@@ -44,7 +44,8 @@ import time
 
 from .artifacts import (Artifact, ClipAnalysis, ClipAnalysisSet, Cost,
                         ContentStrategy, Decision, EditPlan,
-                        RevisionRequest, Segment, Story, VisionAnalysis)
+                        RevisionRequest, Segment, Story, VisionAnalysis,
+                        Voiceover)
 from .base import Agent, AgentContext
 from .tools import select_tools as ST
 from .tools.llm_tools import LLMReply
@@ -106,7 +107,8 @@ class EditingDirectorAgent(Agent):
                 clip_analysis_id: str = "",
                 vision: VisionAnalysis | None = None,
                 strategy: ContentStrategy | None = None,
-                story: Story | None = None
+                story: Story | None = None,
+                voiceover: Voiceover | None = None
                 ) -> Artifact[EditPlan]:
         started = time.time()
         constraints = dict(revision_request.constraints) if revision_request else {}
@@ -130,6 +132,12 @@ class EditingDirectorAgent(Agent):
             (story.logline, tuple(story.clip_order),
              tuple((b.role, b.clip_id) for b in story.beats))
             if story else None,
+            # narration changes how much screen time a beat needs to
+            # carry its words, so a rewritten script is a different
+            # planning problem and must not reuse the previous plan
+            (voiceover.total_words,
+             tuple((sg.beat_index, sg.text) for sg in voiceover.segments))
+            if voiceover else None,
         )
 
         usable = clip_set.usable_clips
@@ -144,7 +152,7 @@ class EditingDirectorAgent(Agent):
         # ---- 1. reasoning, if a model is available -----------------------
         proposal, reject_reason, reply = self._ask_llm(
             ctx, span, clip_set, usable, constraints, vision, strategy,
-            story)
+            story, voiceover)
 
         if reply is not None:
             cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
@@ -281,6 +289,22 @@ class EditingDirectorAgent(Agent):
                 decided_by="policy",
                 confidence=round(story.confidence, 2)))
 
+        if voiceover is not None and voiceover.spoken_segments:
+            decisions.append(Decision(
+                what="Narration from the Voiceover agent",
+                chose=f"{len(voiceover.spoken_segments)} line(s), "
+                      f"{voiceover.total_words} words over beats "
+                      + ", ".join(str(i)
+                                  for i in voiceover.beats_covered[:6]),
+                why=("what is said over the cut; word counts indicate "
+                     "which beats need room, but carry no duration - "
+                     "every in/out point below is still the "
+                     "deterministic window search"
+                     + ("" if voiceover.live else
+                        " - and no narration was actually written")),
+                decided_by="policy",
+                confidence=round(voiceover.confidence, 2)))
+
         decisions.extend(self._plan_decisions(plan, clip_set))
 
         ctx.emit("edit plan: %d segments, %.1fs total, opens on %s"
@@ -303,14 +327,15 @@ class EditingDirectorAgent(Agent):
                  constraints: dict,
                  vision: VisionAnalysis | None = None,
                  strategy: ContentStrategy | None = None,
-                 story: Story | None = None
+                 story: Story | None = None,
+                 voiceover: Voiceover | None = None
                  ) -> tuple[dict | None, str, LLMReply | None]:
         """Returns (validated_proposal | None, reject_reason, reply | None)."""
         if not ctx.llm.available():
             return None, ctx.llm.describe()["why_disabled"] or "no LLM configured", None
 
         prompt = self._build_prompt(clip_set, usable, constraints, vision,
-                                    strategy, story)
+                                    strategy, story, voiceover)
         span.tool("llm.complete_json", provider=ctx.llm.describe().get("provider"),
                   model=ctx.llm.describe().get("model"),
                   prompt_chars=len(prompt))
@@ -331,7 +356,8 @@ class EditingDirectorAgent(Agent):
                       usable: list[ClipAnalysis], constraints: dict,
                       vision: VisionAnalysis | None = None,
                       strategy: ContentStrategy | None = None,
-                      story: Story | None = None) -> str:
+                      story: Story | None = None,
+                      voiceover: Voiceover | None = None) -> str:
         from .tools.pipeline_bridge import build_video
 
         rows = "\n".join(
@@ -456,6 +482,28 @@ class EditingDirectorAgent(Agent):
                      + ("\n".join(head) + "\n" if head else "")
                      + "  beats:\n" + "\n".join(beat_rows) + caveat + "\n")
 
+        # The narration from the Voiceover agent. It tells the director
+        # which beats carry words - a beat with a long line needs room to
+        # breathe - WITHOUT stating any duration, which it cannot express.
+        vtext2 = ""
+        if voiceover is not None and voiceover.spoken_segments:
+            vo_rows = []
+            for sg in voiceover.spoken_segments:
+                vo_rows.append(
+                    "    beat %d (%s, %d words): %s"
+                    % (sg.beat_index, sg.tone, sg.word_count,
+                       sg.text[:100]))
+            caveat2 = (
+                "\n  Word counts show which beats have more to say, so those "
+                "can be given\n  room to breathe. They are NOT durations - "
+                "you still choose every\n  in/out point from the measurements "
+                "above."
+                if voiceover.live else
+                "\n  No narration was actually written; these are "
+                "placeholders.")
+            vtext2 = ("\nTHE NARRATION\n  voice: %s\n" % voiceover.voice
+                      + "\n".join(vo_rows) + caveat2 + "\n")
+
         ctext = ""
         if constraints:
             lines = "\n".join(f"  - {k}: {v}" for k, v in constraints.items())
@@ -468,7 +516,7 @@ class EditingDirectorAgent(Agent):
             clips=rows + vtext, orientation=clip_set.orientation,
             canvas="%dx%d" % clip_set.canvas,
             target=clip_set.target_seconds, median=median,
-            strategy=stext + ntext, constraints=ctext,
+            strategy=stext + ntext + vtext2, constraints=ctext,
             names=", ".join(c.clip_id for c in usable),
             min_seg=build_video.MIN_SEG, max_seg=build_video.MAX_SEG)
 

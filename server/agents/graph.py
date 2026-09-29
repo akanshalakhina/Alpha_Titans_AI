@@ -6,8 +6,8 @@ dependencies, no routing, no retries, no parallelism and no resumability -
 with a graph that has all of them.
 
                      +-> vision   -+
-    clip_analysis  --+             +-> content_strategy -> story -+
-                     +-> research -+                              |
+    clip_analysis  --+     +-> content_strategy -> story -> voiceover -+
+                     +-> research -+                                        |
                                                                   v
           +---------------------------> editing_director -> render -> critic
           |                                   ^                          |
@@ -16,7 +16,8 @@ with a graph that has all of them.
                                                             ESCALATE  -> END
 
 The understanding agents (vision, research) fan out and JOIN at the strategy;
-the strategy briefs the story, and the story briefs the director. Everything upstream of the director sits
+the strategy briefs the story, the story briefs the narration, and the
+narration briefs the director. Everything upstream of the director sits
 OUTSIDE the revision cycle, so a revision re-plans and re-renders without
 re-looking at the footage or re-deciding what the video is about.
 
@@ -59,7 +60,8 @@ from langgraph.graph import END, StateGraph
 
 from .artifacts import (ClipAnalysisSet, ContentStrategy, CriticResult,
                         EditPlan, JobState, RenderResult, ResearchReport,
-                        RevisionRequest, Story, VisionAnalysis)
+                        RevisionRequest, Story, VisionAnalysis,
+                        Voiceover)
 from .base import AgentContext
 from .clip_analysis import ClipAnalysisAgent
 from .content_strategy import ContentStrategyAgent
@@ -69,6 +71,7 @@ from .render_pool import (MediaPool, ProcessCancelled, ProcessTimeout,
                           global_pool)
 from .scheduler import RenderScheduler, WorkCancelled
 from .story import StoryAgent
+from .voiceover import VoiceoverAgent
 from .rendering import RenderingAgent
 from .research_agent import ResearchAgent
 from .vision_agent import VisionAgent
@@ -93,6 +96,8 @@ class GraphState(TypedDict, total=False):
     strategy_failed: str | None
     story_id: str | None
     story_failed: str | None
+    voiceover_id: str | None
+    voiceover_failed: str | None
     edit_plan_id: str
     render_id: str
     critic_id: str
@@ -180,6 +185,7 @@ POLICIES = {
     "content_strategy": NodePolicy(attempts=2, backoff_s=1.0,
                                    timeout_s=300),
     "story": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
+    "voiceover": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "editing_director": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "render": NodePolicy(attempts=2, backoff_s=3.0, timeout_s=3600),
     "critic": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=900),
@@ -544,6 +550,53 @@ def node_story(state: GraphState) -> dict:
     return {"story_id": art.artifact_id, "story_failed": None}
 
 
+def node_voiceover(state: GraphState) -> dict:
+    """What is SAID over the story.
+
+    Runs ONCE, after story and before editing_director, and sits upstream of
+    the critic cycle: a revision re-plans and re-renders without rewriting the
+    narration, because the words did not change just because the cut needs
+    fixing.
+
+    Reads its upstreams out of the store rather than out of graph state,
+    which is the standing rule here: state carries pointers, the store
+    carries payloads.
+
+    Never blocking. Losing the narration costs the director a script, not the
+    operator their video.
+    """
+    job_id = state["job_id"]
+    rt = runtime_for(job_id)
+    agent = VoiceoverAgent()
+
+    story_art = rt.store.get(job_id, "Story", Story)
+    strategy_art = rt.store.get(job_id, "ContentStrategy", ContentStrategy)
+    research_art = rt.store.get(job_id, "ResearchReport", ResearchReport)
+
+    inputs = [a.artifact_id
+              for a in (story_art, strategy_art, research_art) if a]
+
+    def body(span):
+        rev = rt.store.next_revision(job_id, "Voiceover")
+        return agent.execute(
+            rt.context(), span,
+            story=story_art.payload if story_art else None,
+            strategy=strategy_art.payload if strategy_art else None,
+            research=research_art.payload if research_art else None,
+            revision=rev)
+
+    try:
+        art = _run_node("voiceover", VoiceoverAgent.id, job_id,
+                        state.get("attempt", 1), inputs, body)
+    except (ProcessTimeout, WorkCancelled, ProcessCancelled):
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        rt.log.append(f"voiceover failed ({type(exc).__name__}: {exc}); "
+                      f"the director plans without a script")
+        return {"voiceover_id": None, "voiceover_failed": str(exc)[:200]}
+    return {"voiceover_id": art.artifact_id, "voiceover_failed": None}
+
+
 def node_editing_director(state: GraphState) -> dict:
     job_id = state["job_id"]
     rt = runtime_for(job_id)
@@ -555,6 +608,7 @@ def node_editing_director(state: GraphState) -> dict:
     vision_art = rt.store.get(job_id, "VisionAnalysis", VisionAnalysis)
     strategy_art = rt.store.get(job_id, "ContentStrategy", ContentStrategy)
     story_art = rt.store.get(job_id, "Story", Story)
+    vo_art = rt.store.get(job_id, "Voiceover", Voiceover)
 
     raw_req = state.get("revision_request")
     request = RevisionRequest(**raw_req) if raw_req else None
@@ -572,11 +626,13 @@ def node_editing_director(state: GraphState) -> dict:
             clip_analysis_id=clip_art.artifact_id,
             vision=vision_art.payload if vision_art else None,
             strategy=strategy_art.payload if strategy_art else None,
-            story=story_art.payload if story_art else None)
+            story=story_art.payload if story_art else None,
+            voiceover=vo_art.payload if vo_art else None)
 
     inputs = [clip_art.artifact_id]
     inputs += [a.artifact_id
-               for a in (vision_art, strategy_art, story_art) if a]
+               for a in (vision_art, strategy_art, story_art, vo_art)
+               if a]
     art = _run_node("editing_director", EditingDirectorAgent.id, job_id,
                     state.get("attempt", 1), inputs, body)
     return {"edit_plan_id": art.artifact_id,
@@ -732,6 +788,7 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_node("research", node_research)
     g.add_node("content_strategy", node_content_strategy)
     g.add_node("story", node_story)
+    g.add_node("voiceover", node_voiceover)
     g.add_node("editing_director", node_editing_director)
     g.add_node("render", node_render)
     g.add_node("critic", node_critic)
@@ -753,7 +810,8 @@ def _wire(g: "StateGraph") -> "StateGraph":
     # every one of them sits OUTSIDE the critic cycle, so a revision re-plans
     # without re-deciding the message or re-authoring the story.
     g.add_edge("content_strategy", "story")
-    g.add_edge("story", "editing_director")
+    g.add_edge("story", "voiceover")
+    g.add_edge("voiceover", "editing_director")
     g.add_edge("editing_director", "render")
     g.add_edge("render", "critic")
     g.add_conditional_edges("critic", route_after_critic, {

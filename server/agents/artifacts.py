@@ -94,7 +94,7 @@ class Cost(BaseModel):
 
 ArtifactKind = Literal[
     "JobState", "ClipAnalysis", "VisionAnalysis", "ResearchReport",
-    "ContentStrategy", "Story",
+    "ContentStrategy", "Story", "Voiceover",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
     "RevisionRequest",
 ]
@@ -695,6 +695,132 @@ class Story(BaseModel):
         return next((b for b in self.beats if b.role == role), None)
 
 
+# --------------------------------------------------------- Voiceover
+
+Tone = Literal["neutral", "warm", "energetic", "calm", "authoritative",
+               "playful", "wry"]
+VoiceoverType = Literal["reasoned", "degraded", "minimal"]
+
+
+class NarrationSegment(BaseModel):
+    """One spoken line, pinned to a beat the Story already decided.
+
+    `extra="forbid"` is the guard, and it is structural rather than advisory:
+    a reply carrying `start`, `end`, `duration`, `at` or `seconds` fails
+    validation outright. There is no field here that can express WHEN a line
+    is spoken or HOW LONG it lasts - that is a timing decision, and timing
+    belongs to the deterministic window search downstream.
+
+    `beat_index` is the only pointer the model supplies. `clip_id` and
+    `moment_ref` are COPIED from the referenced beat rather than read from
+    the reply, which makes inventing footage structurally impossible: a
+    segment can only ever point at a clip the Story already anchored.
+
+    `word_count` is a computed property, not a field. It is a measured
+    property of the text - not a duration, and not something a model can
+    inject.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    index: int = Field(ge=1)
+    beat_index: int = Field(ge=1)       # -> StoryBeat.index
+    clip_id: str                        # copied from that beat
+    moment_ref: int | None = Field(default=None, ge=0)   # copied from it too
+    text: str = ""
+    tone: Tone = "neutral"
+    support: Support = "none"
+    evidence_urls: list[str] = Field(default_factory=list)
+    note: str = ""                      # delivery note, never a direction
+
+    @property
+    def word_count(self) -> int:
+        return len(self.text.split())
+
+    @property
+    def spoken(self) -> bool:
+        """False for a structural placeholder carrying no words."""
+        return bool(self.text.strip())
+
+
+class Voiceover(BaseModel):
+    """The narration script, aligned to the Story's beats.
+
+    Story decides what is told and in what order. This decides what is SAID
+    over it. The EditingDirector still decides how it is cut, and nothing
+    here expresses a time, a duration, a transition or a filter.
+
+    A segment references a beat by INDEX. The clip and moment come from that
+    beat, so the script cannot drift onto footage the narrative never
+    anchored.
+
+    DEGRADATION IS EXPLICIT
+    -----------------------
+    With no model the agent emits the SHAPE of a script - one placeholder per
+    beat, carrying no words - and says so. Writing narration with nothing to
+    write it from would be invention presented as a script, which is the
+    failure this whole layer exists to avoid.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    domain: str = ""
+    voiceover_type: VoiceoverType = "minimal"
+
+    # NOT `register`: that name shadows an attribute on pydantic's BaseModel
+    # and emits a UserWarning on every import
+    voice: Tone = "neutral"             # the overall delivery
+    voice_rationale: str = ""
+    audience: str = ""
+
+    segments: list[NarrationSegment] = Field(default_factory=list)
+    delivery_notes: list[str] = Field(default_factory=list)
+
+    # provenance: what this script was actually built from
+    story_available: bool = False
+    strategy_available: bool = False
+    research_available: bool = False
+    research_basis: list[str] = Field(default_factory=list)   # cited urls
+    beats_covered: list[int] = Field(default_factory=list)    # beat indices
+
+    risks: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    insufficient_signal: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    live: bool = False                 # True only for a real model call
+    model: str | None = None
+
+    @field_validator("segments")
+    @classmethod
+    def _indices_contiguous(cls, v):
+        """Segments are an ORDER. A gap or a repeat would make the script
+        ambiguous, so it is rejected rather than silently renumbered here -
+        the agent renumbers before construction."""
+        if not v:
+            return v
+        want = list(range(1, len(v) + 1))
+        got = [seg.index for seg in v]
+        if got != want:
+            raise ValueError(
+                f"segment indices must be 1..n in order, got {got}")
+        return v
+
+    @property
+    def spoken_segments(self) -> list[NarrationSegment]:
+        return [s for s in self.segments if s.spoken]
+
+    @property
+    def total_words(self) -> int:
+        return sum(s.word_count for s in self.segments)
+
+    @property
+    def script(self) -> str:
+        """The narration as plain text, in order. Data, never a command."""
+        return "\n".join(s.text for s in self.segments if s.spoken)
+
+    def for_beat(self, beat_index: int) -> list[NarrationSegment]:
+        return [s for s in self.segments if s.beat_index == beat_index]
+
+
 # -------------------------------------------------------------- EditPlan
 
 class Segment(BaseModel):
@@ -950,6 +1076,7 @@ __all__ = [
     "KeyPoint", "ClipPriority", "Hook", "ContentStrategy",
     "Pacing", "ClipRole", "Support", "StrategyType",
     "BeatRole", "StoryType", "StoryBeat", "Story",
+    "Tone", "VoiceoverType", "NarrationSegment", "Voiceover",
     "Segment", "EditPlan",
     "SegmentRenderSpec", "RenderSpec",
     "SegmentRenderInfo", "RenderTechnical", "RenderResult",
