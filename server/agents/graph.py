@@ -6,8 +6,8 @@ dependencies, no routing, no retries, no parallelism and no resumability -
 with a graph that has all of them.
 
                      +-> vision   -+
-    clip_analysis  --+     +-> content_strategy -> story -> voiceover -+
-                     +-> research -+                                        |
+    clip_analysis --+  +-> content_strategy -> story -> voiceover -> music -+
+                    +-> research -+                                             |
                                                                   v
           +---------------------------> editing_director -> render -> critic
           |                                   ^                          |
@@ -16,8 +16,8 @@ with a graph that has all of them.
                                                             ESCALATE  -> END
 
 The understanding agents (vision, research) fan out and JOIN at the strategy;
-the strategy briefs the story, the story briefs the narration, and the
-narration briefs the director. Everything upstream of the director sits
+the strategy briefs the story, the story briefs the narration, the
+narration briefs the score, and the score briefs the director. Everything upstream of the director sits
 OUTSIDE the revision cycle, so a revision re-plans and re-renders without
 re-looking at the footage or re-deciding what the video is about.
 
@@ -60,7 +60,7 @@ from langgraph.graph import END, StateGraph
 
 from .artifacts import (ClipAnalysisSet, ContentStrategy, CriticResult,
                         EditPlan, JobState, RenderResult, ResearchReport,
-                        RevisionRequest, Story, VisionAnalysis,
+                        Music, RevisionRequest, Story, VisionAnalysis,
                         Voiceover)
 from .base import AgentContext
 from .clip_analysis import ClipAnalysisAgent
@@ -70,6 +70,7 @@ from .editing_director import EditingDirectorAgent
 from .render_pool import (MediaPool, ProcessCancelled, ProcessTimeout,
                           global_pool)
 from .scheduler import RenderScheduler, WorkCancelled
+from .music import MusicAgent
 from .story import StoryAgent
 from .voiceover import VoiceoverAgent
 from .rendering import RenderingAgent
@@ -98,6 +99,8 @@ class GraphState(TypedDict, total=False):
     story_failed: str | None
     voiceover_id: str | None
     voiceover_failed: str | None
+    music_id: str | None
+    music_failed: str | None
     edit_plan_id: str
     render_id: str
     critic_id: str
@@ -186,6 +189,7 @@ POLICIES = {
                                    timeout_s=300),
     "story": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "voiceover": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
+    "music": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "editing_director": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "render": NodePolicy(attempts=2, backoff_s=3.0, timeout_s=3600),
     "critic": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=900),
@@ -597,6 +601,55 @@ def node_voiceover(state: GraphState) -> dict:
     return {"voiceover_id": art.artifact_id, "voiceover_failed": None}
 
 
+def node_music(state: GraphState) -> dict:
+    """What the cut should sound like underneath.
+
+    Runs ONCE, after voiceover and before editing_director, and sits upstream
+    of the critic cycle: a revision re-plans and re-renders without
+    re-deciding the score, because the music direction did not change just
+    because the cut needs fixing.
+
+    Takes ClipAnalysis as well as the narrative layers - its deterministic
+    fallback picks the mood from measured motion using the pipeline's own
+    MOOD_BANDS, which needs the measurements.
+
+    Never blocking. Losing the direction costs the director a score brief, not
+    the operator their video.
+    """
+    job_id = state["job_id"]
+    rt = runtime_for(job_id)
+    agent = MusicAgent()
+
+    clip_art = rt.store.get(job_id, "ClipAnalysis", ClipAnalysisSet)
+    story_art = rt.store.get(job_id, "Story", Story)
+    vo_art = rt.store.get(job_id, "Voiceover", Voiceover)
+    strategy_art = rt.store.get(job_id, "ContentStrategy", ContentStrategy)
+
+    inputs = [a.artifact_id
+              for a in (clip_art, story_art, vo_art, strategy_art) if a]
+
+    def body(span):
+        rev = rt.store.next_revision(job_id, "Music")
+        return agent.execute(
+            rt.context(), span,
+            clip_set=clip_art.payload if clip_art else None,
+            story=story_art.payload if story_art else None,
+            voiceover=vo_art.payload if vo_art else None,
+            strategy=strategy_art.payload if strategy_art else None,
+            revision=rev)
+
+    try:
+        art = _run_node("music", MusicAgent.id, job_id,
+                        state.get("attempt", 1), inputs, body)
+    except (ProcessTimeout, WorkCancelled, ProcessCancelled):
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        rt.log.append(f"music failed ({type(exc).__name__}: {exc}); "
+                      f"the director plans without a score brief")
+        return {"music_id": None, "music_failed": str(exc)[:200]}
+    return {"music_id": art.artifact_id, "music_failed": None}
+
+
 def node_editing_director(state: GraphState) -> dict:
     job_id = state["job_id"]
     rt = runtime_for(job_id)
@@ -609,6 +662,7 @@ def node_editing_director(state: GraphState) -> dict:
     strategy_art = rt.store.get(job_id, "ContentStrategy", ContentStrategy)
     story_art = rt.store.get(job_id, "Story", Story)
     vo_art = rt.store.get(job_id, "Voiceover", Voiceover)
+    music_art = rt.store.get(job_id, "Music", Music)
 
     raw_req = state.get("revision_request")
     request = RevisionRequest(**raw_req) if raw_req else None
@@ -627,11 +681,13 @@ def node_editing_director(state: GraphState) -> dict:
             vision=vision_art.payload if vision_art else None,
             strategy=strategy_art.payload if strategy_art else None,
             story=story_art.payload if story_art else None,
-            voiceover=vo_art.payload if vo_art else None)
+            voiceover=vo_art.payload if vo_art else None,
+            music=music_art.payload if music_art else None)
 
     inputs = [clip_art.artifact_id]
     inputs += [a.artifact_id
-               for a in (vision_art, strategy_art, story_art, vo_art)
+               for a in (vision_art, strategy_art, story_art, vo_art,
+                         music_art)
                if a]
     art = _run_node("editing_director", EditingDirectorAgent.id, job_id,
                     state.get("attempt", 1), inputs, body)
@@ -789,6 +845,7 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_node("content_strategy", node_content_strategy)
     g.add_node("story", node_story)
     g.add_node("voiceover", node_voiceover)
+    g.add_node("music", node_music)
     g.add_node("editing_director", node_editing_director)
     g.add_node("render", node_render)
     g.add_node("critic", node_critic)
@@ -811,7 +868,8 @@ def _wire(g: "StateGraph") -> "StateGraph":
     # without re-deciding the message or re-authoring the story.
     g.add_edge("content_strategy", "story")
     g.add_edge("story", "voiceover")
-    g.add_edge("voiceover", "editing_director")
+    g.add_edge("voiceover", "music")
+    g.add_edge("music", "editing_director")
     g.add_edge("editing_director", "render")
     g.add_edge("render", "critic")
     g.add_conditional_edges("critic", route_after_critic, {

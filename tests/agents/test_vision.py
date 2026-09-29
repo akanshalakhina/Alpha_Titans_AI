@@ -445,7 +445,9 @@ def test_vision_sits_between_clip_analysis_and_the_director():
         assert ("vision", "content_strategy") in edges
         assert ("content_strategy", "story") in edges
         assert ("story", "voiceover") in edges
-        assert ("voiceover", "editing_director") in edges
+        assert ("voiceover", "music") in edges
+        assert ("music", "editing_director") in edges
+        assert ("voiceover", "editing_director") not in edges
         assert ("story", "editing_director") not in edges
         assert ("content_strategy", "editing_director") not in edges
         assert ("vision", "editing_director") not in edges

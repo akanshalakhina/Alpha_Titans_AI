@@ -94,7 +94,7 @@ class Cost(BaseModel):
 
 ArtifactKind = Literal[
     "JobState", "ClipAnalysis", "VisionAnalysis", "ResearchReport",
-    "ContentStrategy", "Story", "Voiceover",
+    "ContentStrategy", "Story", "Voiceover", "Music",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
     "RevisionRequest",
 ]
@@ -821,6 +821,131 @@ class Voiceover(BaseModel):
         return [s for s in self.segments if s.beat_index == beat_index]
 
 
+# ------------------------------------------------------------- Music
+
+# The SEVEN moods the existing engine actually supports. Lifted verbatim from
+# `server/extras.py::MOODS`, whose own comment reads "Every option maps to a
+# real engine setting" - lofi/calm -> stdlib lofi, bright/upbeat -> stdlib
+# bright, beat/energetic/cinematic -> beatbed.
+#
+# This is the enforcement point for "the music plan must be actionable": a
+# mood outside this set is one nothing can render, so the model picks from
+# the engine's own vocabulary rather than inventing a genre. A test asserts
+# this Literal still matches extras.MOODS exactly, so the two cannot drift.
+Mood = Literal["lofi", "calm", "bright", "upbeat", "beat", "energetic",
+               "cinematic"]
+Energy = Literal["low", "building", "steady", "high", "peak", "falling"]
+TempoFeel = Literal["slow", "moderate", "driving", "varied"]
+MusicType = Literal["reasoned", "degraded", "minimal"]
+
+
+class MusicSection(BaseModel):
+    """What the score does across ONE story beat.
+
+    `extra="forbid"` is the guard, and it is structural rather than advisory:
+    a reply carrying `start`, `end`, `duration`, `at`, `bpm` or `seconds`
+    fails validation outright. Nothing here can say WHEN a section begins or
+    HOW LONG it lasts - the real transition marks are measured from the
+    finished cut, and tempo is fitted to them by the existing beat engine.
+
+    `beat_index` is the only pointer the model supplies. `clip_id` is COPIED
+    from the referenced beat, so a section cannot land on footage the story
+    never anchored.
+
+    `under_narration` is derived from the Voiceover, not asked of the model -
+    whether a beat carries spoken words is a fact, not a judgement.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    index: int = Field(ge=1)
+    beat_index: int = Field(ge=1)       # -> StoryBeat.index
+    clip_id: str                        # copied from that beat
+    energy: Energy = "steady"
+    intent: str = ""                    # what the music does here
+    under_narration: bool = False       # derived from the Voiceover
+
+
+class Music(BaseModel):
+    """The music DIRECTION for the cut - never the audio, never the timing.
+
+    Story says what is told; Voiceover says what is spoken; this says what it
+    should sound like underneath. Choosing or generating the actual track,
+    fitting tempo to the real transition marks and ducking under speech all
+    stay with the existing deterministic engines (`beatbed`, `bgm_stdlib`),
+    which do that from measurements this agent never sees.
+
+    NO ASSET IS EVER NAMED HERE. `available_assets` is measured from the music
+    library on disk; the model is not shown it and cannot add to it. A plan
+    that referenced a track nobody has would be worse than one that referenced
+    none.
+
+    `engine` is derived from `mood` through the existing MOODS map, so it is a
+    consequence of the choice rather than a second thing to get wrong.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    domain: str = ""
+    music_type: MusicType = "minimal"
+
+    mood: Mood = "lofi"                 # from the engine's own vocabulary
+    mood_rationale: str = ""
+    engine: str = ""                    # DERIVED from mood, never asked for
+    tempo_feel: TempoFeel = "moderate"
+
+    sonic_direction: str = ""           # how it should sound, in words
+    instrumentation: list[str] = Field(default_factory=list)
+    energy_arc: str = ""
+    avoid: list[str] = Field(default_factory=list)
+
+    sections: list[MusicSection] = Field(default_factory=list)
+    narration_notes: list[str] = Field(default_factory=list)
+
+    # what the library actually holds, measured - never model output
+    available_assets: list[str] = Field(default_factory=list)
+
+    # provenance: what this direction was actually built from
+    story_available: bool = False
+    voiceover_available: bool = False
+    strategy_available: bool = False
+    beats_covered: list[int] = Field(default_factory=list)
+
+    risks: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    insufficient_signal: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    live: bool = False                 # True only for a real model call
+    model: str | None = None
+
+    @field_validator("sections")
+    @classmethod
+    def _indices_contiguous(cls, v):
+        """Sections are an ORDER. A gap or a repeat would make the arc
+        ambiguous, so it is rejected rather than silently renumbered here -
+        the agent renumbers before construction."""
+        if not v:
+            return v
+        want = list(range(1, len(v) + 1))
+        got = [sec.index for sec in v]
+        if got != want:
+            raise ValueError(
+                f"section indices must be 1..n in order, got {got}")
+        return v
+
+    @property
+    def spoken_sections(self) -> list[MusicSection]:
+        """Sections the narration talks over - where the bed must give way."""
+        return [s for s in self.sections if s.under_narration]
+
+    @property
+    def energy_shape(self) -> list[str]:
+        return [s.energy for s in self.sections]
+
+    def section_for(self, beat_index: int) -> "MusicSection | None":
+        return next((s for s in self.sections
+                     if s.beat_index == beat_index), None)
+
+
 # -------------------------------------------------------------- EditPlan
 
 class Segment(BaseModel):
@@ -1077,6 +1202,7 @@ __all__ = [
     "Pacing", "ClipRole", "Support", "StrategyType",
     "BeatRole", "StoryType", "StoryBeat", "Story",
     "Tone", "VoiceoverType", "NarrationSegment", "Voiceover",
+    "Mood", "Energy", "TempoFeel", "MusicType", "MusicSection", "Music",
     "Segment", "EditPlan",
     "SegmentRenderSpec", "RenderSpec",
     "SegmentRenderInfo", "RenderTechnical", "RenderResult",
