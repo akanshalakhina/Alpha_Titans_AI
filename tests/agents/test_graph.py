@@ -84,7 +84,9 @@ def test_the_graph_has_the_cycle():
         assert ("story", "voiceover") in edges
         assert ("voiceover", "music") in edges
         assert ("music", "animation") in edges
-        assert ("animation", "editing_director") in edges
+        assert ("animation", "transition") in edges
+        assert ("transition", "editing_director") in edges
+        assert ("animation", "editing_director") not in edges
         assert ("music", "editing_director") not in edges
         assert ("voiceover", "editing_director") not in edges
         assert ("story", "editing_director") not in edges
@@ -230,8 +232,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     a full pass over everything.
     """
     from agents.artifacts import (Animation, ContentStrategy, Music,
-                                  ResearchReport, Story, VisionAnalysis,
-                                  Voiceover)
+                                  ResearchReport, Story, Transition,
+                                  VisionAnalysis, Voiceover)
 
     job = _job(agent_root, calm_clip, lively_clip, "gnorerun")
     llm = llm_returning_plan(
@@ -248,7 +250,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
                         ("Story", Story),
                         ("Voiceover", Voiceover),
                         ("Music", Music),
-                        ("Animation", Animation)):
+                        ("Animation", Animation),
+                        ("Transition", Transition)):
         revs = store.all_revisions(job.job_id, kind, model)
         assert len(revs) == 1, f"{kind} re-ran on a revision ({len(revs)}x)"
 
@@ -266,6 +269,7 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     assert nodes.count("voiceover") == 1
     assert nodes.count("music") == 1
     assert nodes.count("animation") == 1
+    assert nodes.count("transition") == 1
     assert nodes.count("editing_director") == 2
 
 
@@ -305,7 +309,9 @@ def test_the_strategy_joins_vision_and_research_before_the_director(
     assert started["music"] >= ends["voiceover"]
     assert "animation" in started
     assert started["animation"] >= ends["music"]
-    assert started["editing_director"] >= ends["animation"]
+    assert "transition" in started
+    assert started["transition"] >= ends["animation"]
+    assert started["editing_director"] >= ends["transition"]
 
 
 @pytest.mark.slow
@@ -328,7 +334,8 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     # produced nothing would be indistinguishable from one that never ran.
     assert kinds == {"ClipAnalysis", "VisionAnalysis", "ResearchReport",
                      "ContentStrategy", "Story", "Voiceover", "Music",
-                     "Animation", "EditPlan", "RenderResult", "CriticResult"}
+                     "Animation", "Transition", "EditPlan",
+                     "RenderResult", "CriticResult"}
 
     producers = {r["kind"]: r["produced_by"] for r in rows}
     assert producers["ClipAnalysis"] == "clip_analysis"
@@ -339,6 +346,7 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     assert producers["Voiceover"] == "voiceover"
     assert producers["Music"] == "music"
     assert producers["Animation"] == "animation"
+    assert producers["Transition"] == "transition"
     assert producers["EditPlan"] == "editing_director"
     assert producers["RenderResult"] == "rendering"
     assert producers["CriticResult"] == "critic"

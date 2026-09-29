@@ -45,7 +45,7 @@ import time
 from .artifacts import (Artifact, ClipAnalysis, ClipAnalysisSet, Cost,
                         ContentStrategy, Decision, EditPlan,
                         Animation, Music, RevisionRequest, Segment,
-                        Story, VisionAnalysis, Voiceover)
+                        Story, Transition, VisionAnalysis, Voiceover)
 from .base import Agent, AgentContext
 from .tools import select_tools as ST
 from .tools.llm_tools import LLMReply
@@ -110,7 +110,8 @@ class EditingDirectorAgent(Agent):
                 story: Story | None = None,
                 voiceover: Voiceover | None = None,
                 music: Music | None = None,
-                animation: Animation | None = None
+                animation: Animation | None = None,
+                transition: Transition | None = None
                 ) -> Artifact[EditPlan]:
         started = time.time()
         constraints = dict(revision_request.constraints) if revision_request else {}
@@ -150,6 +151,9 @@ class EditingDirectorAgent(Agent):
              tuple((d.beat_index, d.emphasis, d.caption_intent)
                    for d in animation.directions))
             if animation else None,
+            # the join sequence feeds AT_XFADES, so a changed set of
+            # transitions genuinely changes the rendered output
+            tuple(transition.xfade_sequence) if transition else None,
         )
 
         usable = clip_set.usable_clips
@@ -164,7 +168,7 @@ class EditingDirectorAgent(Agent):
         # ---- 1. reasoning, if a model is available -----------------------
         proposal, reject_reason, reply = self._ask_llm(
             ctx, span, clip_set, usable, constraints, vision, strategy,
-            story, voiceover, music, animation)
+            story, voiceover, music, animation, transition)
 
         if reply is not None:
             cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
@@ -348,6 +352,19 @@ class EditingDirectorAgent(Agent):
                 decided_by="policy",
                 confidence=round(animation.confidence, 2)))
 
+        if transition is not None and transition.choices:
+            decisions.append(Decision(
+                what="Join brief from the Transition agent",
+                chose=" -> ".join(transition.xfade_sequence[:6]),
+                why=("which crossfade sits at each junction; the "
+                     "renderer applies one at every junction at a single "
+                     "global length either way, so this changes the look "
+                     "of the joins and nothing about the timing"
+                     + ("" if transition.live else
+                        " - and none was chosen for its effect")),
+                decided_by="policy",
+                confidence=round(transition.confidence, 2)))
+
         decisions.extend(self._plan_decisions(plan, clip_set))
 
         ctx.emit("edit plan: %d segments, %.1fs total, opens on %s"
@@ -373,7 +390,8 @@ class EditingDirectorAgent(Agent):
                  story: Story | None = None,
                  voiceover: Voiceover | None = None,
                  music: Music | None = None,
-                 animation: Animation | None = None
+                 animation: Animation | None = None,
+                 transition: Transition | None = None
                  ) -> tuple[dict | None, str, LLMReply | None]:
         """Returns (validated_proposal | None, reject_reason, reply | None)."""
         if not ctx.llm.available():
@@ -381,7 +399,7 @@ class EditingDirectorAgent(Agent):
 
         prompt = self._build_prompt(clip_set, usable, constraints, vision,
                                     strategy, story, voiceover, music,
-                                    animation)
+                                    animation, transition)
         span.tool("llm.complete_json", provider=ctx.llm.describe().get("provider"),
                   model=ctx.llm.describe().get("model"),
                   prompt_chars=len(prompt))
@@ -405,7 +423,8 @@ class EditingDirectorAgent(Agent):
                       story: Story | None = None,
                       voiceover: Voiceover | None = None,
                       music: Music | None = None,
-                      animation: Animation | None = None) -> str:
+                      animation: Animation | None = None,
+                      transition: Transition | None = None) -> str:
         from .tools.pipeline_bridge import build_video
 
         rows = "\n".join(
@@ -603,6 +622,28 @@ class EditingDirectorAgent(Agent):
                      + ("\n".join(a_head) + "\n" if a_head else "")
                      + "\n".join(a_rows) + a_caveat + "\n")
 
+        # The join brief. Which crossfade sits at each junction - the
+        # renderer applies one at EVERY junction regardless, so this says
+        # which, never whether or for how long.
+        ttext = ""
+        if transition is not None and transition.choices:
+            t_rows = ["    beat %d -> %d: %s%s"
+                      % (c.from_beat, c.to_beat, c.kind,
+                         f" ({c.intent})" if c.intent else "")
+                      for c in transition.choices]
+            t_head = []
+            if transition.style:
+                t_head.append("  feel: %s" % transition.style)
+            t_caveat = ("\n  Every junction crossfades at one global length, "
+                        "so this is which\n  transition, never whether or how "
+                        "long. It does not affect your\n  in/out points."
+                        if transition.live else
+                        "\n  Plain crossfades throughout; none was chosen for "
+                        "its effect.")
+            ttext = ("\nTHE JOINS\n"
+                     + ("\n".join(t_head) + "\n" if t_head else "")
+                     + "\n".join(t_rows) + t_caveat + "\n")
+
         ctext = ""
         if constraints:
             lines = "\n".join(f"  - {k}: {v}" for k, v in constraints.items())
@@ -615,7 +656,7 @@ class EditingDirectorAgent(Agent):
             clips=rows + vtext, orientation=clip_set.orientation,
             canvas="%dx%d" % clip_set.canvas,
             target=clip_set.target_seconds, median=median,
-            strategy=stext + ntext + vtext2 + mtext + atext,
+            strategy=stext + ntext + vtext2 + mtext + atext + ttext,
             constraints=ctext,
             names=", ".join(c.clip_id for c in usable),
             min_seg=build_video.MIN_SEG, max_seg=build_video.MAX_SEG)

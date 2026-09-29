@@ -9,7 +9,7 @@ with a graph that has all of them.
     clip_analysis --+             +-> content_strategy -> story
                     +-> research -+                         |
                                                             v
-                                     voiceover -> music -> animation
+                            voiceover -> music -> animation -> transition
                                          ^                     |
                                          +---------------------+
                                                             |
@@ -23,7 +23,8 @@ with a graph that has all of them.
 The understanding agents (vision, research) fan out and JOIN at the strategy.
 From there it is a chain, each layer briefing the next: the strategy briefs
 the story, the story briefs the narration, the narration briefs the score,
-the score briefs the look, and the look briefs the director.
+the score briefs the look, the look briefs the joins, and the joins
+brief the director.
 
 EVERY one of those sits OUTSIDE the revision cycle. A revision re-plans and
 re-renders without re-looking at the footage, re-deciding what the video is
@@ -69,7 +70,7 @@ from langgraph.graph import END, StateGraph
 from .artifacts import (ClipAnalysisSet, ContentStrategy, CriticResult,
                         EditPlan, JobState, RenderResult, ResearchReport,
                         Animation, Music, RevisionRequest, Story,
-                        VisionAnalysis, Voiceover)
+                        Transition, VisionAnalysis, Voiceover)
 from .base import AgentContext
 from .clip_analysis import ClipAnalysisAgent
 from .content_strategy import ContentStrategyAgent
@@ -81,6 +82,7 @@ from .scheduler import RenderScheduler, WorkCancelled
 from .animation import AnimationAgent
 from .music import MusicAgent
 from .story import StoryAgent
+from .transition import TransitionAgent
 from .voiceover import VoiceoverAgent
 from .rendering import RenderingAgent
 from .research_agent import ResearchAgent
@@ -112,6 +114,8 @@ class GraphState(TypedDict, total=False):
     music_failed: str | None
     animation_id: str | None
     animation_failed: str | None
+    transition_id: str | None
+    transition_failed: str | None
     edit_plan_id: str
     render_id: str
     critic_id: str
@@ -202,6 +206,7 @@ POLICIES = {
     "voiceover": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "music": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "animation": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
+    "transition": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "editing_director": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "render": NodePolicy(attempts=2, backoff_s=3.0, timeout_s=3600),
     "critic": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=900),
@@ -710,6 +715,51 @@ def node_animation(state: GraphState) -> dict:
     return {"animation_id": art.artifact_id, "animation_failed": None}
 
 
+def node_transition(state: GraphState) -> dict:
+    """How one beat gives way to the next.
+
+    Runs ONCE, after animation and before editing_director, and sits upstream
+    of the critic cycle: a revision re-plans and re-renders without
+    re-choosing the joins.
+
+    Its output reaches the renderer through a path that already exists -
+    RenderSpec.xfade_list feeds AT_XFADES, which build_video reads.
+
+    Never blocking. Losing it costs the director a join brief, not the
+    operator their video.
+    """
+    job_id = state["job_id"]
+    rt = runtime_for(job_id)
+    agent = TransitionAgent()
+
+    story_art = rt.store.get(job_id, "Story", Story)
+    anim_art = rt.store.get(job_id, "Animation", Animation)
+    strategy_art = rt.store.get(job_id, "ContentStrategy", ContentStrategy)
+
+    inputs = [a.artifact_id
+              for a in (story_art, anim_art, strategy_art) if a]
+
+    def body(span):
+        rev = rt.store.next_revision(job_id, "Transition")
+        return agent.execute(
+            rt.context(), span,
+            story=story_art.payload if story_art else None,
+            animation=anim_art.payload if anim_art else None,
+            strategy=strategy_art.payload if strategy_art else None,
+            revision=rev)
+
+    try:
+        art = _run_node("transition", TransitionAgent.id, job_id,
+                        state.get("attempt", 1), inputs, body)
+    except (ProcessTimeout, WorkCancelled, ProcessCancelled):
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        rt.log.append(f"transition failed ({type(exc).__name__}: {exc}); "
+                      f"the director plans without a join brief")
+        return {"transition_id": None, "transition_failed": str(exc)[:200]}
+    return {"transition_id": art.artifact_id, "transition_failed": None}
+
+
 def node_editing_director(state: GraphState) -> dict:
     job_id = state["job_id"]
     rt = runtime_for(job_id)
@@ -724,6 +774,7 @@ def node_editing_director(state: GraphState) -> dict:
     vo_art = rt.store.get(job_id, "Voiceover", Voiceover)
     music_art = rt.store.get(job_id, "Music", Music)
     anim_art = rt.store.get(job_id, "Animation", Animation)
+    trans_art = rt.store.get(job_id, "Transition", Transition)
 
     raw_req = state.get("revision_request")
     request = RevisionRequest(**raw_req) if raw_req else None
@@ -744,12 +795,13 @@ def node_editing_director(state: GraphState) -> dict:
             story=story_art.payload if story_art else None,
             voiceover=vo_art.payload if vo_art else None,
             music=music_art.payload if music_art else None,
-            animation=anim_art.payload if anim_art else None)
+            animation=anim_art.payload if anim_art else None,
+            transition=trans_art.payload if trans_art else None)
 
     inputs = [clip_art.artifact_id]
     inputs += [a.artifact_id
                for a in (vision_art, strategy_art, story_art, vo_art,
-                         music_art, anim_art)
+                         music_art, anim_art, trans_art)
                if a]
     art = _run_node("editing_director", EditingDirectorAgent.id, job_id,
                     state.get("attempt", 1), inputs, body)
@@ -909,6 +961,7 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_node("voiceover", node_voiceover)
     g.add_node("music", node_music)
     g.add_node("animation", node_animation)
+    g.add_node("transition", node_transition)
     g.add_node("editing_director", node_editing_director)
     g.add_node("render", node_render)
     g.add_node("critic", node_critic)
@@ -933,7 +986,8 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_edge("story", "voiceover")
     g.add_edge("voiceover", "music")
     g.add_edge("music", "animation")
-    g.add_edge("animation", "editing_director")
+    g.add_edge("animation", "transition")
+    g.add_edge("transition", "editing_director")
     g.add_edge("editing_director", "render")
     g.add_edge("render", "critic")
     g.add_conditional_edges("critic", route_after_critic, {

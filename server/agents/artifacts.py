@@ -95,6 +95,7 @@ class Cost(BaseModel):
 ArtifactKind = Literal[
     "JobState", "ClipAnalysis", "VisionAnalysis", "ResearchReport",
     "ContentStrategy", "Story", "Voiceover", "Music", "Animation",
+    "Transition",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
     "RevisionRequest",
 ]
@@ -1080,6 +1081,125 @@ class Animation(BaseModel):
                      if d.beat_index == beat_index), None)
 
 
+# -------------------------------------------------------- Transition
+
+# The SIX transitions this renderer ships, taken from the default XFADES list
+# in pipeline/build_video.py and each confirmed to exist in ffmpeg's xfade
+# filter. A name outside this set is one the render would fail on, so the
+# model picks from here rather than from ffmpeg's full catalogue.
+#
+# There is deliberately NO "cut" and no "none": build_video crossfades EVERY
+# junction, xfade has no such option, and the fade length `T` is global rather
+# than per-transition. A hard cut is not expressible by this renderer and this
+# artifact does not pretend otherwise.
+#
+# A test asserts this literal still matches the renderer's shipped default, so
+# the two cannot drift.
+TransitionKind = Literal["fade", "fadewhite", "smoothleft", "smoothup",
+                         "wipeleft", "wipeup"]
+TransitionType = Literal["reasoned", "degraded", "minimal"]
+
+
+class TransitionChoice(BaseModel):
+    """The transition at ONE junction between two consecutive beats.
+
+    `extra="forbid"` is the guard, and it is structural: a reply carrying
+    `duration`, `start`, `offset`, `seconds` or `filter` fails validation
+    outright. Length is not expressible here because it is not expressible in
+    the renderer either - `AT_XFADE_T` applies to every transition equally.
+
+    `from_beat` and `to_beat` are the only pointers the model supplies, and
+    both must be beats the Story actually has. `kind` is validated against the
+    renderer's real vocabulary.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    index: int = Field(ge=1)
+    from_beat: int = Field(ge=1)        # -> StoryBeat.index
+    to_beat: int = Field(ge=1)          # -> StoryBeat.index
+    kind: TransitionKind = "fade"
+    intent: str = ""
+    supported: bool = True
+
+
+class Transition(BaseModel):
+    """How one beat gives way to the next.
+
+    The renderer crossfades every junction using a cycling list of transition
+    names supplied through `AT_XFADES`, which `RenderSpec.xfade_list` already
+    feeds. So this artifact's `xfade_sequence` is directly actionable: it is
+    the ordered list of names the render would use, one per junction.
+
+    WHAT CANNOT BE EXPRESSED, AND IS NOT PRETENDED
+    ----------------------------------------------
+    * a hard cut - every junction crossfades, and xfade has no "none"
+    * a per-transition length - `AT_XFADE_T` is one global value
+    * anything outside the six names the renderer ships
+
+    A request for any of those lands in `unsupported_requests` rather than
+    being quietly dropped or silently promised.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    domain: str = ""
+    transition_type: TransitionType = "minimal"
+
+    style: str = ""                     # the overall feel, in words
+    choices: list[TransitionChoice] = Field(default_factory=list)
+
+    # what the renderer actually supports, measured - never model output
+    engine_transitions: list[str] = Field(default_factory=list)
+    # what was asked for and cannot be done
+    unsupported_requests: list[str] = Field(default_factory=list)
+
+    # provenance: what this was actually built from
+    story_available: bool = False
+    animation_available: bool = False
+    strategy_available: bool = False
+
+    risks: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    insufficient_signal: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    live: bool = False                 # True only for a real model call
+    model: str | None = None
+
+    @field_validator("choices")
+    @classmethod
+    def _indices_contiguous(cls, v):
+        """Junctions run in order. A gap or a repeat would make the sequence
+        ambiguous, so it is rejected rather than silently renumbered here -
+        the agent renumbers before construction."""
+        if not v:
+            return v
+        want = list(range(1, len(v) + 1))
+        got = [c.index for c in v]
+        if got != want:
+            raise ValueError(
+                f"choice indices must be 1..n in order, got {got}")
+        return v
+
+    @property
+    def xfade_sequence(self) -> list[str]:
+        """The ordered names the renderer would receive through AT_XFADES.
+
+        One per junction, in order, so build_video's cycling index lands on
+        exactly the intended transition at each one.
+        """
+        return [c.kind for c in self.choices]
+
+    @property
+    def supported_choices(self) -> list["TransitionChoice"]:
+        return [c for c in self.choices if c.supported]
+
+    def choice_between(self, from_beat: int,
+                       to_beat: int) -> "TransitionChoice | None":
+        return next((c for c in self.choices
+                     if c.from_beat == from_beat and c.to_beat == to_beat),
+                    None)
+
+
 # -------------------------------------------------------------- EditPlan
 
 class Segment(BaseModel):
@@ -1339,6 +1459,7 @@ __all__ = [
     "Mood", "Energy", "TempoFeel", "MusicType", "MusicSection", "Music",
     "Treatment", "Emphasis", "CaptionIntent", "AnimationType",
     "AnimationDirection", "Animation",
+    "TransitionKind", "TransitionType", "TransitionChoice", "Transition",
     "Segment", "EditPlan",
     "SegmentRenderSpec", "RenderSpec",
     "SegmentRenderInfo", "RenderTechnical", "RenderResult",
