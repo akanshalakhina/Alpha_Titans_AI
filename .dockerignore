@@ -1,0 +1,16 @@
+# build context should be source only — renders and footage are volumes
+uploads/*
+outputs/*
+data/music/*
+!uploads/.gitkeep
+!outputs/.gitkeep
+!data/music/.gitkeep
+
+.env
+__pycache__/
+*.py[cod]
+*.bak
+.git/
+.gitignore
+.DS_Store
+README.md

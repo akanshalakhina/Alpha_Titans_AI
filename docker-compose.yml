@@ -1,0 +1,29 @@
+# Alpha Titans — Content Engine
+#
+#   docker compose up --build        -> http://localhost:8000
+#
+# uploads/, outputs/ and data/music are bind-mounted so raw footage, finished
+# renders and the music library survive a rebuild of the image.
+
+services:
+  app:
+    build: .
+    image: alpha-titans:latest
+    container_name: alpha-titans
+    ports:
+      - "${AT_PORT:-8000}:8000"
+    environment:
+      AT_HOST: "0.0.0.0"
+      AT_PORT: "8000"
+      # raise if you upload very long source clips
+      AT_MAX_CLIP_MB: "${AT_MAX_CLIP_MB:-2048}"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+      - ./data/music:/app/data/music
+    restart: unless-stopped
+    # a 4K master render is CPU-bound; give it room or it will simply be slow
+    deploy:
+      resources:
+        limits:
+          cpus: "${AT_CPUS:-4}"

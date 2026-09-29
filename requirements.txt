@@ -1,0 +1,31 @@
+# Alpha Titans — Content Engine
+#
+# Two groups. The first four are required; the last two only make the richer
+# music engine available and the app runs without them (it falls back to
+# bgm_stdlib.py, which is pure standard library).
+#
+#   pip install -r requirements.txt
+#
+# ffmpeg and ffprobe are NOT pip packages — install them with your OS package
+# manager. See README.md > Prerequisites.
+
+# --- required ---------------------------------------------------------------
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+python-multipart>=0.0.9          # multipart/form-data uploads (clips, audio)
+
+# --- optional: enables beatbed.py (music) & voice note transcription --------
+numpy>=1.24
+scipy>=1.10
+soundfile>=0.12              # beatbed.py writes its score with it
+faster-whisper>=1.0
+
+# --- agent layer (server/agents/, Phase 1) ----------------------------------
+# Only needed to run the agent graph. The legacy build path - run.bat, the UI
+# and every existing endpoint - works without any of these installed.
+pydantic>=2.5                # typed, immutable artifacts
+langgraph>=1.0               # the orchestrator: conditional edges and the
+                             #   critic -> editing_director cycle
+langgraph-checkpoint-sqlite>=2.0   # durable checkpoints, so a killed build
+                             #   resumes instead of being lost
+

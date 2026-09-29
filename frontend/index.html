@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alpha Titans Studio</title>
+<meta name="description" content="Upload LEGO clips and let AI turn them into a finished, share-ready video.">
+<meta name="theme-color" content="#0a0a0d">
+<meta name="at-ui" content="5">
+<!-- inline so the app needs no extra request and no network at all -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23FFD23F'/%3E%3Cstop offset='.55' stop-color='%23FF8A1F'/%3E%3Cstop offset='1' stop-color='%23EF3B3B'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='2' y='9' width='28' height='20' rx='5' fill='url(%23g)'/%3E%3Crect x='6' y='4' width='8' height='7' rx='2.5' fill='url(%23g)'/%3E%3Crect x='18' y='4' width='8' height='7' rx='2.5' fill='url(%23g)'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/styles.css?v=5">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFD23F"/>
+      <stop offset=".55" stop-color="#FF8A1F"/>
+      <stop offset="1" stop-color="#EF3B3B"/>
+    </linearGradient>
+    <symbol id="i-brick" viewBox="0 0 48 40">
+      <rect x="2" y="12" width="44" height="26" rx="6" fill="url(#brandGrad)"/>
+      <rect x="7" y="4" width="12" height="11" rx="4" fill="url(#brandGrad)"/>
+      <rect x="29" y="4" width="12" height="11" rx="4" fill="url(#brandGrad)"/>
+      <rect x="7" y="4" width="12" height="4" rx="2" fill="#fff" opacity=".28"/>
+      <rect x="29" y="4" width="12" height="4" rx="2" fill="#fff" opacity=".28"/>
+      <rect x="2" y="12" width="44" height="6" rx="3" fill="#fff" opacity=".16"/>
+    </symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4m0 0-4.5 4.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3zm6.5 11l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6z" fill="currentColor"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5L8 5.5z" fill="currentColor"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.2 4.2L19 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 20h14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="M19 12a7 7 0 1 1-2.05-4.95M19 4v4h-4" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zm-6 9a6 6 0 0 0 12 0M12 18v3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-doc" viewBox="0 0 24 24"><path d="M7 3h7l5 5v13H7zM14 3v5h5M10 13h6M10 17h6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  </defs>
+</svg>
+
+<div class="app">
+
+  <!-- ══════════════════════════════ TOP BAR ══════════════════════════════ -->
+  <header class="topbar">
+    <button class="brand" id="brandBtn" title="Your videos">
+      <svg class="mark" aria-hidden="true"><use href="#i-brick"/></svg>
+      <span class="brand-text">
+        <strong>Alpha Titans</strong>
+        <small>Studio</small>
+      </span>
+    </button>
+
+    <ol class="stepper" id="stepper">
+      <li data-step="1"><span class="sn"><b>1</b><svg><use href="#i-check"/></svg></span><span class="sl">Media</span></li>
+      <li data-step="2"><span class="sn"><b>2</b><svg><use href="#i-check"/></svg></span><span class="sl">Customize</span></li>
+      <li data-step="3"><span class="sn"><b>3</b><svg><use href="#i-check"/></svg></span><span class="sl">AI Processing</span></li>
+      <li data-step="4"><span class="sn"><b>4</b><svg><use href="#i-check"/></svg></span><span class="sl">Final Video</span></li>
+    </ol>
+
+    <div class="topbar-right">
+      <button id="libraryBtn" class="btn btn-quiet"><svg class="ico"><use href="#i-grid"/></svg><span>My videos</span></button>
+      <button id="newBuild" class="btn btn-light"><svg class="ico"><use href="#i-plus"/></svg><span>New video</span></button>
+    </div>
+  </header>
+
+  <!-- ══════════════════════════════ 1 · MEDIA ══════════════════════════════ -->
+  <main id="step-1" class="step">
+    <div class="hero">
+      <span class="eyebrow"><svg class="ico"><use href="#i-spark"/></svg> Step 1 · Media</span>
+      <h1>Turn your LEGO clips into a <span class="grad">finished video</span>.</h1>
+      <p class="lede">Drop in your build footage. AI picks the best moments, cuts them
+        together, adds music and delivers a video you can share.</p>
+    </div>
+
+    <div id="sessionNotice" class="notice notice-warn session-notice" hidden>
+      <span class="notice-ico">!</span>
+      <div>
+        <strong>Your previous video session is no longer on the server</strong>
+        <span>The server was restarted or its uploads/outputs folders were cleared,
+        so the clips from that session are gone. Upload your clips again to continue.</span>
+      </div>
+    </div>
+
+    <section class="uploader" id="uploader">
+      <div class="uploader-art" aria-hidden="true">
+        <svg class="brick b1"><use href="#i-brick"/></svg>
+        <span class="uploader-ico"><svg><use href="#i-upload"/></svg></span>
+      </div>
+      <div class="uploader-copy">
+        <strong>Drop your LEGO clips here</strong>
+        <span>Builds, Technic, robotics, stop-motion — any mix, any orientation.</span>
+      </div>
+      <div class="uploader-actions">
+        <button id="browseClips" class="btn btn-primary btn-lg"><svg class="ico"><use href="#i-upload"/></svg>Upload clips</button>
+        <input id="clipInput" type="file" accept="video/*" multiple hidden>
+        <span class="uploader-fmt" id="binFormats">MOV · MP4 · M4V · AVI · MKV</span>
+      </div>
+      <div id="uploadProgress" class="uploading" hidden>
+        <div class="bar"><i></i></div><span></span>
+      </div>
+    </section>
+
+    <section class="bin">
+      <div class="bin-head">
+        <div>
+          <h2>Your clips</h2>
+          <p class="sub" id="clipTally"></p>
+        </div>
+        <span class="bin-tip">Drag to reorder</span>
+      </div>
+      <div id="clipList" class="cliplist"></div>
+      <div id="clipsEmpty" class="binempty">
+        <div class="ghost"></div><div class="ghost"></div><div class="ghost"></div>
+        <p>Your clips will appear here.</p>
+      </div>
+    </section>
+
+    <div class="stepnav">
+      <span class="stepnav-hint" id="step1Hint">Add at least one clip to continue.</span>
+      <button id="toStep2" class="btn btn-primary btn-lg" disabled>Continue<svg class="ico"><use href="#i-chev"/></svg></button>
+    </div>
+  </main>
+
+  <!-- ═══════════════════════════ 2 · CUSTOMIZE ═══════════════════════════ -->
+  <main id="step-2" class="step">
+    <div class="hero">
+      <span class="eyebrow"><svg class="ico"><use href="#i-spark"/></svg> Step 2 · Customize</span>
+      <h1>Set the <span class="grad">style</span> of your video.</h1>
+      <p class="lede">Smart defaults are already picked. Change anything you like —
+        or skip straight to creating.</p>
+    </div>
+
+    <div class="custom-layout">
+      <div class="custom-main">
+
+        <!-- ── story ── -->
+        <section class="card">
+          <div class="card-head">
+            <span class="card-num">01</span>
+            <div>
+              <h2>Story &amp; captions</h2>
+              <p class="sub">Optional. Write one line per caption, or leave it blank for a clean cut.</p>
+            </div>
+          </div>
+          <textarea id="script" rows="4" spellcheck="true"
+            placeholder="Frame goes together&#10;Gear rack drops in&#10;Motor spins up&#10;First full run"></textarea>
+          <div class="toolrow">
+            <label class="btn btn-ghost btn-sm">
+              <svg class="ico"><use href="#i-doc"/></svg>Import text
+              <input id="scriptFile" type="file" accept=".txt,.md,text/plain" hidden>
+            </label>
+            <button id="recordBtn" class="btn btn-ghost btn-sm">
+              <span class="rec-dot"></span> Record voice note
+            </button>
+            <span id="recordState" class="muted small"></span>
+          </div>
+
+          <div id="voiceBox" class="voicebox" hidden></div>
+
+          <div id="transcribeNotice" class="notice notice-warn">
+            <span class="notice-ico">!</span>
+            <div>
+              <strong>Voice transcription is unavailable.</strong>
+              <span id="transcribeWhy"></span>
+            </div>
+          </div>
+
+          <div id="captionPreview" class="capprev" hidden></div>
+
+          <div class="field">
+            <label>Running order</label>
+            <div class="tiles tiles-3" id="sequence" data-value="hook"></div>
+            <small class="hint" id="sequenceHint"></small>
+            <div id="noTimestamps" class="notice notice-info" hidden></div>
+          </div>
+        </section>
+
+        <!-- ── look ── -->
+        <section class="card">
+          <div class="card-head">
+            <span class="card-num">02</span>
+            <div>
+              <h2>Look &amp; motion</h2>
+              <p class="sub">Frame shape, pacing and how scenes flow into each other.</p>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Format</label>
+            <div class="tiles tiles-3 format-tiles" id="orientation" data-value="auto">
+              <button data-v="auto"><i class="shape shape-auto"></i><b>Auto</b><em>match my footage</em></button>
+              <button data-v="horizontal"><i class="shape shape-h"></i><b>Landscape</b><em>YouTube · 16:9</em></button>
+              <button data-v="vertical"><i class="shape shape-v"></i><b>Vertical</b><em>Shorts · Reels · 9:16</em></button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Pace</label>
+            <div class="tiles tiles-4" id="speed" data-value="normal">
+              <button data-v="slow"><b>Relaxed</b><em>0.75×</em></button>
+              <button data-v="normal"><b>Natural</b><em>1×</em></button>
+              <button data-v="fast"><b>Punchy</b><em>1.35×</em></button>
+              <button data-v="custom"><b>Custom</b><em>set it</em></button>
+            </div>
+            <div id="speedCustom" class="slider" hidden>
+              <input id="speedRange" type="range" min="0.4" max="2.5" step="0.05" value="1">
+              <output id="speedOut">1.00×</output>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Transitions</label>
+            <div class="tiles tiles-auto" id="transition" data-value="auto"></div>
+          </div>
+        </section>
+
+        <!-- ── sound ── -->
+        <section class="card">
+          <div class="card-head">
+            <span class="card-num">03</span>
+            <div>
+              <h2>Sound</h2>
+              <p class="sub">An AI score is composed to hit on every cut.</p>
+            </div>
+          </div>
+
+          <div class="tiles tiles-3" id="musicSource" data-value="generate">
+            <button data-v="generate"><b>AI soundtrack</b><em>composed for this cut</em></button>
+            <button data-v="upload"><b>My track</b><em>from your library</em></button>
+            <button data-v="none"><b>No music</b><em>silent bed</em></button>
+          </div>
+
+          <div id="moodWrap" class="subpanel">
+            <label class="sublabel">Mood</label>
+            <div class="chips" id="mood" data-value="auto"></div>
+            <small class="hint" id="moodHint"></small>
+          </div>
+
+          <div id="libraryWrap" class="subpanel" hidden>
+            <div class="row between wrap">
+              <label class="sublabel">Library</label>
+              <label class="btn btn-ghost btn-sm">
+                <svg class="ico"><use href="#i-upload"/></svg>Upload a track
+                <input id="musicFile" type="file" accept="audio/*" hidden>
+              </label>
+            </div>
+            <div id="trackList" class="tracklist"></div>
+          </div>
+
+          <div class="subpanel">
+            <label class="sublabel">Original clip audio</label>
+            <div class="tiles tiles-3" id="keepAudio" data-value="none"></div>
+            <small class="hint" id="keepAudioHint"></small>
+            <div id="audioDetected" class="notice notice-info" hidden></div>
+          </div>
+        </section>
+
+        <!-- ── export ── -->
+        <section class="card">
+          <div class="card-head">
+            <span class="card-num">04</span>
+            <div>
+              <h2>Export</h2>
+              <p class="sub">Name and output size of the finished video.</p>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="title">Video name</label>
+            <input id="title" type="text" placeholder="ALPHA_TITANS">
+          </div>
+
+          <div class="field">
+            <label>Resolution</label>
+            <div class="tiles tiles-4" id="resolution" data-value="1080p"></div>
+          </div>
+
+          <details class="advanced">
+            <summary><svg class="ico"><use href="#i-chev"/></svg>Advanced</summary>
+            <div class="advanced-body">
+              <div class="field">
+                <label>Quality</label>
+                <div class="tiles tiles-4" id="quality" data-value="high"></div>
+                <small class="hint">Quality sets how much detail is kept when the video is
+                  compressed. Higher keeps sharper edges on bricks and fine parts, but the file
+                  gets bigger and takes longer to render. It does not change the resolution.</small>
+                <small class="hint" id="qualityHint"></small>
+              </div>
+              <div class="field">
+                <label for="target">Target length</label>
+                <div class="row gap">
+                  <input id="target" type="number" min="8" max="600" step="1" placeholder="Auto">
+                  <span class="muted small">seconds · blank lets AI decide</span>
+                </div>
+              </div>
+              <div class="field">
+                <label>Transition length</label>
+                <div class="seg" id="xfade" data-value="auto">
+                  <button data-v="auto">Auto</button>
+                  <button data-v="0.2">0.2s</button>
+                  <button data-v="0.4">0.4s</button>
+                  <button data-v="0.7">0.7s</button>
+                  <button data-v="1.0">1.0s</button>
+                </div>
+              </div>
+            </div>
+          </details>
+        </section>
+      </div>
+
+      <!-- ── sticky summary ── -->
+      <aside class="custom-side">
+        <div class="card summary-card">
+          <p class="summary-eyebrow">Your video</p>
+          <div id="customSummary"></div>
+          <details class="aboutai">
+            <summary><svg class="ico"><use href="#i-spark"/></svg>How the AI works<svg class="ico chev"><use href="#i-chev"/></svg></summary>
+            <div id="visionState" class="notice notice-muted"></div>
+            <div id="agentRoster" class="agentroster"></div>
+          </details>
+        </div>
+      </aside>
+    </div>
+
+    <div class="stepnav">
+      <button id="backTo1" class="btn btn-ghost"><svg class="ico"><use href="#i-back"/></svg>Media</button>
+      <div class="row gap center-y">
+        <span class="stepnav-hint" id="startHint"></span>
+        <button id="startBuild" class="btn btn-primary btn-lg"><svg class="ico"><use href="#i-spark"/></svg>Create video</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- ═════════════════════════ 3 · AI PROCESSING ═════════════════════════ -->
+  <main id="step-3" class="step">
+    <div class="proc-hero">
+      <div class="ring" id="ring">
+        <div class="ring-glow" aria-hidden="true"></div>
+        <svg viewBox="0 0 120 120" aria-hidden="true">
+          <circle class="ring-bg" cx="60" cy="60" r="52"></circle>
+          <circle class="ring-fg" cx="60" cy="60" r="52" id="ringFg"></circle>
+        </svg>
+        <div class="ring-label"><b id="ringPct">0%</b><span id="ringState">queued</span></div>
+      </div>
+      <span class="eyebrow"><svg class="ico"><use href="#i-spark"/></svg> Step 3 · AI Processing</span>
+      <h1 id="procTitle">AI processing</h1>
+      <p class="lede" id="procSub">Waiting for the first stage</p>
+      <div class="proc-time" id="procTime" hidden></div>
+      <button id="cancelBuild" class="btn btn-ghost btn-sm">Cancel</button>
+    </div>
+
+    <div id="excluded" class="notice notice-warn" hidden></div>
+
+    <section class="card run-card">
+      <div class="card-head row between">
+        <div>
+          <h2>What the AI is doing</h2>
+          <p class="sub">Live progress from each agent working on your footage.</p>
+        </div>
+        <button id="stageToggle" class="btn btn-ghost btn-xs">Show all steps</button>
+      </div>
+      <ol class="stagerun" id="stageRun"></ol>
+    </section>
+
+    <section class="card fold" id="planCard" hidden>
+      <details>
+        <summary>
+          <div>
+            <h2>Creative decisions</h2>
+            <p class="sub">Every choice the AI made, and why.</p>
+          </div>
+          <svg class="ico chev"><use href="#i-chev"/></svg>
+        </summary>
+        <div class="planlegend">
+          <span class="planby vision">saw it</span> vision model on real frames
+          <span class="planby auto">decided</span> from the measurements
+          <span class="planby manual">yours</span> your setting
+        </div>
+        <div id="planList" class="planlist"></div>
+      </details>
+    </section>
+
+    <section class="card fold">
+      <details id="logDetails" class="logdetails">
+        <summary>
+          <div>
+            <h2>Technical log</h2>
+            <p class="sub" id="logCount">Raw pipeline output</p>
+          </div>
+          <svg class="ico chev"><use href="#i-chev"/></svg>
+        </summary>
+        <div class="logbar">
+          <label class="checkline"><input type="checkbox" id="autoscroll" checked> Follow output</label>
+          <button id="copyLog" class="btn btn-ghost btn-xs">Copy</button>
+        </div>
+        <pre id="log" class="log"></pre>
+      </details>
+    </section>
+
+    <div class="stepnav">
+      <button id="backTo2" class="btn btn-ghost"><svg class="ico"><use href="#i-back"/></svg>Customize</button>
+      <button id="toStep4" class="btn btn-primary btn-lg" disabled><svg class="ico"><use href="#i-play"/></svg>Watch video</button>
+    </div>
+  </main>
+
+  <!-- ══════════════════════════ 4 · FINAL VIDEO ══════════════════════════ -->
+  <main id="step-4" class="step">
+    <div id="outputEmpty" class="empty big">
+      <svg class="brick"><use href="#i-brick"/></svg>
+      <strong>No video yet</strong>
+      <span>Create one, or open a past video from <b>My videos</b>.</span>
+    </div>
+
+    <div id="outputBody" hidden>
+      <div class="final-head">
+        <div>
+          <span class="eyebrow ok"><svg class="ico"><use href="#i-check"/></svg> Your video is ready</span>
+          <h1 id="outName">Final video</h1>
+          <p class="lede" id="outLine"></p>
+        </div>
+        <div class="final-actions">
+          <button id="regenBtn" class="btn btn-ghost btn-lg"><svg class="ico"><use href="#i-redo"/></svg>Regenerate</button>
+          <a id="downloadBtn" class="btn btn-primary btn-lg" download><svg class="ico"><use href="#i-down"/></svg>Download</a>
+        </div>
+      </div>
+
+      <section class="player-card">
+        <div class="player-shell" id="playerShell">
+          <video id="player" controls playsinline preload="metadata"></video>
+        </div>
+        <div class="player-foot">
+          <div class="chips-row" id="outChips"></div>
+          <span class="qc" id="verifySummary"></span>
+        </div>
+        <div class="timeline" id="timeline"></div>
+      </section>
+
+      <section class="card fold">
+        <details>
+          <summary>
+            <div>
+              <h2>Technical details</h2>
+              <p class="sub">Quality checks, file specification and the scene list.</p>
+            </div>
+            <svg class="ico chev"><use href="#i-chev"/></svg>
+          </summary>
+          <div class="techgrid">
+            <div>
+              <h3>Quality checks</h3>
+              <div id="verify" class="verify"></div>
+            </div>
+            <div>
+              <h3>Specification</h3>
+              <dl id="meta" class="meta"></dl>
+            </div>
+          </div>
+          <h3 class="mt2">Scene list</h3>
+          <div class="tablewrap"><table id="cutsheet"></table></div>
+        </details>
+      </section>
+
+      <div class="stepnav">
+        <button id="backTo3" class="btn btn-ghost"><svg class="ico"><use href="#i-back"/></svg>Processing</button>
+        <button id="againBtn" class="btn btn-light"><svg class="ico"><use href="#i-plus"/></svg>Make another video</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- ═══════════════════════════ BUILDS DRAWER ═══════════════════════════ -->
+  <div id="drawer" class="drawer" hidden>
+    <div class="drawer-scrim" id="drawerScrim"></div>
+    <aside class="drawer-panel">
+      <div class="drawer-head">
+        <div>
+          <h2>My videos</h2>
+          <p class="sub" id="buildsSub"></p>
+        </div>
+        <button id="drawerClose" class="iconbtn" title="Close">×</button>
+      </div>
+      <div id="builds" class="buildlist"></div>
+      <div class="drawer-foot">
+        <div id="health" class="pill pill-muted">checking…</div>
+      </div>
+    </aside>
+  </div>
+
+  <div id="dropOverlay" hidden>
+    <div class="dropmsg">
+      <svg class="brick"><use href="#i-brick"/></svg>
+      <strong>Drop to add your clips</strong>
+      <span id="dropCount">release to upload</span>
+    </div>
+  </div>
+  <div id="dropzone" class="dropzone" hidden><div class="dz-inner"></div></div>
+
+  <div id="loader" class="loader boot">
+    <div class="loader-card">
+      <div class="lring spin" id="lrRing">
+        <svg viewBox="0 0 120 120" aria-hidden="true">
+          <circle class="lr-bg" cx="60" cy="60" r="50"></circle>
+          <circle class="lr-fg" cx="60" cy="60" r="50" id="lrFg"></circle>
+        </svg>
+        <svg class="lr-brick" aria-hidden="true"><use href="#i-brick"/></svg>
+        <b id="lrPct"></b>
+      </div>
+      <strong id="lrTitle">Starting the studio</strong>
+      <span id="lrSub">Connecting to Alpha Titans…</span>
+      <div class="lr-times">
+        <span>Elapsed <b id="lrElapsed">0.0s</b></span>
+        <span id="lrEtaWrap" hidden>Remaining <b id="lrEta">—</b></span>
+      </div>
+      <button id="lrRetry" class="btn btn-ghost btn-sm" hidden>Try again</button>
+    </div>
+  </div>
+
+  <div id="toasts" class="toasts"></div>
+</div>
+<script type="module" src="/static/app.js?v=5"></script>
+</body>
+</html>

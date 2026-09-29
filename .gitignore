@@ -1,0 +1,53 @@
+# secrets / local config — .env.example is the tracked template
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials/
+secrets/
+*credentials*.json
+*service-account*.json
+firebase*.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# node
+node_modules/
+
+# build artifacts
+dist/
+build/
+
+# footage in, renders out — never committed
+uploads/*
+outputs/*
+data/music/*
+!uploads/.gitkeep
+!outputs/.gitkeep
+!data/music/.gitkeep
+
+# generated test output. tests/fixtures/ is NOT ignored: those clips are real
+# inputs the backend suite uploads, so the tests cannot run without them.
+tests/screenshots/
+
+# editor/tooling backups. build_video.py.bak is the ONE exception — README.md
+# documents it as the pre-change copy kept deliberately for diffing.
+*.bak
+!pipeline/build_video.py.bak
+
+# scratch ffmpeg probe dumps and logs
+test_rel.txt
+*.signalstats.txt
+*.log
+
+# os
+.DS_Store
+Thumbs.db
