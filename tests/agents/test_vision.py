@@ -443,7 +443,9 @@ def test_vision_sits_between_clip_analysis_and_the_director():
         # property this test defends - that Vision runs after the
         # measurements and before the edit is planned - is unchanged.
         assert ("vision", "content_strategy") in edges
-        assert ("content_strategy", "editing_director") in edges
+        assert ("content_strategy", "story") in edges
+        assert ("story", "editing_director") in edges
+        assert ("content_strategy", "editing_director") not in edges
         assert ("vision", "editing_director") not in edges
         # the revision cycle is untouched
         assert ("critic", "editing_director") in edges

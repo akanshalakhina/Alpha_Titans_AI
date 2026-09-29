@@ -44,7 +44,7 @@ import time
 
 from .artifacts import (Artifact, ClipAnalysis, ClipAnalysisSet, Cost,
                         ContentStrategy, Decision, EditPlan,
-                        RevisionRequest, Segment, VisionAnalysis)
+                        RevisionRequest, Segment, Story, VisionAnalysis)
 from .base import Agent, AgentContext
 from .tools import select_tools as ST
 from .tools.llm_tools import LLMReply
@@ -105,7 +105,8 @@ class EditingDirectorAgent(Agent):
                 revision_request: RevisionRequest | None = None,
                 clip_analysis_id: str = "",
                 vision: VisionAnalysis | None = None,
-                strategy: ContentStrategy | None = None
+                strategy: ContentStrategy | None = None,
+                story: Story | None = None
                 ) -> Artifact[EditPlan]:
         started = time.time()
         constraints = dict(revision_request.constraints) if revision_request else {}
@@ -123,6 +124,12 @@ class EditingDirectorAgent(Agent):
             (strategy.central_topic, strategy.core_angle, strategy.pacing,
              tuple(strategy.ordered_clips), strategy.hook.clip_id)
             if strategy else None,
+            # a different narrative is a different planning problem: the
+            # order the story is TOLD in changes which clip opens and what
+            # follows it, so a changed story must not reuse the old plan
+            (story.logline, tuple(story.clip_order),
+             tuple((b.role, b.clip_id) for b in story.beats))
+            if story else None,
         )
 
         usable = clip_set.usable_clips
@@ -136,7 +143,8 @@ class EditingDirectorAgent(Agent):
 
         # ---- 1. reasoning, if a model is available -----------------------
         proposal, reject_reason, reply = self._ask_llm(
-            ctx, span, clip_set, usable, constraints, vision, strategy)
+            ctx, span, clip_set, usable, constraints, vision, strategy,
+            story)
 
         if reply is not None:
             cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
@@ -259,6 +267,20 @@ class EditingDirectorAgent(Agent):
                 decided_by="policy",
                 confidence=round(strategy.confidence, 2)))
 
+        if story is not None and story.beats:
+            decisions.append(Decision(
+                what="Narrative from the Story agent",
+                chose=" -> ".join(f"{b.role}:{b.clip_id}"
+                                  for b in story.beats[:5]),
+                why=("the order the story is told in; this plan decides how "
+                     "it is cut. The narrative carries no timestamps, so "
+                     "every in/out point below is still the deterministic "
+                     "window search"
+                     + ("" if story.live else
+                        " - and this sequence was assembled, not authored")),
+                decided_by="policy",
+                confidence=round(story.confidence, 2)))
+
         decisions.extend(self._plan_decisions(plan, clip_set))
 
         ctx.emit("edit plan: %d segments, %.1fs total, opens on %s"
@@ -280,14 +302,15 @@ class EditingDirectorAgent(Agent):
                  clip_set: ClipAnalysisSet, usable: list[ClipAnalysis],
                  constraints: dict,
                  vision: VisionAnalysis | None = None,
-                 strategy: ContentStrategy | None = None
+                 strategy: ContentStrategy | None = None,
+                 story: Story | None = None
                  ) -> tuple[dict | None, str, LLMReply | None]:
         """Returns (validated_proposal | None, reject_reason, reply | None)."""
         if not ctx.llm.available():
             return None, ctx.llm.describe()["why_disabled"] or "no LLM configured", None
 
         prompt = self._build_prompt(clip_set, usable, constraints, vision,
-                                    strategy)
+                                    strategy, story)
         span.tool("llm.complete_json", provider=ctx.llm.describe().get("provider"),
                   model=ctx.llm.describe().get("model"),
                   prompt_chars=len(prompt))
@@ -307,7 +330,8 @@ class EditingDirectorAgent(Agent):
     def _build_prompt(self, clip_set: ClipAnalysisSet,
                       usable: list[ClipAnalysis], constraints: dict,
                       vision: VisionAnalysis | None = None,
-                      strategy: ContentStrategy | None = None) -> str:
+                      strategy: ContentStrategy | None = None,
+                      story: Story | None = None) -> str:
         from .tools.pipeline_bridge import build_video
 
         rows = "\n".join(
@@ -399,6 +423,39 @@ class EditingDirectorAgent(Agent):
             stext = ("\nTHE BRIEF\n" + "\n".join(bits)
                      + caveat + "\n")
 
+        # The narrative from the Story agent: the order the video is TOLD
+        # in. It names no timestamps and cannot, so following it still leaves
+        # every in/out point to the deterministic window search below.
+        ntext = ""
+        if story is not None and story.beats:
+            # NOT `rows`: that name already holds the clip table above, and
+            # shadowing it here silently fed a list into the prompt format
+            beat_rows = []
+            for b in story.beats:
+                line = "    %d. %-9s %-28s" % (b.index, b.role, b.clip_id)
+                if b.narrative:
+                    line += " " + b.narrative[:80]
+                beat_rows.append(line)
+            head = []
+            if story.logline:
+                head.append(f"  logline   {story.logline}")
+            for label, val in (("hook", story.hook), ("setup", story.setup),
+                               ("builds", story.progression),
+                               ("payoff", story.payoff),
+                               ("ending", story.ending)):
+                if val:
+                    head.append(f"  {label:<10}{val}")
+            caveat = ("\n  This sequence was assembled "
+                      "deterministically, not authored - weigh it lightly."
+                      if not story.live else
+                      "\n  This is the order the story should be "
+                      "TOLD in. You still choose\n  the cut, the "
+                      "trims and every in/out point; the measurements above "
+                      "outrank it.")
+            ntext = ("\nTHE NARRATIVE\n"
+                     + ("\n".join(head) + "\n" if head else "")
+                     + "  beats:\n" + "\n".join(beat_rows) + caveat + "\n")
+
         ctext = ""
         if constraints:
             lines = "\n".join(f"  - {k}: {v}" for k, v in constraints.items())
@@ -411,7 +468,7 @@ class EditingDirectorAgent(Agent):
             clips=rows + vtext, orientation=clip_set.orientation,
             canvas="%dx%d" % clip_set.canvas,
             target=clip_set.target_seconds, median=median,
-            strategy=stext, constraints=ctext,
+            strategy=stext + ntext, constraints=ctext,
             names=", ".join(c.clip_id for c in usable),
             min_seg=build_video.MIN_SEG, max_seg=build_video.MAX_SEG)
 

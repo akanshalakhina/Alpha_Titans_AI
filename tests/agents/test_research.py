@@ -492,7 +492,9 @@ def test_research_is_a_parallel_branch_that_joins_at_the_strategy():
         # join - now at the strategy, which then briefs the director
         assert ("vision", "content_strategy") in edges
         assert ("research", "content_strategy") in edges
-        assert ("content_strategy", "editing_director") in edges
+        assert ("content_strategy", "story") in edges
+        assert ("story", "editing_director") in edges
+        assert ("content_strategy", "editing_director") not in edges
         assert ("research", "editing_director") not in edges
         # research is independent of vision
         assert ("vision", "research") not in edges

@@ -94,7 +94,7 @@ class Cost(BaseModel):
 
 ArtifactKind = Literal[
     "JobState", "ClipAnalysis", "VisionAnalysis", "ResearchReport",
-    "ContentStrategy",
+    "ContentStrategy", "Story",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
     "RevisionRequest",
 ]
@@ -577,6 +577,124 @@ class ContentStrategy(BaseModel):
                 for c in sorted(self.clip_priorities, key=lambda c: c.priority)]
 
 
+# ------------------------------------------------------------- Story
+
+BeatRole = Literal["hook", "setup", "develop", "turn", "payoff", "ending"]
+StoryType = Literal["reasoned", "degraded", "minimal"]
+
+
+class StoryBeat(BaseModel):
+    """One moment in the narrative, pinned to footage that exists.
+
+    `extra="forbid"` is the timestamp guard, and it is structural rather than
+    advisory: a reply carrying `start`, `end`, `duration` or `at` fails
+    validation outright instead of having the field quietly ignored. A beat
+    says WHAT happens and in WHICH clip; when it happens stays a measurement,
+    and that stays with the deterministic window search downstream.
+
+    `moment_ref` is an INDEX into the clip's `interesting_moments` - the same
+    discipline Vision uses for `chosen_window` and ContentStrategy uses for
+    its own clip priorities. An index can only ever point at something that
+    was already measured.
+
+    `support` is derived from what survived validation, never from what the
+    model claimed: a beat citing research must name a url actually in the
+    ResearchReport, and its clip must be one Vision actually analysed.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    index: int = Field(ge=1)
+    role: BeatRole = "develop"
+    clip_id: str
+    moment_ref: int | None = Field(default=None, ge=0)
+    narrative: str = ""
+    why: str = ""
+    support: Support = "none"
+    evidence_urls: list[str] = Field(default_factory=list)
+
+
+class Story(BaseModel):
+    """The narrative shape of the video: what is told, and in what order.
+
+    ContentStrategy decides WHAT the video should communicate. Story decides
+    HOW that lands as a sequence - the hook, the setup, the beats between,
+    the payoff and the ending. The EditingDirector then decides how it is
+    CUT. None of those three is the same question, which is why this sits
+    between them rather than inside either.
+
+    WHAT IT MAY NOT DO
+    ------------------
+    No timestamps, no durations, no in/out points, no transitions, no filter
+    strings, no shell. Every beat names a clip id and, optionally, an index
+    into moments Vision already measured. Timing belongs to the deterministic
+    window search, and nothing here can express it.
+
+    DEGRADATION IS EXPLICIT
+    -----------------------
+    `strategy_available`, `vision_available` and `research_available` record
+    what this story was actually built from. A story written without a
+    semantic reading of the footage is a legitimate output; one that quietly
+    pretends it had one is not.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    domain: str = ""
+    story_type: StoryType = "minimal"
+
+    logline: str = ""
+    hook: str = ""
+    setup: str = ""
+    progression: str = ""
+    payoff: str = ""
+    ending: str = ""
+
+    beats: list[StoryBeat] = Field(default_factory=list)
+    themes: list[str] = Field(default_factory=list)
+
+    # provenance: what this story was actually built from
+    strategy_available: bool = False
+    vision_available: bool = False
+    research_available: bool = False
+    research_basis: list[str] = Field(default_factory=list)   # cited urls
+    vision_basis: list[str] = Field(default_factory=list)     # cited clip ids
+
+    risks: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    insufficient_signal: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    live: bool = False                 # True only for a real model call
+    model: str | None = None
+
+    @field_validator("beats")
+    @classmethod
+    def _indices_contiguous(cls, v):
+        """Beats are an ORDER. Gaps or repeats would make the sequence
+        ambiguous, so they are rejected rather than silently renumbered
+        here - the agent renumbers before construction."""
+        if not v:
+            return v
+        want = list(range(1, len(v) + 1))
+        got = [b.index for b in v]
+        if got != want:
+            raise ValueError(f"beat indices must be 1..n in order, got {got}")
+        return v
+
+    @property
+    def grounded_beats(self) -> list[StoryBeat]:
+        return [b for b in self.beats if b.support != "none"]
+
+    @property
+    def clip_order(self) -> list[str]:
+        """Clip ids in narrative order - a suggestion to the director, with
+        no timing attached and no duplicate removed: a clip may legitimately
+        appear in more than one beat."""
+        return [b.clip_id for b in self.beats]
+
+    def beat_for(self, role: str) -> "StoryBeat | None":
+        return next((b for b in self.beats if b.role == role), None)
+
+
 # -------------------------------------------------------------- EditPlan
 
 class Segment(BaseModel):
@@ -831,6 +949,7 @@ __all__ = [
     "EvidenceItem", "TrendItem", "ContentOpportunity", "ResearchReport",
     "KeyPoint", "ClipPriority", "Hook", "ContentStrategy",
     "Pacing", "ClipRole", "Support", "StrategyType",
+    "BeatRole", "StoryType", "StoryBeat", "Story",
     "Segment", "EditPlan",
     "SegmentRenderSpec", "RenderSpec",
     "SegmentRenderInfo", "RenderTechnical", "RenderResult",

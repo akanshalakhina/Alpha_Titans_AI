@@ -80,7 +80,9 @@ def test_the_graph_has_the_cycle():
         # before "how do we cut it".
         assert ("vision", "content_strategy") in edges
         assert ("research", "content_strategy") in edges
-        assert ("content_strategy", "editing_director") in edges
+        assert ("content_strategy", "story") in edges
+        assert ("story", "editing_director") in edges
+        assert ("content_strategy", "editing_director") not in edges
         # the edges those two replaced must be GONE, or the director would be
         # briefed and un-briefed on the same run
         assert ("vision", "editing_director") not in edges
@@ -221,7 +223,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     none of those inputs changed, and doing so would make every revision cost
     a full pass over everything.
     """
-    from agents.artifacts import ContentStrategy, ResearchReport, VisionAnalysis
+    from agents.artifacts import (ContentStrategy, ResearchReport, Story,
+                                  VisionAnalysis)
 
     job = _job(agent_root, calm_clip, lively_clip, "gnorerun")
     llm = llm_returning_plan(
@@ -234,7 +237,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     store = _store(job)
     for kind, model in (("VisionAnalysis", VisionAnalysis),
                         ("ResearchReport", ResearchReport),
-                        ("ContentStrategy", ContentStrategy)):
+                        ("ContentStrategy", ContentStrategy),
+                        ("Story", Story)):
         revs = store.all_revisions(job.job_id, kind, model)
         assert len(revs) == 1, f"{kind} re-ran on a revision ({len(revs)}x)"
 
@@ -248,6 +252,7 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     tracer = shared_tracer(outputs=Path(job.build_dir).resolve().parent)
     nodes = [r["node"] for r in tracer.for_job(job.job_id)]
     assert nodes.count("content_strategy") == 1
+    assert nodes.count("story") == 1
     assert nodes.count("editing_director") == 2
 
 
@@ -279,7 +284,9 @@ def test_the_strategy_joins_vision_and_research_before_the_director(
     ends = {r["node"]: r["ended_at"] for r in rows}
     assert started["content_strategy"] >= ends["vision"]
     assert started["content_strategy"] >= ends["research"]
-    assert started["editing_director"] >= ends["content_strategy"]
+    assert "story" in started
+    assert started["story"] >= ends["content_strategy"]
+    assert started["editing_director"] >= ends["story"]
 
 
 @pytest.mark.slow
@@ -301,7 +308,7 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     # the strategy ranking the clips deterministically. An agent that silently
     # produced nothing would be indistinguishable from one that never ran.
     assert kinds == {"ClipAnalysis", "VisionAnalysis", "ResearchReport",
-                     "ContentStrategy", "EditPlan", "RenderResult",
+                     "ContentStrategy", "Story", "EditPlan", "RenderResult",
                      "CriticResult"}
 
     producers = {r["kind"]: r["produced_by"] for r in rows}
@@ -309,6 +316,7 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     assert producers["VisionAnalysis"] == "vision"
     assert producers["ResearchReport"] == "research"
     assert producers["ContentStrategy"] == "content_strategy"
+    assert producers["Story"] == "story"
     assert producers["EditPlan"] == "editing_director"
     assert producers["RenderResult"] == "rendering"
     assert producers["CriticResult"] == "critic"
