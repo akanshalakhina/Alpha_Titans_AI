@@ -94,7 +94,7 @@ class Cost(BaseModel):
 
 ArtifactKind = Literal[
     "JobState", "ClipAnalysis", "VisionAnalysis", "ResearchReport",
-    "ContentStrategy", "Story", "Voiceover", "Music",
+    "ContentStrategy", "Story", "Voiceover", "Music", "Animation",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
     "RevisionRequest",
 ]
@@ -946,6 +946,140 @@ class Music(BaseModel):
                      if s.beat_index == beat_index), None)
 
 
+# --------------------------------------------------------- Animation
+
+# The TWO framing treatments `pipeline/build_video.py::fit_filter` actually
+# implements. There is no third, and there is no motion of any kind: the
+# render engine contains no zoompan, no Ken Burns, no pan and no zoom.
+#
+#   fill      orientations match -> scale to fill, then crop
+#   blur_pad  they do not        -> blurred darkened bed, fitted foreground
+#
+# Which one applies is decided by orientation, not by taste, so it is DERIVED
+# here rather than chosen. A test asserts both branches still exist in
+# fit_filter, so this cannot quietly stop matching the engine.
+Treatment = Literal["fill", "blur_pad"]
+
+# What should draw the eye. This is judgement, and it is the one thing on a
+# direction the model genuinely decides.
+Emphasis = Literal["none", "subject", "context", "text"]
+
+# Whether this beat wants words on screen. The Caption agent - which does not
+# exist yet - would write them; this only says whether there is a place for
+# them, and the engine's drawtext can honour exactly that.
+CaptionIntent = Literal["none", "short_label", "key_phrase"]
+
+AnimationType = Literal["reasoned", "degraded", "minimal"]
+
+
+class AnimationDirection(BaseModel):
+    """How ONE story beat should be presented on the canvas.
+
+    `extra="forbid"` is the guard, and it is structural: a reply carrying
+    `start`, `end`, `duration`, `zoom`, `filter`, `path` or `ffmpeg` fails
+    validation outright. Nothing here can express when something happens, how
+    long it lasts, or how it is rendered.
+
+    `beat_index` is the only pointer the model supplies. `clip_id` is COPIED
+    from that beat and `treatment` is DERIVED from the clip's orientation
+    against the canvas - the same rule `fit_filter` applies - so neither can
+    be invented.
+
+    `supported` records whether the engine can realise this direction today.
+    An unsupported wish is kept and flagged rather than dropped, because it is
+    useful to know what was wanted; it is never presented as something that
+    will happen.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    index: int = Field(ge=1)
+    beat_index: int = Field(ge=1)       # -> StoryBeat.index
+    clip_id: str                        # copied from that beat
+    treatment: Treatment = "fill"       # DERIVED from orientation
+    emphasis: Emphasis = "none"         # the model's judgement
+    caption_intent: CaptionIntent = "none"
+    intent: str = ""                    # why, in words
+    supported: bool = True              # can the engine do this today?
+
+
+class Animation(BaseModel):
+    """How the cut should LOOK, within what the renderer can actually do.
+
+    The engine's visual vocabulary is small and this artifact does not pretend
+    otherwise. `engine_capabilities` is measured from the render module, and
+    `unsupported_requests` records anything asked for that falls outside it -
+    motion, zoom, parallax, anything with movement - so the gap is visible
+    instead of implied.
+
+    Between-segment transitions are NOT here. Those are xfade, and they belong
+    to the Transition agent, which does not exist yet.
+
+    NO ASSET IS EVER NAMED. There is no overlay library, no lower-third pack
+    and no motion-graphics template in this project, so a direction that
+    referenced one would be fiction.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    domain: str = ""
+    animation_type: AnimationType = "minimal"
+
+    visual_style: str = ""              # the look, in a sentence
+    pacing_feel: str = ""
+    directions: list[AnimationDirection] = Field(default_factory=list)
+
+    # what the renderer can actually do, measured - never model output
+    engine_capabilities: list[str] = Field(default_factory=list)
+    # what was asked for and cannot be done today
+    unsupported_requests: list[str] = Field(default_factory=list)
+
+    # provenance: what this direction was actually built from
+    story_available: bool = False
+    strategy_available: bool = False
+    vision_available: bool = False
+    beats_covered: list[int] = Field(default_factory=list)
+
+    risks: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    insufficient_signal: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    live: bool = False                 # True only for a real model call
+    model: str | None = None
+
+    @field_validator("directions")
+    @classmethod
+    def _indices_contiguous(cls, v):
+        """Directions follow the beats in order. A gap or a repeat would make
+        the sequence ambiguous, so it is rejected rather than silently
+        renumbered here - the agent renumbers before construction."""
+        if not v:
+            return v
+        want = list(range(1, len(v) + 1))
+        got = [d.index for d in v]
+        if got != want:
+            raise ValueError(
+                f"direction indices must be 1..n in order, got {got}")
+        return v
+
+    @property
+    def supported_directions(self) -> list[AnimationDirection]:
+        return [d for d in self.directions if d.supported]
+
+    @property
+    def captioned_beats(self) -> list[int]:
+        """Beats that want words on screen, for the Caption agent later."""
+        return [d.beat_index for d in self.directions
+                if d.caption_intent != "none"]
+
+    @property
+    def treatments(self) -> list[str]:
+        return [d.treatment for d in self.directions]
+
+    def direction_for(self, beat_index: int) -> "AnimationDirection | None":
+        return next((d for d in self.directions
+                     if d.beat_index == beat_index), None)
+
+
 # -------------------------------------------------------------- EditPlan
 
 class Segment(BaseModel):
@@ -1203,6 +1337,8 @@ __all__ = [
     "BeatRole", "StoryType", "StoryBeat", "Story",
     "Tone", "VoiceoverType", "NarrationSegment", "Voiceover",
     "Mood", "Energy", "TempoFeel", "MusicType", "MusicSection", "Music",
+    "Treatment", "Emphasis", "CaptionIntent", "AnimationType",
+    "AnimationDirection", "Animation",
     "Segment", "EditPlan",
     "SegmentRenderSpec", "RenderSpec",
     "SegmentRenderInfo", "RenderTechnical", "RenderResult",

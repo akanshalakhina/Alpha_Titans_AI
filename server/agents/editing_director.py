@@ -44,8 +44,8 @@ import time
 
 from .artifacts import (Artifact, ClipAnalysis, ClipAnalysisSet, Cost,
                         ContentStrategy, Decision, EditPlan,
-                        Music, RevisionRequest, Segment, Story,
-                        VisionAnalysis, Voiceover)
+                        Animation, Music, RevisionRequest, Segment,
+                        Story, VisionAnalysis, Voiceover)
 from .base import Agent, AgentContext
 from .tools import select_tools as ST
 from .tools.llm_tools import LLMReply
@@ -109,7 +109,8 @@ class EditingDirectorAgent(Agent):
                 strategy: ContentStrategy | None = None,
                 story: Story | None = None,
                 voiceover: Voiceover | None = None,
-                music: Music | None = None
+                music: Music | None = None,
+                animation: Animation | None = None
                 ) -> Artifact[EditPlan]:
         started = time.time()
         constraints = dict(revision_request.constraints) if revision_request else {}
@@ -143,6 +144,12 @@ class EditingDirectorAgent(Agent):
             # a changed score is a different planning problem
             (music.mood, music.tempo_feel, tuple(music.energy_shape))
             if music else None,
+            # emphasis and caption intent change what a beat has to show,
+            # so a changed look is a different planning problem
+            (tuple(animation.treatments),
+             tuple((d.beat_index, d.emphasis, d.caption_intent)
+                   for d in animation.directions))
+            if animation else None,
         )
 
         usable = clip_set.usable_clips
@@ -157,7 +164,7 @@ class EditingDirectorAgent(Agent):
         # ---- 1. reasoning, if a model is available -----------------------
         proposal, reject_reason, reply = self._ask_llm(
             ctx, span, clip_set, usable, constraints, vision, strategy,
-            story, voiceover, music)
+            story, voiceover, music, animation)
 
         if reply is not None:
             cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
@@ -324,6 +331,23 @@ class EditingDirectorAgent(Agent):
                 decided_by="policy",
                 confidence=round(music.confidence, 2)))
 
+        if animation is not None and animation.directions:
+            decisions.append(Decision(
+                what="Look brief from the Animation agent",
+                chose=", ".join(animation.treatments[:6])
+                      + (f" | {len(animation.captioned_beats)} beat(s) "
+                         f"want text"
+                         if animation.captioned_beats else ""),
+                why=("framing is derived from orientation and is what "
+                     "the renderer will do regardless; the emphasis is "
+                     "advisory and carries no duration - every in/out "
+                     "point below is still the deterministic window "
+                     "search"
+                     + ("" if animation.live else
+                        " - and no emphasis was judged")),
+                decided_by="policy",
+                confidence=round(animation.confidence, 2)))
+
         decisions.extend(self._plan_decisions(plan, clip_set))
 
         ctx.emit("edit plan: %d segments, %.1fs total, opens on %s"
@@ -348,14 +372,16 @@ class EditingDirectorAgent(Agent):
                  strategy: ContentStrategy | None = None,
                  story: Story | None = None,
                  voiceover: Voiceover | None = None,
-                 music: Music | None = None
+                 music: Music | None = None,
+                 animation: Animation | None = None
                  ) -> tuple[dict | None, str, LLMReply | None]:
         """Returns (validated_proposal | None, reject_reason, reply | None)."""
         if not ctx.llm.available():
             return None, ctx.llm.describe()["why_disabled"] or "no LLM configured", None
 
         prompt = self._build_prompt(clip_set, usable, constraints, vision,
-                                    strategy, story, voiceover, music)
+                                    strategy, story, voiceover, music,
+                                    animation)
         span.tool("llm.complete_json", provider=ctx.llm.describe().get("provider"),
                   model=ctx.llm.describe().get("model"),
                   prompt_chars=len(prompt))
@@ -378,7 +404,8 @@ class EditingDirectorAgent(Agent):
                       strategy: ContentStrategy | None = None,
                       story: Story | None = None,
                       voiceover: Voiceover | None = None,
-                      music: Music | None = None) -> str:
+                      music: Music | None = None,
+                      animation: Animation | None = None) -> str:
         from .tools.pipeline_bridge import build_video
 
         rows = "\n".join(
@@ -549,6 +576,33 @@ class EditingDirectorAgent(Agent):
             mtext = ("\nTHE SCORE\n" + "\n".join(m_head) + "\n"
                      + "\n".join(m_rows) + m_caveat + "\n")
 
+        # The look brief. Framing is already decided by orientation, so what
+        # reaches the director is the EMPHASIS - which beats need to show a
+        # subject clearly, and which want room for words.
+        atext = ""
+        if animation is not None and animation.directions:
+            a_rows = []
+            for d in animation.supported_directions:
+                bits = [d.treatment]
+                if d.emphasis != "none":
+                    bits.append("emphasis: " + d.emphasis)
+                if d.caption_intent != "none":
+                    bits.append("wants text: " + d.caption_intent)
+                a_rows.append("    beat %d: %s" % (d.beat_index,
+                                                   ", ".join(bits)))
+            a_head = []
+            if animation.visual_style:
+                a_head.append("  style: %s" % animation.visual_style)
+            a_caveat = ("\n  A beat that has to show a subject clearly, or "
+                        "carry text, needs a\n  little longer on screen. This "
+                        "is not a duration - you still choose\n  every in/out "
+                        "point from the measurements above."
+                        if animation.live else
+                        "\n  Framing only; no emphasis was judged.")
+            atext = ("\nTHE LOOK\n"
+                     + ("\n".join(a_head) + "\n" if a_head else "")
+                     + "\n".join(a_rows) + a_caveat + "\n")
+
         ctext = ""
         if constraints:
             lines = "\n".join(f"  - {k}: {v}" for k, v in constraints.items())
@@ -561,7 +615,8 @@ class EditingDirectorAgent(Agent):
             clips=rows + vtext, orientation=clip_set.orientation,
             canvas="%dx%d" % clip_set.canvas,
             target=clip_set.target_seconds, median=median,
-            strategy=stext + ntext + vtext2 + mtext, constraints=ctext,
+            strategy=stext + ntext + vtext2 + mtext + atext,
+            constraints=ctext,
             names=", ".join(c.clip_id for c in usable),
             min_seg=build_video.MIN_SEG, max_seg=build_video.MAX_SEG)
 
