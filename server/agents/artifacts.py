@@ -33,7 +33,7 @@ import json
 import time
 import uuid
 from enum import Enum
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -1252,6 +1252,33 @@ class EditPlan(BaseModel):
     rejected: list[dict] = Field(default_factory=list)
     budget_method: str = "sqrt-weighted"
     constraints_applied: list[str] = Field(default_factory=list)
+
+    # The join sequence the Transition agent chose, carried on the plan so it
+    # reaches `compile_render_spec` -> `RenderSpec.xfade_list` -> AT_XFADES.
+    # Empty means "the renderer's default", which is what every plan made
+    # before the Transition agent existed will say.
+    xfade_list: list[str] = Field(default_factory=list)
+
+    @field_validator("xfade_list", mode="before")
+    @classmethod
+    def _only_supported_transitions(cls, v):
+        """The last gate before a transition name can reach the renderer.
+
+        `Transition.kind` is already a closed literal, so a sequence coming
+        from that agent is safe by construction. This exists for every OTHER
+        way an EditPlan can be built - a test fixture, a resumed job, a future
+        caller - because a name ffmpeg does not know makes the render fail
+        outright, and failing here with a dropped entry is far better than
+        failing there with a dead build.
+
+        `mode="before"` so this runs ahead of the list[str] type check and
+        FILTERS rather than raising: one odd entry on a resumed job should
+        cost that entry, not the build.
+        """
+        if not isinstance(v, list):
+            return []
+        allowed = set(get_args(TransitionKind))
+        return [x for x in v if isinstance(x, str) and x in allowed]
 
     @field_validator("segments")
     @classmethod

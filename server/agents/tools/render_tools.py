@@ -49,9 +49,19 @@ def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
                         title: str = "ALPHA_TITANS") -> RenderSpec:
     """EditPlan -> RenderSpec. Deterministic; never authored by a model.
 
-    The transition list is a plain `fade` for every cut in Phase 1: the
-    Transition Agent is Phase 4 and inventing a richer choice here would be
-    pretending to a capability this phase does not have.
+    The transition list comes from the plan when the Transition agent chose
+    one, and falls back to a plain `fade` per cut when it did not - which is
+    what every plan made before that agent existed carries, so old jobs and
+    resumed checkpoints behave exactly as they did.
+
+    The names are safe by the time they arrive twice over: `Transition.kind`
+    is a closed literal, and `EditPlan.xfade_list` re-filters against the
+    renderer's vocabulary on the way in. Nothing else may set it.
+
+    Length is not forced to match `n_cuts`. build_video indexes the list
+    cyclically - `XFADES[(i - 1) % len(XFADES)]` - so a shorter sequence
+    repeats and a longer one is simply not reached, both of which are
+    harmless. Padding or truncating here would invent a choice nobody made.
     """
     n_cuts = max(len(plan.segments) - 1, 1)
     return RenderSpec(
@@ -63,7 +73,7 @@ def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
         preset="fast",
         fps=30,
         xfade_duration=float(xfade_duration),
-        xfade_list=["fade"] * n_cuts,
+        xfade_list=list(plan.xfade_list) or ["fade"] * n_cuts,
         title=title,
         segments=[
             SegmentRenderSpec(

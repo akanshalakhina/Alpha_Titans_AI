@@ -255,6 +255,11 @@ class EditingDirectorAgent(Agent):
                 rejected=[{"clip_id": c.clip_id, "why": c.usability.reason}
                           for c in clip_set.clips if not c.usability.usable],
                 constraints_applied=sorted(constraints.keys()),
+                # carried so it reaches compile_render_spec -> AT_XFADES.
+                # Every name is already a closed literal on the Transition
+                # artifact, and EditPlan re-filters on the way in.
+                xfade_list=(list(transition.xfade_sequence)
+                            if transition else []),
             )
         except Exception as exc:
             # The plan itself failed schema validation. Last resort: the
@@ -273,6 +278,8 @@ class EditingDirectorAgent(Agent):
                 canvas=clip_set.canvas,
                 strategy="deterministic motion-weighted plan",
                 opening_rationale="liveliest clip opens (pipeline default)",
+                xfade_list=(list(transition.xfade_sequence)
+                            if transition else []),
             )
             degraded = True
             fallback = "deterministic_planner (assembled plan failed validation)"
