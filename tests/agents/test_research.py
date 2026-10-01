@@ -497,7 +497,9 @@ def test_research_is_a_parallel_branch_that_joins_at_the_strategy():
         assert ("voiceover", "music") in edges
         assert ("music", "animation") in edges
         assert ("animation", "transition") in edges
-        assert ("transition", "editing_director") in edges
+        assert ("transition", "caption") in edges
+        assert ("caption", "editing_director") in edges
+        assert ("transition", "editing_director") not in edges
         assert ("animation", "editing_director") not in edges
         assert ("music", "editing_director") not in edges
         assert ("voiceover", "editing_director") not in edges

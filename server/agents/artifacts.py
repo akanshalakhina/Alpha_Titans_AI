@@ -35,7 +35,8 @@ import uuid
 from enum import Enum
 from typing import Any, Generic, Literal, TypeVar, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+                      model_validator)
 
 SCHEMA_VERSION = 1
 
@@ -95,7 +96,7 @@ class Cost(BaseModel):
 ArtifactKind = Literal[
     "JobState", "ClipAnalysis", "VisionAnalysis", "ResearchReport",
     "ContentStrategy", "Story", "Voiceover", "Music", "Animation",
-    "Transition",
+    "Transition", "Caption",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
     "RevisionRequest",
 ]
@@ -965,9 +966,9 @@ Treatment = Literal["fill", "blur_pad"]
 # direction the model genuinely decides.
 Emphasis = Literal["none", "subject", "context", "text"]
 
-# Whether this beat wants words on screen. The Caption agent - which does not
-# exist yet - would write them; this only says whether there is a place for
-# them, and the engine's drawtext can honour exactly that.
+# Whether this beat wants words on screen. The Caption agent writes them; this
+# only says whether there is a place for them, and the engine's drawtext can
+# honour exactly that.
 CaptionIntent = Literal["none", "short_label", "key_phrase"]
 
 AnimationType = Literal["reasoned", "degraded", "minimal"]
@@ -1200,6 +1201,166 @@ class Transition(BaseModel):
                     None)
 
 
+# ----------------------------------------------------------- Caption
+
+# The ONE caption treatment `pipeline/build_video.py::fit_filter` implements:
+#
+#   drawtext  x=(w-text_w)/2   y=h-160 horizontal | h-470 vertical
+#             fontcolor=white  borderw=3  bordercolor=black@0.7
+#             fontsize 48 horizontal | 56 vertical
+#             shown from 0.25s in until 0.35s before the segment ends
+#
+# One line per segment, never wrapped. There is no second position, no colour
+# or box choice, no animation and no per-word timing - so each literal below
+# has exactly one member, and a reply asking for anything else is recorded as
+# unsupported rather than promised. A parity test asserts these still match
+# fit_filter, so the two cannot quietly drift apart.
+CaptionPosition = Literal["bottom_center"]
+CaptionStyle = Literal["outlined_white"]
+
+# Where a caption's words were FOUND - never what the model claimed. The agent
+# locates the span in the beat's validated text and records which one held it.
+CaptionSource = Literal["voiceover", "story"]
+CaptionType = Literal["reasoned", "degraded", "minimal"]
+
+
+class CaptionLine(BaseModel):
+    """The words burnt onto ONE story beat's footage.
+
+    `extra="forbid"` is the guard, and it is structural: a reply carrying
+    `start`, `end`, `duration`, `font`, `color`, `filter` or `path` fails
+    validation outright. When a caption appears, where it sits and how it
+    looks are all fixed by the renderer, so none of them is expressible here.
+
+    `beat_index` is the only pointer the model supplies. `clip_id` is COPIED
+    from that beat, so a caption can only ever land on footage the Story
+    already anchored. `text` is a verbatim span of that beat's validated
+    narration or story line, located by the agent - a phrase that is not in
+    the source is dropped, so inventing words is not detected, it is
+    impossible. `source` records which of the two held it.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    index: int = Field(ge=1)
+    beat_index: int = Field(ge=1)       # -> StoryBeat.index
+    clip_id: str                        # copied from that beat
+    text: str = Field(min_length=1)     # a verbatim span of validated text
+    source: CaptionSource               # DERIVED: where the span was found
+    intent: CaptionIntent = "key_phrase"
+    position: CaptionPosition = "bottom_center"   # the renderer's only one
+    style: CaptionStyle = "outlined_white"        # likewise
+    why: str = ""
+
+    @field_validator("text")
+    @classmethod
+    def _one_printable_line(cls, v: str) -> str:
+        """drawtext renders one line and does not wrap. A newline or control
+        character here is a malformed caption, not a second line."""
+        if not v.strip() or any(not ch.isprintable() for ch in v):
+            raise ValueError("caption text must be one printable line")
+        return v
+
+    @field_validator("intent")
+    @classmethod
+    def _says_something(cls, v: str) -> str:
+        if v == "none":
+            raise ValueError("a caption line cannot have intent 'none'")
+        return v
+
+
+class Caption(BaseModel):
+    """The words on screen, within what the renderer can actually draw.
+
+    Story decides what is told, Voiceover what is said. This decides which of
+    those words also appear on screen, and on which beat. It writes nothing
+    new: every line is a span of text an upstream agent already produced and
+    validated.
+
+    WHERE IT GOES
+    -------------
+    The EditingDirector copies each line onto the segment showing the clip its
+    beat names. From there it rides a path that already exists:
+    `Segment.caption` -> `SegmentRenderSpec.caption` -> captions.json ->
+    build_video `cut` -> drawtext.
+
+    WHAT CANNOT BE EXPRESSED, AND IS NOT PRETENDED
+    ----------------------------------------------
+    * a position, colour, size, box or animation - the renderer has one style
+    * any timing - each caption spans its whole segment, less fixed margins
+    * more than one line, or more characters than fit across this canvas -
+      `max_chars` is derived from the renderer's font size and canvas width
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    domain: str = ""
+    caption_type: CaptionType = "minimal"
+
+    lines: list[CaptionLine] = Field(default_factory=list)
+
+    # what the renderer can actually do, measured - never model output
+    engine_options: list[str] = Field(default_factory=list)
+    max_chars: int = Field(default=28, ge=1)
+    # what was asked for and cannot be done
+    unsupported_requests: list[str] = Field(default_factory=list)
+
+    # provenance: what these captions were actually built from
+    story_available: bool = False
+    voiceover_available: bool = False
+    animation_available: bool = False
+    beats_eligible: list[int] = Field(default_factory=list)
+
+    risks: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    insufficient_signal: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    live: bool = False                 # True only for a real model call
+    model: str | None = None
+
+    @field_validator("lines")
+    @classmethod
+    def _one_per_beat_in_order(cls, v):
+        """Lines are an ORDER, one per beat at most. A gap, a repeat or a
+        second caption on the same beat would make it ambiguous which words
+        land where, so each is rejected rather than silently repaired here -
+        the agent renumbers and de-duplicates before construction."""
+        if not v:
+            return v
+        want = list(range(1, len(v) + 1))
+        got = [ln.index for ln in v]
+        if got != want:
+            raise ValueError(f"line indices must be 1..n in order, got {got}")
+        beats = [ln.beat_index for ln in v]
+        if len(set(beats)) != len(beats):
+            raise ValueError(f"at most one caption per beat, got {beats}")
+        return v
+
+    @model_validator(mode="after")
+    def _every_line_fits(self):
+        """drawtext does not wrap: a line wider than the canvas is cut off by
+        the frame edge. `max_chars` is derived from the renderer, so a line
+        over it is one the render would visibly break."""
+        for ln in self.lines:
+            if len(ln.text) > self.max_chars:
+                raise ValueError(
+                    f"caption for beat {ln.beat_index} is {len(ln.text)} "
+                    f"characters; one line on this canvas fits "
+                    f"{self.max_chars}")
+        return self
+
+    @property
+    def captioned_beats(self) -> list[int]:
+        return [ln.beat_index for ln in self.lines]
+
+    def for_beat(self, beat_index: int) -> "CaptionLine | None":
+        return next((ln for ln in self.lines
+                     if ln.beat_index == beat_index), None)
+
+    def for_clip(self, clip_id: str) -> "CaptionLine | None":
+        """The first caption, in story order, on a beat showing this clip."""
+        return next((ln for ln in self.lines if ln.clip_id == clip_id), None)
+
+
 # -------------------------------------------------------------- EditPlan
 
 class Segment(BaseModel):
@@ -1214,6 +1375,23 @@ class Segment(BaseModel):
     orientation: Literal["vertical", "horizontal"]
     caption: str = ""
     reason: str = ""
+
+    @field_validator("caption", mode="before")
+    @classmethod
+    def _caption_is_one_line(cls, v):
+        """The last gate before text reaches drawtext.
+
+        `CaptionLine.text` is already one printable line, so a caption coming
+        from that agent is safe by construction. This exists for every OTHER
+        way a Segment can be built - a fixture, a resumed job, a future caller
+        - because drawtext does not wrap and a control character inside the
+        filter graph is a malformed render. Normalised rather than rejected:
+        an odd caption should cost its formatting, not the build.
+        """
+        if not isinstance(v, str):
+            return ""
+        return " ".join("".join(ch if ch.isprintable() else " "
+                                for ch in v).split())
 
     @field_validator("end")
     @classmethod
@@ -1487,6 +1665,8 @@ __all__ = [
     "Treatment", "Emphasis", "CaptionIntent", "AnimationType",
     "AnimationDirection", "Animation",
     "TransitionKind", "TransitionType", "TransitionChoice", "Transition",
+    "CaptionPosition", "CaptionStyle", "CaptionSource", "CaptionType",
+    "CaptionLine", "Caption",
     "Segment", "EditPlan",
     "SegmentRenderSpec", "RenderSpec",
     "SegmentRenderInfo", "RenderTechnical", "RenderResult",

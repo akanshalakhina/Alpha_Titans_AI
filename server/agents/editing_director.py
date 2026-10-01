@@ -42,8 +42,8 @@ from __future__ import annotations
 import math
 import time
 
-from .artifacts import (Artifact, ClipAnalysis, ClipAnalysisSet, Cost,
-                        ContentStrategy, Decision, EditPlan,
+from .artifacts import (Artifact, Caption, ClipAnalysis, ClipAnalysisSet,
+                        Cost, ContentStrategy, Decision, EditPlan,
                         Animation, Music, RevisionRequest, Segment,
                         Story, Transition, VisionAnalysis, Voiceover)
 from .base import Agent, AgentContext
@@ -111,7 +111,8 @@ class EditingDirectorAgent(Agent):
                 voiceover: Voiceover | None = None,
                 music: Music | None = None,
                 animation: Animation | None = None,
-                transition: Transition | None = None
+                transition: Transition | None = None,
+                caption: Caption | None = None
                 ) -> Artifact[EditPlan]:
         started = time.time()
         constraints = dict(revision_request.constraints) if revision_request else {}
@@ -154,6 +155,10 @@ class EditingDirectorAgent(Agent):
             # the join sequence feeds AT_XFADES, so a changed set of
             # transitions genuinely changes the rendered output
             tuple(transition.xfade_sequence) if transition else None,
+            # the words burnt onto each segment are part of its pixels, so
+            # changed captions are a genuinely different rendered output
+            tuple((ln.beat_index, ln.clip_id, ln.text)
+                  for ln in caption.lines) if caption else None,
         )
 
         usable = clip_set.usable_clips
@@ -168,7 +173,7 @@ class EditingDirectorAgent(Agent):
         # ---- 1. reasoning, if a model is available -----------------------
         proposal, reject_reason, reply = self._ask_llm(
             ctx, span, clip_set, usable, constraints, vision, strategy,
-            story, voiceover, music, animation, transition)
+            story, voiceover, music, animation, transition, caption)
 
         if reply is not None:
             cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
@@ -238,6 +243,9 @@ class EditingDirectorAgent(Agent):
         for n in notes:
             span.note(n)
 
+        # ---- 4b. captions, onto whichever segments show their clips -------
+        segments, placed, unplaced = self._apply_captions(segments, caption)
+
         # ---- 5. validate, or fall back ------------------------------------
         xfade = ctx.job.settings.transition_duration
         try:
@@ -270,6 +278,8 @@ class EditingDirectorAgent(Agent):
                 ST.deterministic_plan, ctx.job.build_dir, clip_set,
                 clip_set.target_seconds, "hook", ctx.emit,
                 pool=ctx.pool, job_id=ctx.job.job_id))
+            segments, placed, unplaced = self._apply_captions(segments,
+                                                              caption)
             plan = EditPlan(
                 segments=segments,
                 total_duration=ST.total_with_crossfades(
@@ -372,6 +382,27 @@ class EditingDirectorAgent(Agent):
                 decided_by="policy",
                 confidence=round(transition.confidence, 2)))
 
+        if caption is not None and caption.lines:
+            decisions.append(Decision(
+                what="Captions from the Caption agent",
+                chose=(f"{len(placed)} placed"
+                       + (": " + ", ".join(f'segment {i} "{ln.text}"'
+                                          for i, ln in placed[:3])
+                          if placed else "")
+                       + (f" | {len(unplaced)} not placed" if unplaced
+                          else ""))[:250],
+                why=("copied word for word onto the segment showing the "
+                     "clip its beat names; they reach drawtext through "
+                     "captions.json at the one position and style the "
+                     "renderer has"
+                     + (" - a caption whose clip is not in this cut has "
+                        "nowhere to go and is left out"
+                        if unplaced else "")
+                     + ("" if caption.live else
+                        " - and these words were extracted, not chosen")),
+                decided_by="policy",
+                confidence=round(caption.confidence, 2)))
+
         decisions.extend(self._plan_decisions(plan, clip_set))
 
         ctx.emit("edit plan: %d segments, %.1fs total, opens on %s"
@@ -398,7 +429,8 @@ class EditingDirectorAgent(Agent):
                  voiceover: Voiceover | None = None,
                  music: Music | None = None,
                  animation: Animation | None = None,
-                 transition: Transition | None = None
+                 transition: Transition | None = None,
+                 caption: Caption | None = None
                  ) -> tuple[dict | None, str, LLMReply | None]:
         """Returns (validated_proposal | None, reject_reason, reply | None)."""
         if not ctx.llm.available():
@@ -406,7 +438,7 @@ class EditingDirectorAgent(Agent):
 
         prompt = self._build_prompt(clip_set, usable, constraints, vision,
                                     strategy, story, voiceover, music,
-                                    animation, transition)
+                                    animation, transition, caption)
         span.tool("llm.complete_json", provider=ctx.llm.describe().get("provider"),
                   model=ctx.llm.describe().get("model"),
                   prompt_chars=len(prompt))
@@ -431,7 +463,8 @@ class EditingDirectorAgent(Agent):
                       voiceover: Voiceover | None = None,
                       music: Music | None = None,
                       animation: Animation | None = None,
-                      transition: Transition | None = None) -> str:
+                      transition: Transition | None = None,
+                      caption: Caption | None = None) -> str:
         from .tools.pipeline_bridge import build_video
 
         rows = "\n".join(
@@ -651,6 +684,21 @@ class EditingDirectorAgent(Agent):
                      + ("\n".join(t_head) + "\n" if t_head else "")
                      + "\n".join(t_rows) + t_caveat + "\n")
 
+        # The captions. Which words are burnt onto which clip - fixed in
+        # position, style and timing by the renderer, so what reaches the
+        # director is only that a segment carries words a viewer must read.
+        cptext = ""
+        if caption is not None and caption.lines:
+            c_rows = ["    %-28s \"%s\" (%d words)"
+                      % (ln.clip_id, ln.text, len(ln.text.split()))
+                      for ln in caption.lines]
+            cptext = ("\nTHE CAPTIONS\n" + "\n".join(c_rows)
+                      + "\n  Each is shown for the whole of that clip's "
+                        "segment. A captioned segment\n  needs to stay up "
+                        "long enough to be read. This is not a duration - "
+                        "you\n  still choose every in/out point from the "
+                        "measurements above.\n")
+
         ctext = ""
         if constraints:
             lines = "\n".join(f"  - {k}: {v}" for k, v in constraints.items())
@@ -663,7 +711,8 @@ class EditingDirectorAgent(Agent):
             clips=rows + vtext, orientation=clip_set.orientation,
             canvas="%dx%d" % clip_set.canvas,
             target=clip_set.target_seconds, median=median,
-            strategy=stext + ntext + vtext2 + mtext + atext + ttext,
+            strategy=(stext + ntext + vtext2 + mtext + atext + ttext
+                      + cptext),
             constraints=ctext,
             names=", ".join(c.clip_id for c in usable),
             min_seg=build_video.MIN_SEG, max_seg=build_video.MAX_SEG)
@@ -841,6 +890,35 @@ class EditingDirectorAgent(Agent):
         head = [s for s in segments if s.clip_id == clip_id]
         tail = [s for s in segments if s.clip_id != clip_id]
         return head + tail
+
+    @staticmethod
+    def _apply_captions(segments: list[Segment], caption: Caption | None
+                        ) -> tuple[list[Segment], list, list]:
+        """Put each caption on the segment showing the clip its beat names.
+
+        The plan uses a clip at most once, so a clip gets the FIRST caption in
+        story order whose beat shows it, and each caption lands at most once.
+        One whose clip is not in the cut is returned as unplaced rather than
+        moved onto footage its beat never anchored. The text is copied, never
+        edited: it was validated verbatim upstream.
+        """
+        if caption is None or not caption.lines:
+            return segments, [], []
+        used: set[int] = set()
+        placed = []
+        out = []
+        for s in segments:
+            line = next((ln for ln in caption.lines
+                         if ln.clip_id == s.clip_id and ln.index not in used),
+                        None)
+            if line is None:
+                out.append(s)
+                continue
+            used.add(line.index)
+            out.append(s.model_copy(update={"caption": line.text}))
+            placed.append((s.index, line))
+        unplaced = [ln for ln in caption.lines if ln.index not in used]
+        return out, placed, unplaced
 
     @staticmethod
     def _renumber(segments: list[Segment]) -> list[Segment]:

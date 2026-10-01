@@ -85,7 +85,9 @@ def test_the_graph_has_the_cycle():
         assert ("voiceover", "music") in edges
         assert ("music", "animation") in edges
         assert ("animation", "transition") in edges
-        assert ("transition", "editing_director") in edges
+        assert ("transition", "caption") in edges
+        assert ("caption", "editing_director") in edges
+        assert ("transition", "editing_director") not in edges
         assert ("animation", "editing_director") not in edges
         assert ("music", "editing_director") not in edges
         assert ("voiceover", "editing_director") not in edges
@@ -231,8 +233,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     none of those inputs changed, and doing so would make every revision cost
     a full pass over everything.
     """
-    from agents.artifacts import (Animation, ContentStrategy, Music,
-                                  ResearchReport, Story, Transition,
+    from agents.artifacts import (Animation, Caption, ContentStrategy,
+                                  Music, ResearchReport, Story, Transition,
                                   VisionAnalysis, Voiceover)
 
     job = _job(agent_root, calm_clip, lively_clip, "gnorerun")
@@ -251,7 +253,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
                         ("Voiceover", Voiceover),
                         ("Music", Music),
                         ("Animation", Animation),
-                        ("Transition", Transition)):
+                        ("Transition", Transition),
+                        ("Caption", Caption)):
         revs = store.all_revisions(job.job_id, kind, model)
         assert len(revs) == 1, f"{kind} re-ran on a revision ({len(revs)}x)"
 
@@ -270,6 +273,7 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     assert nodes.count("music") == 1
     assert nodes.count("animation") == 1
     assert nodes.count("transition") == 1
+    assert nodes.count("caption") == 1
     assert nodes.count("editing_director") == 2
 
 
@@ -312,6 +316,9 @@ def test_the_strategy_joins_vision_and_research_before_the_director(
     assert "transition" in started
     assert started["transition"] >= ends["animation"]
     assert started["editing_director"] >= ends["transition"]
+    assert "caption" in started
+    assert started["caption"] >= ends["transition"]
+    assert started["editing_director"] >= ends["caption"]
 
 
 @pytest.mark.slow
@@ -334,7 +341,7 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     # produced nothing would be indistinguishable from one that never ran.
     assert kinds == {"ClipAnalysis", "VisionAnalysis", "ResearchReport",
                      "ContentStrategy", "Story", "Voiceover", "Music",
-                     "Animation", "Transition", "EditPlan",
+                     "Animation", "Transition", "Caption", "EditPlan",
                      "RenderResult", "CriticResult"}
 
     producers = {r["kind"]: r["produced_by"] for r in rows}
@@ -347,6 +354,7 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     assert producers["Music"] == "music"
     assert producers["Animation"] == "animation"
     assert producers["Transition"] == "transition"
+    assert producers["Caption"] == "caption"
     assert producers["EditPlan"] == "editing_director"
     assert producers["RenderResult"] == "rendering"
     assert producers["CriticResult"] == "critic"

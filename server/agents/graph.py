@@ -9,11 +9,9 @@ with a graph that has all of them.
     clip_analysis --+             +-> content_strategy -> story
                     +-> research -+                         |
                                                             v
-                            voiceover -> music -> animation -> transition
-                                         ^                     |
-                                         +---------------------+
-                                                            |
-                                                            v
+                voiceover -> music -> animation -> transition -> caption
+                                                                     |
+                                                                     v
           +------------------------> editing_director -> render -> critic
           |                                ^                          |
           |                                |             PASS      -> END
@@ -23,12 +21,13 @@ with a graph that has all of them.
 The understanding agents (vision, research) fan out and JOIN at the strategy.
 From there it is a chain, each layer briefing the next: the strategy briefs
 the story, the story briefs the narration, the narration briefs the score,
-the score briefs the look, the look briefs the joins, and the joins
-brief the director.
+the score briefs the look, the look briefs the joins, the joins hand
+on to the captions, and the captions brief the director.
 
 EVERY one of those sits OUTSIDE the revision cycle. A revision re-plans and
 re-renders without re-looking at the footage, re-deciding what the video is
-about, re-authoring the story, rewriting the narration, or re-scoring it.
+about, re-authoring the story, rewriting the narration, re-scoring it, or
+re-choosing the words on screen.
 
 WHAT IS GENUINELY IMPLEMENTED HERE
 ----------------------------------
@@ -69,9 +68,10 @@ from langgraph.graph import END, StateGraph
 
 from .artifacts import (ClipAnalysisSet, ContentStrategy, CriticResult,
                         EditPlan, JobState, RenderResult, ResearchReport,
-                        Animation, Music, RevisionRequest, Story,
+                        Animation, Caption, Music, RevisionRequest, Story,
                         Transition, VisionAnalysis, Voiceover)
 from .base import AgentContext
+from .caption import CaptionAgent
 from .clip_analysis import ClipAnalysisAgent
 from .content_strategy import ContentStrategyAgent
 from .critic import DEFAULT_PASS_THRESHOLD, CriticAgent
@@ -116,6 +116,8 @@ class GraphState(TypedDict, total=False):
     animation_failed: str | None
     transition_id: str | None
     transition_failed: str | None
+    caption_id: str | None
+    caption_failed: str | None
     edit_plan_id: str
     render_id: str
     critic_id: str
@@ -207,6 +209,7 @@ POLICIES = {
     "music": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "animation": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "transition": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
+    "caption": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "editing_director": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "render": NodePolicy(attempts=2, backoff_s=3.0, timeout_s=3600),
     "critic": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=900),
@@ -760,6 +763,56 @@ def node_transition(state: GraphState) -> dict:
     return {"transition_id": art.artifact_id, "transition_failed": None}
 
 
+def node_caption(state: GraphState) -> dict:
+    """Which of the words already written also appear on screen.
+
+    Runs ONCE, after transition and before editing_director, and sits
+    upstream of the critic cycle: a revision re-plans and re-renders without
+    re-choosing the words.
+
+    Takes ClipAnalysis as well as the narrative layers, because how much text
+    fits on one line depends on the canvas the renderer draws onto.
+
+    Its output reaches the renderer through a path that already exists -
+    Segment.caption -> captions.json -> build_video `cut` -> drawtext.
+
+    Never blocking. Losing it costs the cut its captions, not the operator
+    their video.
+    """
+    job_id = state["job_id"]
+    rt = runtime_for(job_id)
+    agent = CaptionAgent()
+
+    clip_art = rt.store.get(job_id, "ClipAnalysis", ClipAnalysisSet)
+    story_art = rt.store.get(job_id, "Story", Story)
+    vo_art = rt.store.get(job_id, "Voiceover", Voiceover)
+    anim_art = rt.store.get(job_id, "Animation", Animation)
+
+    inputs = [a.artifact_id
+              for a in (clip_art, story_art, vo_art, anim_art) if a]
+
+    def body(span):
+        rev = rt.store.next_revision(job_id, "Caption")
+        return agent.execute(
+            rt.context(), span,
+            story=story_art.payload if story_art else None,
+            voiceover=vo_art.payload if vo_art else None,
+            animation=anim_art.payload if anim_art else None,
+            clip_set=clip_art.payload if clip_art else None,
+            revision=rev)
+
+    try:
+        art = _run_node("caption", CaptionAgent.id, job_id,
+                        state.get("attempt", 1), inputs, body)
+    except (ProcessTimeout, WorkCancelled, ProcessCancelled):
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        rt.log.append(f"caption failed ({type(exc).__name__}: {exc}); "
+                      f"the director plans without captions")
+        return {"caption_id": None, "caption_failed": str(exc)[:200]}
+    return {"caption_id": art.artifact_id, "caption_failed": None}
+
+
 def node_editing_director(state: GraphState) -> dict:
     job_id = state["job_id"]
     rt = runtime_for(job_id)
@@ -775,6 +828,7 @@ def node_editing_director(state: GraphState) -> dict:
     music_art = rt.store.get(job_id, "Music", Music)
     anim_art = rt.store.get(job_id, "Animation", Animation)
     trans_art = rt.store.get(job_id, "Transition", Transition)
+    cap_art = rt.store.get(job_id, "Caption", Caption)
 
     raw_req = state.get("revision_request")
     request = RevisionRequest(**raw_req) if raw_req else None
@@ -796,12 +850,13 @@ def node_editing_director(state: GraphState) -> dict:
             voiceover=vo_art.payload if vo_art else None,
             music=music_art.payload if music_art else None,
             animation=anim_art.payload if anim_art else None,
-            transition=trans_art.payload if trans_art else None)
+            transition=trans_art.payload if trans_art else None,
+            caption=cap_art.payload if cap_art else None)
 
     inputs = [clip_art.artifact_id]
     inputs += [a.artifact_id
                for a in (vision_art, strategy_art, story_art, vo_art,
-                         music_art, anim_art, trans_art)
+                         music_art, anim_art, trans_art, cap_art)
                if a]
     art = _run_node("editing_director", EditingDirectorAgent.id, job_id,
                     state.get("attempt", 1), inputs, body)
@@ -962,6 +1017,7 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_node("music", node_music)
     g.add_node("animation", node_animation)
     g.add_node("transition", node_transition)
+    g.add_node("caption", node_caption)
     g.add_node("editing_director", node_editing_director)
     g.add_node("render", node_render)
     g.add_node("critic", node_critic)
@@ -987,7 +1043,8 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_edge("voiceover", "music")
     g.add_edge("music", "animation")
     g.add_edge("animation", "transition")
-    g.add_edge("transition", "editing_director")
+    g.add_edge("transition", "caption")
+    g.add_edge("caption", "editing_director")
     g.add_edge("editing_director", "render")
     g.add_edge("render", "critic")
     g.add_conditional_edges("critic", route_after_critic, {
