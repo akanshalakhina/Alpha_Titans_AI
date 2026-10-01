@@ -71,8 +71,8 @@ import time
 from pathlib import Path
 
 from .artifacts import (ClipAnalysisSet, CriticResult, EditPlan,
-                        JobSettings, Publishing, RenderResult, Thumbnail,
-                        Title)
+                        JobSettings, PerformanceAnalysis, Publishing,
+                        RenderResult, Thumbnail, Title)
 from .store import (ArtifactStore, resolve_job_db, shared_db_path)
 from .tools.pipeline_bridge import adapter_mod, config_mod
 from .trace import TraceRecorder
@@ -404,6 +404,24 @@ def _project_publishing(p: Publishing) -> dict:
     }
 
 
+def _project_performance(p: PerformanceAnalysis) -> dict:
+    """The performance report, as the app's API reports it.
+
+    `available` is the plain False it always is, and the metrics appear only
+    by NAME, under `unmeasured` - there is no key a figure could sit in.
+    """
+    return {
+        "status": p.status,
+        "available": False,
+        "provider": p.provider,
+        "published": p.published,
+        "reasons": p.reasons,
+        "unmeasured": [m.metric for m in p.unmeasured],
+        "excluded": [e.signal for e in p.excluded_signals],
+        "next_steps": list(p.next_steps),
+    }
+
+
 def _packaged_thumbnail(build: Path, render: RenderResult | None,
                         thumbnail: Thumbnail | None) -> str | None:
     """The Thumbnail agent's image, only when it is genuinely this video's.
@@ -486,6 +504,9 @@ def build_job_json(job_id: str, root: Path | None = None) -> dict:
     publishing = store.get(job_id, "Publishing", Publishing)
     if output is not None and publishing is not None:
         output["publishing"] = _project_publishing(publishing.payload)
+    performance = store.get(job_id, "PerformanceAnalysis", PerformanceAnalysis)
+    if output is not None and performance is not None:
+        output["performance"] = _project_performance(performance.payload)
     status, error = _project_status(graph, critic.payload if critic else None,
                                     output is not None)
 

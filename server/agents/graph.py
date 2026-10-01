@@ -18,7 +18,10 @@ with a graph that has all of them.
           +--------------------------------+    REVISE   -+           |
                                                 ESCALATE -> escalate -+
                                                                       v
-                                  thumbnail -> title -> publishing -> END
+                                          thumbnail -> title -> publishing
+                                                                      |
+                                                                      v
+                                                performance_analysis -> END
 
 The understanding agents (vision, research) fan out and JOIN at the strategy.
 From there it is a chain, each layer briefing the next: the strategy briefs
@@ -30,7 +33,10 @@ Packaging sits after it: once the cycle has settled on the video that
 will be delivered - passed or escalated - the thumbnail is chosen from that
 video and the title is chosen for it, and a publishing PLAN is made for
 the operator - once each, and none of them can cost a render or trigger a
-revision. Nothing in the project can upload, and nothing claims to.
+revision. Nothing in the project can upload, and nothing claims to. Last,
+the video's performance is reported - as unavailable, with the measured
+reasons, because nothing here can publish it or read its analytics, and
+nothing made before publication is passed off as performance.
 
 EVERY one of those sits OUTSIDE the revision cycle. A revision re-plans and
 re-renders without re-looking at the footage, re-deciding what the video is
@@ -90,6 +96,7 @@ from .render_pool import (MediaPool, ProcessCancelled, ProcessTimeout,
 from .scheduler import RenderScheduler, WorkCancelled
 from .animation import AnimationAgent
 from .music import MusicAgent
+from .performance import PerformanceAnalysisAgent
 from .publishing import PublishingAgent
 from .story import StoryAgent
 from .thumbnail import ThumbnailAgent
@@ -136,6 +143,8 @@ class GraphState(TypedDict, total=False):
     title_failed: str | None
     publishing_id: str | None
     publishing_failed: str | None
+    performance_id: str | None
+    performance_failed: str | None
     edit_plan_id: str
     render_id: str
     critic_id: str
@@ -234,6 +243,8 @@ POLICIES = {
     "thumbnail": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "title": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "publishing": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=900),
+    "performance_analysis": NodePolicy(attempts=2, backoff_s=1.0,
+                                       timeout_s=300),
 }
 
 
@@ -1166,6 +1177,59 @@ def node_publishing(state: GraphState) -> dict:
     return {"publishing_id": art.artifact_id, "publishing_failed": None}
 
 
+def node_performance_analysis(state: GraphState) -> dict:
+    """How the delivered video performed. The last step, after packaging.
+
+    Runs ONCE, after the publishing plan exists. It reads that plan by the
+    id the packaging step left in state, and reports performance as
+    unavailable with the measured reasons: nothing here publishes, nothing
+    records which video was uploaded, and nothing can read analytics. The
+    critic's result and Research's report are passed in only so they can be
+    named as EXCLUDED - pre-publication signals, never performance.
+
+    Never blocking, and never touches the job's status.
+    """
+    job_id = state["job_id"]
+    rt = runtime_for(job_id)
+    agent = PerformanceAnalysisAgent()
+
+    plans = rt.store.all_revisions(job_id, "Publishing", Publishing)
+    pub_art = next((a for a in plans
+                    if a.artifact_id == state.get("publishing_id")),
+                   plans[-1] if plans else None)
+    critics = rt.store.all_revisions(job_id, "CriticResult", CriticResult)
+    critic_art = next((a for a in critics
+                       if a.artifact_id == state.get("critic_id")),
+                      critics[-1] if critics else None)
+    research_art = rt.store.get(job_id, "ResearchReport", ResearchReport)
+    title_art = rt.store.get(job_id, "Title", Title)
+
+    inputs = [a.artifact_id for a in (pub_art, critic_art, research_art,
+                                      title_art) if a]
+
+    def body(span):
+        rev = rt.store.next_revision(job_id, "PerformanceAnalysis")
+        return agent.execute(
+            rt.context(), span,
+            publishing=pub_art.payload if pub_art else None,
+            critic=critic_art.payload if critic_art else None,
+            research=research_art.payload if research_art else None,
+            title=title_art.payload if title_art else None,
+            revision=rev)
+
+    try:
+        art = _run_node("performance_analysis", PerformanceAnalysisAgent.id,
+                        job_id, state.get("attempt", 1), inputs, body)
+    except (ProcessTimeout, WorkCancelled, ProcessCancelled):
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        rt.log.append(f"performance analysis failed ({type(exc).__name__}: "
+                      f"{exc}); no report was made, and no figure was "
+                      f"invented")
+        return {"performance_id": None, "performance_failed": str(exc)[:200]}
+    return {"performance_id": art.artifact_id, "performance_failed": None}
+
+
 # ------------------------------------------------------------- routing
 
 def route_after_critic(state: GraphState) -> Literal["revise", "escalate", "finish"]:
@@ -1202,6 +1266,7 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_node("thumbnail", node_thumbnail)
     g.add_node("title", node_title)
     g.add_node("publishing", node_publishing)
+    g.add_node("performance_analysis", node_performance_analysis)
 
     g.set_entry_point("clip_analysis")
     # fan out: vision and research are independent of each other
@@ -1237,7 +1302,8 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_edge("escalate", "thumbnail")
     g.add_edge("thumbnail", "title")
     g.add_edge("title", "publishing")
-    g.add_edge("publishing", END)
+    g.add_edge("publishing", "performance_analysis")
+    g.add_edge("performance_analysis", END)
     return g
 
 

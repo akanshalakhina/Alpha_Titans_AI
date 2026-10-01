@@ -99,6 +99,7 @@ ArtifactKind = Literal[
     "Transition", "Caption",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
     "RevisionRequest", "Thumbnail", "Title", "Publishing",
+    "PerformanceAnalysis",
 ]
 
 T = TypeVar("T", bound=BaseModel)
@@ -2009,6 +2010,118 @@ class Publishing(BaseModel):
         return [c for c in self.checks if not c.passed and not c.blocking]
 
 
+# --------------------------------------------------- PerformanceAnalysis
+
+# NOTHING IN THIS PROJECT CAN READ HOW A VIDEO PERFORMED. Performance needs
+# three things - a published video, a record of WHICH video it is, and access
+# to its analytics - and none exists: nothing publishes (`Publishing.published`
+# is the literal False), nothing records an uploaded video's id or URL, and
+# there is no YouTube Analytics, statistics or channel-access code anywhere.
+# So, exactly as for Publishing, each literal below has one member and parity
+# tests fail the moment any of that changes:
+#
+#   status     "unavailable" - "insufficient_data" (published, measurable, too
+#              little yet) is deliberately ABSENT: it needs a publication and
+#              a provider, and adding it is part of adding them
+#   provider   "none"
+#   published  False
+#
+# There is deliberately NO field for a view count, a click-through rate,
+# retention, likes, revenue, a URL or a video id: `extra="forbid"` makes
+# inventing one a validation error. What it carries instead is WHY there is
+# no data, WHICH metrics are therefore unmeasured and what each would need,
+# and which pre-publication signals were set aside rather than passed off as
+# performance.
+PerformanceStatus = Literal["unavailable"]
+AnalyticsProvider = Literal["none"]
+PerformanceGapReason = Literal["not_published", "no_publishing_plan",
+                               "no_video_reference", "no_analytics_provider"]
+PerformanceMetric = Literal[
+    "views", "likes", "comments", "impressions", "click_through_rate",
+    "average_view_duration", "audience_retention", "watch_time",
+    "subscribers_gained", "revenue"]
+
+
+class PerformanceGap(BaseModel):
+    """One measured reason there is no performance data."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    reason: PerformanceGapReason
+    evidence: str                       # what was read that shows it
+
+
+class UnmeasuredMetric(BaseModel):
+    """A metric this report does NOT have - named so its absence is stated
+    rather than left to be filled in. There is no value field."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    metric: PerformanceMetric
+    needs: str                          # what would have to exist to read it
+
+
+class ExcludedSignal(BaseModel):
+    """A pre-publication signal that was present and deliberately NOT used
+    as performance - named, never quoted, so no number of it leaks in."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    signal: str
+    artifact: ArtifactKind
+    why: str
+
+
+class PerformanceAnalysis(BaseModel):
+    """How the delivered video performed - which, today, nobody can know.
+
+    The last step after packaging. It reads what the project can actually
+    see after publishing - the publishing record, and whatever analytics
+    access the code has - and reports that performance is unavailable, with
+    the measured reasons. Every metric is listed as unmeasured; every
+    pre-publication signal that might be mistaken for performance (the
+    critic's score, a "ready" plan, Research's evidence) is listed as
+    excluded. Nothing is estimated.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: PerformanceStatus = "unavailable"
+    provider: AnalyticsProvider = "none"
+    published: Literal[False] = False
+    # the publishing PLAN's status, when there is one - context for what the
+    # operator does next, never a measure of reception
+    publishing_status: PublishStatus | None = None
+
+    gaps: list[PerformanceGap] = Field(default_factory=list)
+    unmeasured: list[UnmeasuredMetric] = Field(default_factory=list)
+    excluded_signals: list[ExcludedSignal] = Field(default_factory=list)
+    # what the project can do on a platform, measured - never model output
+    platform_capabilities: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _unavailable_says_why(self):
+        reasons = [g.reason for g in self.gaps]
+        if not reasons:
+            raise ValueError("an unavailable report must say why")
+        if len(set(reasons)) != len(reasons):
+            raise ValueError("each reason is stated once")
+        if ("not_published" in reasons) == ("no_publishing_plan" in reasons):
+            raise ValueError("exactly one of not_published and "
+                             "no_publishing_plan explains the publication")
+        if ("no_publishing_plan" in reasons) != (self.publishing_status
+                                                 is None):
+            raise ValueError("a publishing status exists exactly when a "
+                             "publishing plan does")
+        metrics = [m.metric for m in self.unmeasured]
+        if sorted(metrics) != sorted(get_args(PerformanceMetric)):
+            raise ValueError("with no performance data, every metric is "
+                             "unmeasured - each listed exactly once")
+        return self
+
+    @property
+    def reasons(self) -> list[str]:
+        return [g.reason for g in self.gaps]
+
+
 __all__ = [
     "SCHEMA_VERSION", "new_id", "content_hash",
     "Decision", "DecidedBy", "Cost", "Artifact", "ArtifactKind",
@@ -2037,4 +2150,7 @@ __all__ = [
     "TITLE_MAX_CHARS", "TitleSource", "TitleType", "Title",
     "PublishStatus", "PublishProvider", "CheckSource", "PublishCheck",
     "PublishAsset", "Publishing",
+    "PerformanceStatus", "AnalyticsProvider", "PerformanceGapReason",
+    "PerformanceMetric", "PerformanceGap", "UnmeasuredMetric",
+    "ExcludedSignal", "PerformanceAnalysis",
 ]

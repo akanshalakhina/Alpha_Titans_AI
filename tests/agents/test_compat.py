@@ -212,6 +212,28 @@ def test_the_publishing_plan_is_reported_and_claims_nothing(
         assert key not in pub
 
 
+def test_performance_is_reported_unavailable_with_no_figure(
+        client, published_job):
+    """A real build through the real app: performance is unavailable, says
+    why, and has no key a view count or a rate could sit in."""
+    job, payload = published_job
+    perf = payload["output"]["performance"]
+    assert perf["status"] == "unavailable" and perf["available"] is False
+    assert perf["published"] is False and perf["provider"] == "none"
+    assert perf["reasons"] == ["not_published", "no_video_reference",
+                               "no_analytics_provider"]
+    assert "views" in perf["unmeasured"]
+    assert "click_through_rate" in perf["unmeasured"]
+    # the critic scored this build - and its score is named, not reported
+    assert "the critic's verdict and scores" in perf["excluded"]
+    served = client.get(f"/api/jobs/{job.job_id}").json()["output"]
+    assert served["performance"]["available"] is False
+    assert served["performance"]["status"] == "unavailable"
+    for key in ("views", "ctr", "click_through_rate", "retention", "likes",
+                "revenue", "url", "video_id", "metrics"):
+        assert key not in perf
+
+
 def test_notes_endpoint_reads_the_agent_output_json(client, published_job):
     job, _ = published_job
     r = client.get(f"/api/jobs/{job.job_id}/notes")

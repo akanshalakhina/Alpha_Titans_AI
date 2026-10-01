@@ -105,13 +105,16 @@ def test_the_graph_has_the_cycle():
         assert ("escalate", "thumbnail") in edges
         assert ("thumbnail", "title") in edges
         assert ("title", "publishing") in edges
-        assert ("publishing", "__end__") in edges
+        assert ("publishing", "performance_analysis") in edges
+        assert ("performance_analysis", "__end__") in edges
+        assert ("publishing", "__end__") not in edges
         assert ("title", "__end__") not in edges
         assert ("thumbnail", "__end__") not in edges
         assert ("finish", "__end__") not in edges
         assert ("escalate", "__end__") not in edges
-        assert not any(src in ("thumbnail", "title", "publishing")
-                       and dst not in ("title", "publishing", "__end__")
+        after = ("thumbnail", "title", "publishing", "performance_analysis")
+        assert not any(src in after
+                       and dst not in after[1:] + ("__end__",)
                        for src, dst in edges)
     finally:
         conn.close()
@@ -242,6 +245,17 @@ def test_max_revisions_is_enforced_and_escalates(agent_root, calm_clip,
     assert pub.status == "needs_review" and pub.published is False
     assert any(c.check == "the critic passed it" and not c.passed
                for c in pub.checks)
+    # and an escalated video has no performance either - only a plan that
+    # must be resolved first
+    assert final.get("performance_id"), final.get("performance_failed")
+    from agents.artifacts import PerformanceAnalysis
+    perf = _store(job).get(job.job_id, "PerformanceAnalysis",
+                           PerformanceAnalysis)
+    assert perf.payload.status == "unavailable"
+    assert perf.payload.publishing_status == "needs_review"
+    assert perf.payload.next_steps[0].startswith(
+        "Resolve the publishing plan first")
+    assert perf.degraded and perf.confidence == 0.0
     assert final["revision_count"] <= 2, "exceeded the revision cap"
     assert len(final["history"]) <= 3, "rendered more times than the cap allows"
     assert final["history"][-1]["verdict"] == "ESCALATE"
@@ -258,9 +272,9 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     a full pass over everything.
     """
     from agents.artifacts import (Animation, Caption, ContentStrategy,
-                                  Music, Publishing, ResearchReport,
-                                  Story, Thumbnail, Title, Transition,
-                                  VisionAnalysis, Voiceover)
+                                  Music, PerformanceAnalysis, Publishing,
+                                  ResearchReport, Story, Thumbnail, Title,
+                                  Transition, VisionAnalysis, Voiceover)
 
     job = _job(agent_root, calm_clip, lively_clip, "gnorerun")
     llm = llm_returning_plan(
@@ -282,7 +296,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
                         ("Caption", Caption),
                         ("Thumbnail", Thumbnail),
                         ("Title", Title),
-                        ("Publishing", Publishing)):
+                        ("Publishing", Publishing),
+                        ("PerformanceAnalysis", PerformanceAnalysis)):
         revs = store.all_revisions(job.job_id, kind, model)
         assert len(revs) == 1, f"{kind} re-ran on a revision ({len(revs)}x)"
 
@@ -306,6 +321,7 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     assert nodes.count("thumbnail") == 1
     assert nodes.count("title") == 1
     assert nodes.count("publishing") == 1
+    assert nodes.count("performance_analysis") == 1
     assert nodes.count("editing_director") == 2
 
 
@@ -357,6 +373,8 @@ def test_the_strategy_joins_vision_and_research_before_the_director(
     assert started["title"] >= ends["thumbnail"]
     assert "publishing" in started
     assert started["publishing"] >= ends["title"]
+    assert "performance_analysis" in started
+    assert started["performance_analysis"] >= ends["publishing"]
 
 
 @pytest.mark.slow
@@ -381,7 +399,7 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
                      "ContentStrategy", "Story", "Voiceover", "Music",
                      "Animation", "Transition", "Caption", "EditPlan",
                      "RenderResult", "CriticResult", "Thumbnail",
-                     "Title", "Publishing"}
+                     "Title", "Publishing", "PerformanceAnalysis"}
 
     producers = {r["kind"]: r["produced_by"] for r in rows}
     assert producers["ClipAnalysis"] == "clip_analysis"
@@ -397,6 +415,7 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     assert producers["Thumbnail"] == "thumbnail"
     assert producers["Title"] == "title"
     assert producers["Publishing"] == "publishing"
+    assert producers["PerformanceAnalysis"] == "performance_analysis"
     assert producers["EditPlan"] == "editing_director"
     assert producers["RenderResult"] == "rendering"
     assert producers["CriticResult"] == "critic"
