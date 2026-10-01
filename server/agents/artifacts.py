@@ -98,7 +98,7 @@ ArtifactKind = Literal[
     "ContentStrategy", "Story", "Voiceover", "Music", "Animation",
     "Transition", "Caption",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
-    "RevisionRequest", "Thumbnail",
+    "RevisionRequest", "Thumbnail", "Title",
 ]
 
 T = TypeVar("T", bound=BaseModel)
@@ -1790,6 +1790,111 @@ class Thumbnail(BaseModel):
         return None if self.chosen is None else self.candidates[self.chosen]
 
 
+# ---------------------------------------------------------------- Title
+
+# There is no publishing integration in this project - nothing uploads, and
+# nothing writes container metadata. A title reaches exactly two places:
+#
+#   * master_stage names the delivered FILE from JobSettings.title, sanitised
+#     to [A-Za-z0-9._-]. That happens inside the render, before packaging, so
+#     it is never changed after the fact - the file keeps its name.
+#   * the app shows `settings.title` on the job card and above the player,
+#     and untitled agent builds show the JobSettings placeholder.
+#
+# So the title is published by projecting it into that one display slot, and
+# only when the operator did not name the video: operator settings win.
+#
+# 100 characters is YouTube's own title limit - the platform this system
+# makes videos for - not something this project enforces anywhere else.
+TITLE_MAX_CHARS = 100
+
+# Where the chosen words came from.
+#   operator   the operator named the video; nothing else is considered
+#   model      written by the model, every content word found upstream
+#   strategy   ContentStrategy's central topic, selected verbatim
+#   story      the Story's logline, selected verbatim
+#   domain     the operator's own description of the footage, verbatim
+TitleSource = Literal["operator", "model", "strategy", "story", "domain"]
+TitleType = Literal["operator", "reasoned", "degraded", "minimal"]
+
+
+class Title(BaseModel):
+    """The title the delivered video is published under - or none at all.
+
+    PACKAGING, NOT EDITING
+    ----------------------
+    Runs once, after the render/critic cycle has settled on the video that
+    will be delivered, so it describes the cut that actually exists: story
+    beats on clips the cut dropped cannot lend a single word to it.
+
+    NO WORD IS UNSUPPORTED
+    ----------------------
+    Every content word must appear in the validated material about THIS
+    video - the strategy, the story beats that made the cut, the operator's
+    domain. Research about the wider subject is context the model may read,
+    but a word found ONLY there describes the world, not the footage, and is
+    rejected. Superlatives and hype are rejected outright, and a number must
+    be one the material contains. `grounded_terms` records where each content
+    word was found, so the check can be audited rather than trusted.
+
+    An empty `text` is a legitimate outcome: nothing supportable to say, so
+    the placeholder stands rather than an invented title replacing it.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    domain: str = ""
+    title_type: TitleType = "minimal"
+
+    text: str = ""                      # "" = no supportable title
+    source: TitleSource | None = None
+    grounded_terms: list[str] = Field(default_factory=list)  # "word<-where"
+    alternatives: list[str] = Field(default_factory=list)    # also passed
+    rejected: list[str] = Field(default_factory=list)        # and why
+    max_chars: int = Field(default=TITLE_MAX_CHARS, ge=1)
+
+    operator_title: str | None = None   # what the operator set, if anything
+    # will the app show this instead of the placeholder?
+    published: bool = False
+
+    unsupported_requests: list[str] = Field(default_factory=list)
+
+    # provenance: what the title was actually built from
+    strategy_available: bool = False
+    story_available: bool = False
+    research_available: bool = False
+
+    risks: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    insufficient_signal: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    live: bool = False                 # True only for a real model call
+    model: str | None = None
+
+    @field_validator("text", "alternatives")
+    @classmethod
+    def _one_printable_line(cls, v):
+        for t in ([v] if isinstance(v, str) else v):
+            if any(not ch.isprintable() for ch in t) or t != t.strip():
+                raise ValueError("a title is one printable, trimmed line")
+        return v
+
+    @model_validator(mode="after")
+    def _claims_match(self):
+        for t in [self.text, *self.alternatives]:
+            if len(t) > self.max_chars:
+                raise ValueError(f"title is {len(t)} characters; the limit "
+                                 f"is {self.max_chars}")
+        if bool(self.text) != (self.source is not None):
+            raise ValueError("a title has a source exactly when it has text")
+        if self.source == "operator" and self.text != self.operator_title:
+            raise ValueError("an operator title is used verbatim")
+        if self.published and (not self.text or self.source == "operator"):
+            raise ValueError("only a title this agent supplied replaces the "
+                             "placeholder - an operator title already shows")
+        return self
+
+
 __all__ = [
     "SCHEMA_VERSION", "new_id", "content_hash",
     "Decision", "DecidedBy", "Cost", "Artifact", "ArtifactKind",
@@ -1815,4 +1920,5 @@ __all__ = [
     "RevisionRequest",
     "ThumbnailOperation", "ThumbnailSource", "ThumbnailType",
     "ThumbnailCandidate", "Thumbnail",
+    "TITLE_MAX_CHARS", "TitleSource", "TitleType", "Title",
 ]

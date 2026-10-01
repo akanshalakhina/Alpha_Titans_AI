@@ -100,6 +100,8 @@ def test_settings_do_not_claim_capabilities_phase_1_lacks(published_job):
     _, payload = published_job
     s = payload["settings"]
     assert s["title"] == "COMPAT_TEST"
+    # the operator named it, so the Title agent published nothing over it
+    assert "_title_by" not in s
     assert s["_produced_by"] == compat.MARKER
     # there is no Music Agent, so the bed really is none
     assert s["music_source"] == "none" and s["keep_audio"] == "none"

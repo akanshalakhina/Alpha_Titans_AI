@@ -71,7 +71,7 @@ import time
 from pathlib import Path
 
 from .artifacts import (ClipAnalysisSet, CriticResult, EditPlan,
-                        JobSettings, RenderResult, Thumbnail)
+                        JobSettings, RenderResult, Thumbnail, Title)
 from .store import (ArtifactStore, resolve_job_db, shared_db_path)
 from .tools.pipeline_bridge import adapter_mod, config_mod
 from .trace import TraceRecorder
@@ -231,7 +231,8 @@ def _graph_status(job_id: str, build: Path) -> dict:
 
 # ------------------------------------------------------------ projection
 
-def _project_settings(s: JobSettings, graph: dict) -> dict:
+def _project_settings(s: JobSettings, graph: dict,
+                      title: Title | None = None) -> dict:
     """Agent settings -> the legacy settings dict the UI reads.
 
     Knobs Phase 1 genuinely does not have are filled with what the build
@@ -239,7 +240,7 @@ def _project_settings(s: JobSettings, graph: dict) -> dict:
     Agent so the bed really is none, no speed control so it really was 1.0x,
     and every cut really was a plain fade.
     """
-    return {
+    out = {
         "orientation": s.orientation,
         "resolution": s.resolution,
         "quality": s.quality,
@@ -259,6 +260,28 @@ def _project_settings(s: JobSettings, graph: dict) -> dict:
         "_agent_attempts": graph.get("attempt"),
         "_agent_revisions": graph.get("revision_count"),
     }
+    published = _published_title(s, title)
+    if published is not None:
+        # the title the build was published under, in the one slot the app
+        # shows a title in - with its provenance beside it
+        out["title"] = published
+        out["_title_by"] = "title agent"
+    return out
+
+
+def _published_title(s: JobSettings, title: Title | None) -> str | None:
+    """The Title agent's title, only where the operator named nothing.
+
+    An operator title always stands. So does the placeholder when the agent
+    found nothing supportable to say - it is never replaced by an empty or
+    unchecked string.
+    """
+    placeholder = JobSettings.model_fields["title"].default
+    if (s.title or "").strip() not in ("", placeholder):
+        return None
+    if title is None or not title.published or not title.text:
+        return None
+    return title.text
 
 
 def _project_stages(trace_rows: list[dict], live: bool = False) -> dict:
@@ -427,6 +450,7 @@ def build_job_json(job_id: str, root: Path | None = None) -> dict:
 
     render = store.get(job_id, "RenderResult", RenderResult)
     critic = store.get(job_id, "CriticResult", CriticResult)
+    title = store.get(job_id, "Title", Title)
     if render is None and not (build / "output.json").exists():
         raise NotAnAgentJob(f"job {job_id} has no finished render to publish")
 
@@ -452,7 +476,8 @@ def build_job_json(job_id: str, root: Path | None = None) -> dict:
 
     return {
         "id": job_id,
-        "settings": _project_settings(settings, graph),
+        "settings": _project_settings(settings, graph,
+                                      title.payload if title else None),
         "created": created,
         "status": status,
         "error": error,
