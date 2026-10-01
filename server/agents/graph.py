@@ -18,7 +18,7 @@ with a graph that has all of them.
           +--------------------------------+    REVISE   -+           |
                                                 ESCALATE -> escalate -+
                                                                       v
-                                                thumbnail -> title -> END
+                                  thumbnail -> title -> publishing -> END
 
 The understanding agents (vision, research) fan out and JOIN at the strategy.
 From there it is a chain, each layer briefing the next: the strategy briefs
@@ -28,8 +28,9 @@ on to the captions, and the captions brief the director.
 
 Packaging sits after it: once the cycle has settled on the video that
 will be delivered - passed or escalated - the thumbnail is chosen from that
-video and the title is chosen for it, once each, and neither can cost a
-render or trigger a revision.
+video and the title is chosen for it, and a publishing PLAN is made for
+the operator - once each, and none of them can cost a render or trigger a
+revision. Nothing in the project can upload, and nothing claims to.
 
 EVERY one of those sits OUTSIDE the revision cycle. A revision re-plans and
 re-renders without re-looking at the footage, re-deciding what the video is
@@ -76,8 +77,8 @@ from langgraph.graph import END, StateGraph
 from .artifacts import (ClipAnalysisSet, ContentStrategy, CriticResult,
                         EditPlan, JobState, RenderResult, ResearchReport,
                         Animation, Caption, Music, RevisionRequest, Story,
-                        Thumbnail, Title, Transition, VisionAnalysis,
-                        Voiceover)
+                        Publishing, Thumbnail, Title, Transition,
+                        VisionAnalysis, Voiceover)
 from .base import AgentContext
 from .caption import CaptionAgent
 from .clip_analysis import ClipAnalysisAgent
@@ -89,6 +90,7 @@ from .render_pool import (MediaPool, ProcessCancelled, ProcessTimeout,
 from .scheduler import RenderScheduler, WorkCancelled
 from .animation import AnimationAgent
 from .music import MusicAgent
+from .publishing import PublishingAgent
 from .story import StoryAgent
 from .thumbnail import ThumbnailAgent
 from .title import TitleAgent
@@ -132,6 +134,8 @@ class GraphState(TypedDict, total=False):
     thumbnail_failed: str | None
     title_id: str | None
     title_failed: str | None
+    publishing_id: str | None
+    publishing_failed: str | None
     edit_plan_id: str
     render_id: str
     critic_id: str
@@ -229,6 +233,7 @@ POLICIES = {
     "critic": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=900),
     "thumbnail": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "title": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
+    "publishing": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=900),
 }
 
 
@@ -1113,6 +1118,54 @@ def node_title(state: GraphState) -> dict:
     return {"title_id": art.artifact_id, "title_failed": None}
 
 
+def node_publishing(state: GraphState) -> dict:
+    """The publishing PLAN for the delivered video. PACKAGING's last step.
+
+    Runs ONCE, after the title - so after the cycle has settled on the video
+    that ships and after its thumbnail and title exist. It reads that render
+    by the id the cycle left in state, verifies the deliverables and states
+    what the operator must do to publish. It uploads nothing: no provider
+    exists, and publishing is the operator's act.
+
+    Never blocking, and never touches the job's status.
+    """
+    job_id = state["job_id"]
+    rt = runtime_for(job_id)
+    agent = PublishingAgent()
+
+    renders = rt.store.all_revisions(job_id, "RenderResult", RenderResult)
+    render_art = next((a for a in renders
+                       if a.artifact_id == state.get("render_id")),
+                      renders[-1] if renders else None)
+    if render_art is None:
+        rt.log.append("publishing skipped: there is no delivered render")
+        return {"publishing_id": None,
+                "publishing_failed": "no delivered render"}
+    thumb_art = rt.store.get(job_id, "Thumbnail", Thumbnail)
+    title_art = rt.store.get(job_id, "Title", Title)
+
+    inputs = [a.artifact_id for a in (render_art, thumb_art, title_art) if a]
+
+    def body(span):
+        rev = rt.store.next_revision(job_id, "Publishing")
+        return agent.execute(
+            rt.context(), span, render=render_art.payload,
+            thumbnail=thumb_art.payload if thumb_art else None,
+            title=title_art.payload if title_art else None,
+            verdict=state.get("verdict"), revision=rev)
+
+    try:
+        art = _run_node("publishing", PublishingAgent.id, job_id,
+                        state.get("attempt", 1), inputs, body)
+    except (ProcessTimeout, WorkCancelled, ProcessCancelled):
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        rt.log.append(f"publishing failed ({type(exc).__name__}: {exc}); "
+                      f"no plan was made, and nothing was published")
+        return {"publishing_id": None, "publishing_failed": str(exc)[:200]}
+    return {"publishing_id": art.artifact_id, "publishing_failed": None}
+
+
 # ------------------------------------------------------------- routing
 
 def route_after_critic(state: GraphState) -> Literal["revise", "escalate", "finish"]:
@@ -1148,6 +1201,7 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_node("escalate", node_escalate)
     g.add_node("thumbnail", node_thumbnail)
     g.add_node("title", node_title)
+    g.add_node("publishing", node_publishing)
 
     g.set_entry_point("clip_analysis")
     # fan out: vision and research are independent of each other
@@ -1182,7 +1236,8 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_edge("finish", "thumbnail")
     g.add_edge("escalate", "thumbnail")
     g.add_edge("thumbnail", "title")
-    g.add_edge("title", END)
+    g.add_edge("title", "publishing")
+    g.add_edge("publishing", END)
     return g
 
 

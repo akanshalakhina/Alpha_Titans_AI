@@ -98,7 +98,7 @@ ArtifactKind = Literal[
     "ContentStrategy", "Story", "Voiceover", "Music", "Animation",
     "Transition", "Caption",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
-    "RevisionRequest", "Thumbnail", "Title",
+    "RevisionRequest", "Thumbnail", "Title", "Publishing",
 ]
 
 T = TypeVar("T", bound=BaseModel)
@@ -1895,6 +1895,120 @@ class Title(BaseModel):
         return self
 
 
+# ----------------------------------------------------------- Publishing
+
+# NOTHING IN THIS PROJECT CAN PUBLISH. The only YouTube code is a read-only
+# search (`youtube/v3/search`, API key) feeding Research; uploading needs
+# OAuth consent and `videos.insert`, and neither exists - no client library,
+# no credentials, no endpoint. So each of these literals has exactly one
+# member, and a parity test fails the moment an upload path appears:
+#
+#   published                   False - always; nothing here was uploaded
+#   provider                    "none"
+#   requires_operator_approval  True - publishing is an outward, public,
+#                               hard-to-undo act, so it is the operator's
+#   recommended_visibility      "private" - a first upload should be seen on
+#                               the platform by its owner before anyone else
+#
+# There is deliberately NO field for an upload id, a URL, a view count or a
+# publish time: `extra="forbid"` makes inventing one a validation error.
+PublishStatus = Literal["ready", "needs_review", "blocked"]
+PublishProvider = Literal["none"]
+CheckSource = Literal["measured", "youtube_limit", "policy"]
+
+
+class PublishCheck(BaseModel):
+    """One readiness check, run locally against the files that exist.
+
+    `youtube_limit` checks compare against YouTube's documented limits; they
+    are run HERE, on disk - nothing is sent to YouTube to find out.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    check: str
+    passed: bool
+    value: str = ""
+    limit: str = ""
+    source: CheckSource = "measured"
+    blocking: bool = False             # a failure here means nothing to ship
+
+
+class PublishAsset(BaseModel):
+    """A deliverable that exists on disk, as measured at packaging time."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["video", "thumbnail"]
+    path: str
+    file_name: str
+    size: int = Field(ge=0)
+    width: int | None = None
+    height: int | None = None
+    codec: str | None = None
+    duration: float | None = None
+
+
+class Publishing(BaseModel):
+    """The publishing PLAN for the delivered video - never a publication.
+
+    Packaging's last step. It gathers what was actually produced - the video
+    the app delivers, the thumbnail and the title it shows - measures each,
+    checks them against YouTube's documented limits locally, and states
+    plainly what a person must do to publish, and that nothing has been.
+
+    `status` is DERIVED from the checks by a validator, so it cannot say
+    "ready" over a failed check: blocked when a blocking check failed,
+    needs_review when any other did, ready only when none did. "ready" means
+    ready for the OPERATOR to upload by hand.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: PublishStatus = "blocked"
+    published: Literal[False] = False
+    provider: PublishProvider = "none"
+    requires_operator_approval: Literal[True] = True
+    recommended_visibility: Literal["private"] = "private"
+
+    video: PublishAsset | None = None
+    thumbnail: PublishAsset | None = None
+    thumbnail_from: Literal["thumbnail_agent", "master_stage"] | None = None
+    title: str = ""
+    title_from: Literal["title_agent", "operator"] | None = None
+    verdict: Verdict | None = None      # what the critic said of the video
+
+    checks: list[PublishCheck] = Field(default_factory=list)
+    # what the project can do on a platform, measured - never model output
+    platform_capabilities: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _status_follows_the_checks(self):
+        failed = [c for c in self.checks if not c.passed]
+        want = ("blocked" if any(c.blocking for c in failed) or not
+                self.checks else "needs_review" if failed else "ready")
+        if self.status != want:
+            raise ValueError(f"status {self.status!r} contradicts the "
+                             f"checks, which give {want!r}")
+        if self.status == "ready" and not (self.video and self.thumbnail
+                                           and self.title):
+            raise ValueError("nothing is ready without a video, a "
+                             "thumbnail and a title")
+        if bool(self.title) != (self.title_from is not None):
+            raise ValueError("a title has a source exactly when it exists")
+        if bool(self.thumbnail) != (self.thumbnail_from is not None):
+            raise ValueError("a thumbnail has a source exactly when it "
+                             "exists")
+        return self
+
+    @property
+    def blockers(self) -> list[PublishCheck]:
+        return [c for c in self.checks if not c.passed and c.blocking]
+
+    @property
+    def warnings(self) -> list[PublishCheck]:
+        return [c for c in self.checks if not c.passed and not c.blocking]
+
+
 __all__ = [
     "SCHEMA_VERSION", "new_id", "content_hash",
     "Decision", "DecidedBy", "Cost", "Artifact", "ArtifactKind",
@@ -1921,4 +2035,6 @@ __all__ = [
     "ThumbnailOperation", "ThumbnailSource", "ThumbnailType",
     "ThumbnailCandidate", "Thumbnail",
     "TITLE_MAX_CHARS", "TitleSource", "TitleType", "Title",
+    "PublishStatus", "PublishProvider", "CheckSource", "PublishCheck",
+    "PublishAsset", "Publishing",
 ]

@@ -71,7 +71,8 @@ import time
 from pathlib import Path
 
 from .artifacts import (ClipAnalysisSet, CriticResult, EditPlan,
-                        JobSettings, RenderResult, Thumbnail, Title)
+                        JobSettings, Publishing, RenderResult, Thumbnail,
+                        Title)
 from .store import (ArtifactStore, resolve_job_db, shared_db_path)
 from .tools.pipeline_bridge import adapter_mod, config_mod
 from .trace import TraceRecorder
@@ -383,6 +384,26 @@ def _project_output(build: Path, render: RenderResult | None,
     return meta
 
 
+def _project_publishing(p: Publishing) -> dict:
+    """The publishing plan, as the app's API reports it.
+
+    `published` is carried as the plain False it always is, so nothing
+    reading this job can take "ready" to mean "uploaded".
+    """
+    return {
+        "status": p.status,
+        "published": p.published,
+        "provider": p.provider,
+        "requires_operator_approval": p.requires_operator_approval,
+        "recommended_visibility": p.recommended_visibility,
+        "title": p.title or None,
+        "thumbnail": p.thumbnail.file_name if p.thumbnail else None,
+        "blockers": [c.check for c in p.blockers],
+        "warnings": [c.check for c in p.warnings],
+        "next_steps": list(p.next_steps),
+    }
+
+
 def _packaged_thumbnail(build: Path, render: RenderResult | None,
                         thumbnail: Thumbnail | None) -> str | None:
     """The Thumbnail agent's image, only when it is genuinely this video's.
@@ -462,6 +483,9 @@ def build_job_json(job_id: str, root: Path | None = None) -> dict:
     thumb = store.get(job_id, "Thumbnail", Thumbnail)
     output = _project_output(build, render.payload if render else None,
                              attempts, thumb.payload if thumb else None)
+    publishing = store.get(job_id, "Publishing", Publishing)
+    if output is not None and publishing is not None:
+        output["publishing"] = _project_publishing(publishing.payload)
     status, error = _project_status(graph, critic.payload if critic else None,
                                     output is not None)
 

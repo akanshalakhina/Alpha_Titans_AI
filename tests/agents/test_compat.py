@@ -193,6 +193,25 @@ def _thumbnail(job) -> Thumbnail:
     return art.payload
 
 
+def test_the_publishing_plan_is_reported_and_claims_nothing(
+        client, published_job):
+    """A real build, published through the real app: the plan is there, it
+    is ready for the OPERATOR, and nothing says it was uploaded."""
+    job, payload = published_job
+    pub = payload["output"]["publishing"]
+    assert pub["published"] is False and pub["provider"] == "none"
+    assert pub["requires_operator_approval"] is True
+    assert pub["recommended_visibility"] == "private"
+    assert pub["status"] == "ready", pub
+    assert pub["title"] == "COMPAT_TEST"          # the operator's, verbatim
+    assert pub["thumbnail"] == payload["output"]["thumbnail"]
+    assert pub["blockers"] == [] and pub["warnings"] == []
+    served = client.get(f"/api/jobs/{job.job_id}").json()["output"]
+    assert served["publishing"]["published"] is False
+    for key in ("upload_id", "video_id", "url", "views", "published_at"):
+        assert key not in pub
+
+
 def test_notes_endpoint_reads_the_agent_output_json(client, published_job):
     job, _ = published_job
     r = client.get(f"/api/jobs/{job.job_id}/notes")
