@@ -14,15 +14,21 @@ with a graph that has all of them.
                                                                      v
           +------------------------> editing_director -> render -> critic
           |                                ^                          |
-          |                                |             PASS      -> END
-          +--------------------------------+             REVISE    -+
-                                                         ESCALATE  -> END
+          |                                |    PASS     -> finish   -+
+          +--------------------------------+    REVISE   -+           |
+                                                ESCALATE -> escalate -+
+                                                                      v
+                                                         thumbnail -> END
 
 The understanding agents (vision, research) fan out and JOIN at the strategy.
 From there it is a chain, each layer briefing the next: the strategy briefs
 the story, the story briefs the narration, the narration briefs the score,
 the score briefs the look, the look briefs the joins, the joins hand
 on to the captions, and the captions brief the director.
+
+Packaging sits after it: once the cycle has settled on the video that
+will be delivered - passed or escalated - the thumbnail is chosen from that
+video, once, and can never cost a render or trigger a revision.
 
 EVERY one of those sits OUTSIDE the revision cycle. A revision re-plans and
 re-renders without re-looking at the footage, re-deciding what the video is
@@ -69,7 +75,7 @@ from langgraph.graph import END, StateGraph
 from .artifacts import (ClipAnalysisSet, ContentStrategy, CriticResult,
                         EditPlan, JobState, RenderResult, ResearchReport,
                         Animation, Caption, Music, RevisionRequest, Story,
-                        Transition, VisionAnalysis, Voiceover)
+                        Thumbnail, Transition, VisionAnalysis, Voiceover)
 from .base import AgentContext
 from .caption import CaptionAgent
 from .clip_analysis import ClipAnalysisAgent
@@ -82,6 +88,7 @@ from .scheduler import RenderScheduler, WorkCancelled
 from .animation import AnimationAgent
 from .music import MusicAgent
 from .story import StoryAgent
+from .thumbnail import ThumbnailAgent
 from .transition import TransitionAgent
 from .voiceover import VoiceoverAgent
 from .rendering import RenderingAgent
@@ -118,6 +125,8 @@ class GraphState(TypedDict, total=False):
     transition_failed: str | None
     caption_id: str | None
     caption_failed: str | None
+    thumbnail_id: str | None
+    thumbnail_failed: str | None
     edit_plan_id: str
     render_id: str
     critic_id: str
@@ -213,6 +222,7 @@ POLICIES = {
     "editing_director": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "render": NodePolicy(attempts=2, backoff_s=3.0, timeout_s=3600),
     "critic": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=900),
+    "thumbnail": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
 }
 
 
@@ -990,6 +1000,64 @@ def node_escalate(state: GraphState) -> dict:
                      or "maximum revisions reached without a passing render"}
 
 
+def node_thumbnail(state: GraphState) -> dict:
+    """Which frame of the delivered video represents it. PACKAGING.
+
+    Runs ONCE, after finish or escalate - so after the render/critic cycle
+    has settled on the video that ships. It reads that render and the plan
+    it was cut from by the ids the cycle left in state, chooses a frame of
+    it, and grabs it with master_stage's own single-frame operation. It
+    cannot cost a render, trigger a revision or change the video.
+
+    Never blocking, and never touches the job's status: losing it leaves
+    master_stage's thumbnail in place, not the operator without a video.
+    """
+    job_id = state["job_id"]
+    rt = runtime_for(job_id)
+    agent = ThumbnailAgent()
+
+    def pick(kind, model, wanted):
+        revs = rt.store.all_revisions(job_id, kind, model)
+        return next((a for a in revs if a.artifact_id == wanted),
+                    revs[-1] if revs else None)
+
+    render_art = pick("RenderResult", RenderResult, state.get("render_id"))
+    plan_art = pick("EditPlan", EditPlan, state.get("edit_plan_id"))
+    if render_art is None or plan_art is None:
+        rt.log.append("thumbnail skipped: there is no delivered render to "
+                      "package")
+        return {"thumbnail_id": None,
+                "thumbnail_failed": "no delivered render"}
+    vision_art = rt.store.get(job_id, "VisionAnalysis", VisionAnalysis)
+    strategy_art = rt.store.get(job_id, "ContentStrategy", ContentStrategy)
+    story_art = rt.store.get(job_id, "Story", Story)
+
+    inputs = [render_art.artifact_id, plan_art.artifact_id]
+    inputs += [a.artifact_id
+               for a in (vision_art, strategy_art, story_art) if a]
+
+    def body(span):
+        rev = rt.store.next_revision(job_id, "Thumbnail")
+        return agent.execute(
+            rt.context(), span, plan=plan_art.payload,
+            render=render_art.payload,
+            vision=vision_art.payload if vision_art else None,
+            strategy=strategy_art.payload if strategy_art else None,
+            story=story_art.payload if story_art else None,
+            verdict=state.get("verdict"), revision=rev)
+
+    try:
+        art = _run_node("thumbnail", ThumbnailAgent.id, job_id,
+                        state.get("attempt", 1), inputs, body)
+    except (ProcessTimeout, WorkCancelled, ProcessCancelled):
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        rt.log.append(f"thumbnail failed ({type(exc).__name__}: {exc}); "
+                      f"master_stage's thumbnail stays the one shown")
+        return {"thumbnail_id": None, "thumbnail_failed": str(exc)[:200]}
+    return {"thumbnail_id": art.artifact_id, "thumbnail_failed": None}
+
+
 # ------------------------------------------------------------- routing
 
 def route_after_critic(state: GraphState) -> Literal["revise", "escalate", "finish"]:
@@ -1023,6 +1091,7 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_node("critic", node_critic)
     g.add_node("finish", node_finish)
     g.add_node("escalate", node_escalate)
+    g.add_node("thumbnail", node_thumbnail)
 
     g.set_entry_point("clip_analysis")
     # fan out: vision and research are independent of each other
@@ -1052,8 +1121,11 @@ def _wire(g: "StateGraph") -> "StateGraph":
         "escalate": "escalate",
         "finish": "finish",
     })
-    g.add_edge("finish", END)
-    g.add_edge("escalate", END)
+    # packaging: whichever way the cycle ended, the delivered video gets its
+    # thumbnail once - after the cycle, so it can never re-enter it
+    g.add_edge("finish", "thumbnail")
+    g.add_edge("escalate", "thumbnail")
+    g.add_edge("thumbnail", END)
     return g
 
 

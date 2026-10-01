@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from agents import compat
-from agents.artifacts import JobSettings, RenderResult
+from agents.artifacts import JobSettings, RenderResult, Thumbnail
 from agents.runner import make_job, run_job
 from agents.store import ArtifactStore
 from conftest import llm_returning_plan
@@ -69,7 +69,17 @@ def test_output_is_master_stages_own_record_not_a_re_derivation(published_job):
     o = payload["output"]
     original = json.loads((Path(job.build_dir) / "output.json").read_text())
     for k, v in original.items():
+        if k == "thumbnail":
+            continue                 # packaged - asserted on its own below
         assert o[k] == v, f"output.{k} was altered"
+    # the ONE field packaging replaces, with the agent's verified image of
+    # this very render - and it says so
+    thumb = _thumbnail(job)
+    assert thumb.generated
+    assert Path(thumb.video_path).name == o["attempt_file"]
+    assert o["thumbnail"] == Path(thumb.image_path).name
+    assert o["thumbnail"] != original["thumbnail"]
+    assert o["_thumbnail_by"] == "thumbnail agent"
     # provenance added, nothing else
     assert o["_produced_by"] == compat.MARKER
     assert o["attempt"] == 1 and o["attempts"] == 1
@@ -115,7 +125,7 @@ def test_the_drawer_card_has_everything_it_renders(client, published_job):
     assert card["clips"] == 2                    # read from manifest.json
     assert card["orientation"] == "horizontal"
     assert card["duration"] > 0
-    assert card["thumbnail"] == "thumbnail.jpg"
+    assert card["thumbnail"] == Path(_thumbnail(job).image_path).name
     assert card["progress"] == 100.0, (
         "done + skipped must total 100%, or the drawer shows a stalled build")
 
@@ -161,10 +171,24 @@ def test_existing_download_returns_the_real_mp4(client, published_job):
 
 
 def test_existing_file_endpoint_serves_the_thumbnail(client, published_job):
-    job, _ = published_job
+    job, payload = published_job
+    # the packaged one the UI now points at...
+    r = client.get(f"/api/jobs/{job.job_id}/file/"
+                   f"{payload['output']['thumbnail']}")
+    assert r.status_code == 200
+    assert r.content[:2] == b"\xff\xd8", "not a jpeg"
+    # ...and master_stage's own, which packaging leaves in place
     r = client.get(f"/api/jobs/{job.job_id}/file/thumbnail.jpg")
     assert r.status_code == 200
     assert r.content[:2] == b"\xff\xd8", "not a jpeg"
+
+
+def _thumbnail(job) -> Thumbnail:
+    from agents.store import resolve_job_db
+    db, _ = resolve_job_db(job.job_id, None)
+    art = ArtifactStore(db).get(job.job_id, "Thumbnail", Thumbnail)
+    assert art is not None, "the build was never packaged"
+    return art.payload
 
 
 def test_notes_endpoint_reads_the_agent_output_json(client, published_job):

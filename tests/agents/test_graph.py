@@ -99,6 +99,15 @@ def test_the_graph_has_the_cycle():
         assert ("research", "editing_director") not in edges
         assert ("editing_director", "render") in edges
         assert ("render", "critic") in edges
+        # packaging comes AFTER the cycle, whichever way it ended, and
+        # nothing leads back from it into the cycle
+        assert ("finish", "thumbnail") in edges
+        assert ("escalate", "thumbnail") in edges
+        assert ("thumbnail", "__end__") in edges
+        assert ("finish", "__end__") not in edges
+        assert ("escalate", "__end__") not in edges
+        assert not any(src == "thumbnail" and dst != "__end__"
+                       for src, dst in edges)
     finally:
         conn.close()
 
@@ -218,6 +227,8 @@ def test_max_revisions_is_enforced_and_escalates(agent_root, calm_clip,
 
     assert final["status"] == "escalated"
     assert final["verdict"] == "ESCALATE"
+    # packaging ran after escalation and did not touch the outcome
+    assert final.get("thumbnail_id"), final.get("thumbnail_failed")
     assert final["revision_count"] <= 2, "exceeded the revision cap"
     assert len(final["history"]) <= 3, "rendered more times than the cap allows"
     assert final["history"][-1]["verdict"] == "ESCALATE"
@@ -234,8 +245,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     a full pass over everything.
     """
     from agents.artifacts import (Animation, Caption, ContentStrategy,
-                                  Music, ResearchReport, Story, Transition,
-                                  VisionAnalysis, Voiceover)
+                                  Music, ResearchReport, Story, Thumbnail,
+                                  Transition, VisionAnalysis, Voiceover)
 
     job = _job(agent_root, calm_clip, lively_clip, "gnorerun")
     llm = llm_returning_plan(
@@ -254,7 +265,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
                         ("Music", Music),
                         ("Animation", Animation),
                         ("Transition", Transition),
-                        ("Caption", Caption)):
+                        ("Caption", Caption),
+                        ("Thumbnail", Thumbnail)):
         revs = store.all_revisions(job.job_id, kind, model)
         assert len(revs) == 1, f"{kind} re-ran on a revision ({len(revs)}x)"
 
@@ -274,6 +286,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     assert nodes.count("animation") == 1
     assert nodes.count("transition") == 1
     assert nodes.count("caption") == 1
+    # packaging runs once, after the cycle, however many renders it took
+    assert nodes.count("thumbnail") == 1
     assert nodes.count("editing_director") == 2
 
 
@@ -319,6 +333,8 @@ def test_the_strategy_joins_vision_and_research_before_the_director(
     assert "caption" in started
     assert started["caption"] >= ends["transition"]
     assert started["editing_director"] >= ends["caption"]
+    assert "thumbnail" in started
+    assert started["thumbnail"] >= ends["critic"]
 
 
 @pytest.mark.slow
@@ -342,7 +358,7 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     assert kinds == {"ClipAnalysis", "VisionAnalysis", "ResearchReport",
                      "ContentStrategy", "Story", "Voiceover", "Music",
                      "Animation", "Transition", "Caption", "EditPlan",
-                     "RenderResult", "CriticResult"}
+                     "RenderResult", "CriticResult", "Thumbnail"}
 
     producers = {r["kind"]: r["produced_by"] for r in rows}
     assert producers["ClipAnalysis"] == "clip_analysis"
@@ -355,6 +371,7 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     assert producers["Animation"] == "animation"
     assert producers["Transition"] == "transition"
     assert producers["Caption"] == "caption"
+    assert producers["Thumbnail"] == "thumbnail"
     assert producers["EditPlan"] == "editing_director"
     assert producers["RenderResult"] == "rendering"
     assert producers["CriticResult"] == "critic"

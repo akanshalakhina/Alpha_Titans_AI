@@ -98,7 +98,7 @@ ArtifactKind = Literal[
     "ContentStrategy", "Story", "Voiceover", "Music", "Animation",
     "Transition", "Caption",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
-    "RevisionRequest",
+    "RevisionRequest", "Thumbnail",
 ]
 
 T = TypeVar("T", bound=BaseModel)
@@ -1649,6 +1649,147 @@ class RevisionRequest(BaseModel):
         return content_hash(self.constraints)
 
 
+# ------------------------------------------------------------ Thumbnail
+
+# The ONE image operation this pipeline has. `server/extras.py::master_stage`
+# makes its thumbnail with
+#
+#     ffmpeg -ss <t> -i <final video> -frames:v 1 thumbnail.jpg
+#
+# - one frame of the delivered video, at the video's own resolution, as a
+# JPEG. No scale, no crop, no text, no overlay, no compositing, and nothing in
+# the project generates an image. So the only thing a thumbnail can decide is
+# WHICH frame, and this literal has exactly one member. A parity test asserts
+# master_stage still does exactly this.
+ThumbnailOperation = Literal["frame_grab"]
+
+# Where a candidate frame came from. Each is a reference to something already
+# measured or validated upstream - never a time a model supplied.
+#   vision_moment    an index into a clip's Vision `interesting_moments`
+#   measured_window  the middle of a clip's measured best window
+#   plan_segment     the middle of a segment the final EditPlan kept
+ThumbnailSource = Literal["vision_moment", "measured_window", "plan_segment"]
+ThumbnailType = Literal["reasoned", "degraded", "minimal"]
+
+
+class ThumbnailCandidate(BaseModel):
+    """One frame the delivered video actually contains, offered by INDEX.
+
+    Built by the agent, never by the model: `clip_id` is a clip the plan
+    kept, `moment_ref` and `window_ref` point into what Vision and the
+    measurement pass already produced, and `segment_index` is the plan
+    segment that shows it. A reference whose moment was trimmed out of the
+    cut is not a candidate at all - it is not a frame of this video.
+
+    `clip_at` and `frame_at` are DERIVED: the referenced moment's time in its
+    clip, and where that lands in the delivered video using the transition
+    offsets the renderer itself recorded. Neither is ever read from a reply.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    index: int = Field(ge=0)
+    clip_id: str
+    source: ThumbnailSource
+    moment_ref: int | None = Field(default=None, ge=0)
+    window_ref: int | None = Field(default=None, ge=0)
+    segment_index: int = Field(ge=1)
+    clip_at: float = Field(ge=0.0)      # derived: seconds into the clip
+    frame_at: float = Field(ge=0.0)     # derived: seconds into the video
+    what: str = ""                      # Vision's words for it, if any
+
+
+class Thumbnail(BaseModel):
+    """Which frame of the finished video represents it - and the file made.
+
+    PACKAGING, NOT EDITING
+    ----------------------
+    This runs once, after the render/critic cycle has settled on the video
+    that will be delivered, and changes nothing about that video. It chooses
+    a frame of it - from candidates derived from Vision's moments, the
+    measured windows and the final cut - and grabs that frame with the same
+    single ffmpeg operation master_stage uses.
+
+    NOTHING IS CLAIMED THAT DID NOT HAPPEN
+    --------------------------------------
+    `generated` is True only when the image exists on disk and ffprobe read
+    real dimensions from it, and a validator makes the fields agree: no path
+    without a measured image, no measured image without a path. A grab that
+    failed is a thumbnail that was not made, and the artifact says so.
+
+    WHAT CANNOT BE EXPRESSED
+    ------------------------
+    Text, crop, zoom, colour, arrows, faces, composites, generated imagery -
+    the pipeline has none of them, and a request for any lands in
+    `unsupported_requests` rather than being promised.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    domain: str = ""
+    thumbnail_type: ThumbnailType = "minimal"
+    operation: ThumbnailOperation = "frame_grab"
+
+    candidates: list[ThumbnailCandidate] = Field(default_factory=list)
+    chosen: int | None = Field(default=None, ge=0)     # -> candidates[i]
+    rationale: str = ""
+    unrealisable: int = Field(default=0, ge=0)   # references not in the cut
+
+    # what the pipeline can actually do, measured - never model output
+    engine_operations: list[str] = Field(default_factory=list)
+    unsupported_requests: list[str] = Field(default_factory=list)
+
+    # what was actually produced, measured - never claimed
+    video_path: str | None = None       # the delivered file it came from
+    verdict: Verdict | None = None      # what the critic said of that file
+    generated: bool = False
+    image_path: str | None = None
+    width: int | None = None
+    height: int | None = None
+    size: int = Field(default=0, ge=0)
+
+    # provenance: what the choice was actually made from
+    vision_available: bool = False
+    strategy_available: bool = False
+    story_available: bool = False
+
+    risks: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    insufficient_signal: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    live: bool = False                 # True only for a real model call
+    model: str | None = None
+
+    @field_validator("candidates")
+    @classmethod
+    def _indices_contiguous(cls, v):
+        """Candidates are offered by index, so the indices ARE the contract:
+        a gap or a repeat would let a reply's number mean two frames."""
+        got = [c.index for c in v]
+        if got != list(range(len(v))):
+            raise ValueError(
+                f"candidate indices must be 0..n-1 in order, got {got}")
+        return v
+
+    @model_validator(mode="after")
+    def _claims_match_what_exists(self):
+        if self.chosen is not None and self.chosen >= len(self.candidates):
+            raise ValueError(f"chosen {self.chosen} is not one of the "
+                             f"{len(self.candidates)} candidates")
+        if self.generated:
+            if not (self.image_path and self.width and self.height
+                    and self.size > 0 and self.chosen is not None):
+                raise ValueError("a generated thumbnail needs a chosen frame "
+                                 "and a measured image on disk")
+        elif self.image_path or self.width or self.height or self.size:
+            raise ValueError("a thumbnail that was not generated cannot "
+                             "carry an image path or measurements")
+        return self
+
+    @property
+    def choice(self) -> "ThumbnailCandidate | None":
+        return None if self.chosen is None else self.candidates[self.chosen]
+
+
 __all__ = [
     "SCHEMA_VERSION", "new_id", "content_hash",
     "Decision", "DecidedBy", "Cost", "Artifact", "ArtifactKind",
@@ -1672,4 +1813,6 @@ __all__ = [
     "SegmentRenderInfo", "RenderTechnical", "RenderResult",
     "TechnicalCheck", "CreativeCheck", "CriticResult", "Verdict", "Severity",
     "RevisionRequest",
+    "ThumbnailOperation", "ThumbnailSource", "ThumbnailType",
+    "ThumbnailCandidate", "Thumbnail",
 ]

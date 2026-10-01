@@ -71,7 +71,7 @@ import time
 from pathlib import Path
 
 from .artifacts import (ClipAnalysisSet, CriticResult, EditPlan,
-                        JobSettings, RenderResult)
+                        JobSettings, RenderResult, Thumbnail)
 from .store import (ArtifactStore, resolve_job_db, shared_db_path)
 from .tools.pipeline_bridge import adapter_mod, config_mod
 from .trace import TraceRecorder
@@ -301,7 +301,8 @@ def _project_stages(trace_rows: list[dict], live: bool = False) -> dict:
 
 
 def _project_output(build: Path, render: RenderResult | None,
-                    attempts: int) -> dict | None:
+                    attempts: int,
+                    thumbnail: Thumbnail | None = None) -> dict | None:
     """Reuse master_stage's own output.json; never re-derive it.
 
     That file is the verified record of what ffmpeg actually produced, and it
@@ -351,7 +352,36 @@ def _project_output(build: Path, render: RenderResult | None,
         meta["attempt"] = render.attempt
         meta["attempts"] = attempts
         meta["attempt_file"] = Path(render.video_path).name
+    packaged = _packaged_thumbnail(build, render, thumbnail)
+    if packaged is not None:
+        # same key, same kind of value: a file name inside the build folder
+        meta["thumbnail"] = packaged
+        meta["_thumbnail_by"] = "thumbnail agent"
     return meta
+
+
+def _packaged_thumbnail(build: Path, render: RenderResult | None,
+                        thumbnail: Thumbnail | None) -> str | None:
+    """The Thumbnail agent's image, only when it is genuinely this video's.
+
+    It must have been generated, still be on disk inside this build folder,
+    and have been grabbed from the very render being published. Anything
+    less - a failed grab, a deleted file, a frame of an earlier attempt -
+    leaves master_stage's own thumbnail in place.
+    """
+    if thumbnail is None or not thumbnail.generated \
+            or not thumbnail.image_path:
+        return None
+    img = Path(thumbnail.image_path)
+    try:
+        inside = img.resolve().parent == build.resolve()
+    except OSError:
+        return None
+    if not (inside and img.exists()):
+        return None
+    if render is not None and thumbnail.video_path != render.video_path:
+        return None
+    return img.name
 
 
 def _project_status(graph: dict, critic: CriticResult | None,
@@ -405,7 +435,9 @@ def build_job_json(job_id: str, root: Path | None = None) -> dict:
     settings = _read_settings(build)
 
     attempts = len(store.all_revisions(job_id, "RenderResult", RenderResult))
-    output = _project_output(build, render.payload if render else None, attempts)
+    thumb = store.get(job_id, "Thumbnail", Thumbnail)
+    output = _project_output(build, render.payload if render else None,
+                             attempts, thumb.payload if thumb else None)
     status, error = _project_status(graph, critic.payload if critic else None,
                                     output is not None)
 
