@@ -99,7 +99,7 @@ ArtifactKind = Literal[
     "Transition", "Caption",
     "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
     "RevisionRequest", "Thumbnail", "Title", "Publishing",
-    "PerformanceAnalysis",
+    "PerformanceAnalysis", "Learning",
 ]
 
 T = TypeVar("T", bound=BaseModel)
@@ -2122,6 +2122,151 @@ class PerformanceAnalysis(BaseModel):
         return [g.reason for g in self.gaps]
 
 
+# --------------------------------------------------------------- Learning
+
+# NOTHING CAN BE LEARNED YET. Learning joins OUTCOMES (measured performance of
+# published videos) with the production DECISIONS behind them, and only
+# proposes a change once the evidence clears every gate the architecture
+# sets. There are no outcomes: `PerformanceAnalysis.status` has one member,
+# "unavailable". So, as for Publishing and PerformanceAnalysis, the literals
+# below have one member each, and parity tests fail the moment that changes:
+#
+#   status                 "insufficient_data"
+#   learned                False
+#   configuration_changed  False - and a change, when one is ever proposed,
+#                          is a CONFIGURATION change awaiting a human's
+#                          approval; nothing here can reach code at all
+#
+# There is deliberately NO field for an insight, a correlation, an effect, a
+# causal claim, an experiment or a proposal: `extra="forbid"` makes inventing
+# one a validation error. What it carries instead is the gate - every check,
+# its threshold, where that threshold comes from, and what was observed -
+# and what each input was, so a pre-publication signal can never be taken
+# for an outcome.
+LearningStatus = Literal["insufficient_data"]
+LearningGateName = Literal[
+    "sufficient_history", "valid_nonzero_data", "cohort_size", "time_window",
+    "holdout_validation", "practical_effect", "human_approval"]
+GateState = Literal["passed", "failed", "not_evaluated"]
+ThresholdFrom = Literal["architecture", "policy"]
+LearningInputRole = Literal["outcome", "decision", "pre_publication"]
+
+# what each kind can ever be to the learning loop - an outcome is measured
+# AFTER publication; everything made before it is a decision or a check
+_OUTCOME_KINDS = ("PerformanceAnalysis",)
+_DECISION_KINDS = ("ContentStrategy", "Story", "EditPlan", "Transition",
+                   "Caption", "Music", "Animation", "Voiceover")
+
+
+class LearningGate(BaseModel):
+    """One check the evidence must clear before anything may be proposed."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    gate: LearningGateName
+    state: GateState
+    required: str                       # the bar, in words, with its number
+    observed: str                       # what was measured against it
+    threshold_from: ThresholdFrom = "policy"
+
+
+class LearningInput(BaseModel):
+    """An artifact the agent read, and what it can be to learning."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: ArtifactKind
+    role: LearningInputRole
+    summary: str = ""                   # categorical facts only, no figures
+    why: str = ""
+
+    @model_validator(mode="after")
+    def _role_follows_the_kind(self):
+        want = ("outcome" if self.kind in _OUTCOME_KINDS else
+                "decision" if self.kind in _DECISION_KINDS else
+                "pre_publication")
+        if self.role != want:
+            raise ValueError(f"{self.kind} is a {want}, never a {self.role}")
+        return self
+
+
+class LearningHistory(BaseModel):
+    """What the shared store holds, across every job - measured, not
+    assumed. A usable sample is a published video with measured,
+    non-zero performance."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    jobs_in_store: int = Field(ge=0)
+    performance_reports: int = Field(ge=0)
+    unavailable_reports: int = Field(ge=0)
+    unreadable_reports: int = Field(ge=0)
+    usable_samples: int = Field(ge=0)
+    samples_needed: int = Field(ge=0)
+
+
+class ConfigTarget(BaseModel):
+    """A piece of CONFIGURATION a future proposal could name - read from the
+    code that consumes it. Code is never a target."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    key: str
+    where: str
+    current: str
+
+
+class Learning(BaseModel):
+    """What the system has learned from how its videos performed - which,
+    until there is performance data, is nothing.
+
+    The last step. It reads this job's performance report, its production
+    decisions and its final results, and the whole shared history; runs the
+    architecture's gate; and returns `insufficient_data` with every gate's
+    result and the minimum-sample gap. Nothing is learned, nothing is
+    proposed, configuration is unchanged - and that is the correct answer,
+    not a failure.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: LearningStatus = "insufficient_data"
+    learned: Literal[False] = False
+    configuration_changed: Literal[False] = False
+    performance_status: PerformanceStatus | None = None
+
+    history: LearningHistory
+    gates: list[LearningGate] = Field(default_factory=list)
+    inputs: list[LearningInput] = Field(default_factory=list)
+    # what a proposal could ever name, measured - never model output
+    configurable: list[ConfigTarget] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _the_gate_holds(self):
+        names = [g.gate for g in self.gates]
+        if names != list(get_args(LearningGateName)):
+            raise ValueError("every gate is reported exactly once, in order")
+        if all(g.state == "passed" for g in self.gates):
+            raise ValueError("insufficient data means a gate did not pass")
+        open_ = False
+        for g in self.gates:
+            if open_ and g.state == "passed":
+                raise ValueError(f"{g.gate} cannot pass after an earlier gate "
+                                 f"did not")
+            open_ = open_ or g.state != "passed"
+        if next(g for g in self.gates
+                if g.gate == "human_approval").state == "passed":
+            raise ValueError("there is no proposal, so nothing was approved")
+        if self.history.usable_samples > self.history.performance_reports:
+            raise ValueError("a usable sample is a performance report")
+        return self
+
+    @property
+    def failed_gates(self) -> list[str]:
+        return [g.gate for g in self.gates if g.state == "failed"]
+
+    @property
+    def unevaluated_gates(self) -> list[str]:
+        return [g.gate for g in self.gates if g.state == "not_evaluated"]
+
+
 __all__ = [
     "SCHEMA_VERSION", "new_id", "content_hash",
     "Decision", "DecidedBy", "Cost", "Artifact", "ArtifactKind",
@@ -2153,4 +2298,7 @@ __all__ = [
     "PerformanceStatus", "AnalyticsProvider", "PerformanceGapReason",
     "PerformanceMetric", "PerformanceGap", "UnmeasuredMetric",
     "ExcludedSignal", "PerformanceAnalysis",
+    "LearningStatus", "LearningGateName", "GateState", "ThresholdFrom",
+    "LearningInputRole", "LearningGate", "LearningInput", "LearningHistory",
+    "ConfigTarget", "Learning",
 ]

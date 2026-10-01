@@ -21,7 +21,7 @@ with a graph that has all of them.
                                           thumbnail -> title -> publishing
                                                                       |
                                                                       v
-                                                performance_analysis -> END
+                                    performance_analysis -> learning -> END
 
 The understanding agents (vision, research) fan out and JOIN at the strategy.
 From there it is a chain, each layer briefing the next: the strategy briefs
@@ -36,7 +36,9 @@ the operator - once each, and none of them can cost a render or trigger a
 revision. Nothing in the project can upload, and nothing claims to. Last,
 the video's performance is reported - as unavailable, with the measured
 reasons, because nothing here can publish it or read its analytics, and
-nothing made before publication is passed off as performance.
+nothing made before publication is passed off as performance. And what was
+learned is reported - nothing, with the gate that stops it: no outcome
+exists to learn from, configuration is unchanged and nothing is proposed.
 
 EVERY one of those sits OUTSIDE the revision cycle. A revision re-plans and
 re-renders without re-looking at the footage, re-deciding what the video is
@@ -83,8 +85,8 @@ from langgraph.graph import END, StateGraph
 from .artifacts import (ClipAnalysisSet, ContentStrategy, CriticResult,
                         EditPlan, JobState, RenderResult, ResearchReport,
                         Animation, Caption, Music, RevisionRequest, Story,
-                        Publishing, Thumbnail, Title, Transition,
-                        VisionAnalysis, Voiceover)
+                        PerformanceAnalysis, Publishing, Thumbnail, Title,
+                        Transition, VisionAnalysis, Voiceover)
 from .base import AgentContext
 from .caption import CaptionAgent
 from .clip_analysis import ClipAnalysisAgent
@@ -96,6 +98,7 @@ from .render_pool import (MediaPool, ProcessCancelled, ProcessTimeout,
 from .scheduler import RenderScheduler, WorkCancelled
 from .animation import AnimationAgent
 from .music import MusicAgent
+from .learning import LearningAgent
 from .performance import PerformanceAnalysisAgent
 from .publishing import PublishingAgent
 from .story import StoryAgent
@@ -145,6 +148,8 @@ class GraphState(TypedDict, total=False):
     publishing_failed: str | None
     performance_id: str | None
     performance_failed: str | None
+    learning_id: str | None
+    learning_failed: str | None
     edit_plan_id: str
     render_id: str
     critic_id: str
@@ -245,6 +250,7 @@ POLICIES = {
     "publishing": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=900),
     "performance_analysis": NodePolicy(attempts=2, backoff_s=1.0,
                                        timeout_s=300),
+    "learning": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
 }
 
 
@@ -1230,6 +1236,60 @@ def node_performance_analysis(state: GraphState) -> dict:
     return {"performance_id": art.artifact_id, "performance_failed": None}
 
 
+def node_learning(state: GraphState) -> dict:
+    """What was learned from how the video performed. The very last step.
+
+    Runs ONCE, after the performance report. It reads that report by the id
+    left in state, this job's strategy, the edit that shipped, the critic's
+    final result and the publishing plan - each by the id the cycle and the
+    packaging left in state - plus the whole shared history, and reports
+    that nothing can be learned while no outcome exists. It proposes nothing
+    and changes no configuration; it has no path to code at all.
+
+    Never blocking, and never touches the job's status.
+    """
+    job_id = state["job_id"]
+    rt = runtime_for(job_id)
+    agent = LearningAgent()
+
+    def chosen(kind, model, key):
+        arts = rt.store.all_revisions(job_id, kind, model)
+        return next((a for a in arts if a.artifact_id == state.get(key)),
+                    arts[-1] if arts else None)
+
+    perf_art = chosen("PerformanceAnalysis", PerformanceAnalysis,
+                      "performance_id")
+    strategy_art = rt.store.get(job_id, "ContentStrategy", ContentStrategy)
+    plan_art = chosen("EditPlan", EditPlan, "edit_plan_id")
+    critic_art = chosen("CriticResult", CriticResult, "critic_id")
+    pub_art = chosen("Publishing", Publishing, "publishing_id")
+
+    inputs = [a.artifact_id for a in (perf_art, strategy_art, plan_art,
+                                      critic_art, pub_art) if a]
+
+    def body(span):
+        rev = rt.store.next_revision(job_id, "Learning")
+        return agent.execute(
+            rt.context(), span,
+            performance=perf_art.payload if perf_art else None,
+            strategy=strategy_art.payload if strategy_art else None,
+            plan=plan_art.payload if plan_art else None,
+            critic=critic_art.payload if critic_art else None,
+            publishing=pub_art.payload if pub_art else None,
+            revision=rev)
+
+    try:
+        art = _run_node("learning", LearningAgent.id, job_id,
+                        state.get("attempt", 1), inputs, body)
+    except (ProcessTimeout, WorkCancelled, ProcessCancelled):
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        rt.log.append(f"learning failed ({type(exc).__name__}: {exc}); "
+                      f"nothing was learned, proposed or changed")
+        return {"learning_id": None, "learning_failed": str(exc)[:200]}
+    return {"learning_id": art.artifact_id, "learning_failed": None}
+
+
 # ------------------------------------------------------------- routing
 
 def route_after_critic(state: GraphState) -> Literal["revise", "escalate", "finish"]:
@@ -1267,6 +1327,7 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_node("title", node_title)
     g.add_node("publishing", node_publishing)
     g.add_node("performance_analysis", node_performance_analysis)
+    g.add_node("learning", node_learning)
 
     g.set_entry_point("clip_analysis")
     # fan out: vision and research are independent of each other
@@ -1303,7 +1364,8 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_edge("thumbnail", "title")
     g.add_edge("title", "publishing")
     g.add_edge("publishing", "performance_analysis")
-    g.add_edge("performance_analysis", END)
+    g.add_edge("performance_analysis", "learning")
+    g.add_edge("learning", END)
     return g
 
 

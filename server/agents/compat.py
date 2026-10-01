@@ -71,8 +71,8 @@ import time
 from pathlib import Path
 
 from .artifacts import (ClipAnalysisSet, CriticResult, EditPlan,
-                        JobSettings, PerformanceAnalysis, Publishing,
-                        RenderResult, Thumbnail, Title)
+                        JobSettings, Learning, PerformanceAnalysis,
+                        Publishing, RenderResult, Thumbnail, Title)
 from .store import (ArtifactStore, resolve_job_db, shared_db_path)
 from .tools.pipeline_bridge import adapter_mod, config_mod
 from .trace import TraceRecorder
@@ -422,6 +422,24 @@ def _project_performance(p: PerformanceAnalysis) -> dict:
     }
 
 
+def _project_learning(p: Learning) -> dict:
+    """The learning report, as the app's API reports it.
+
+    `learned` and `configuration_changed` are the plain False they always
+    are, and each gate appears by name with its state - there is no key an
+    insight, a correlation or a proposal could sit in.
+    """
+    return {
+        "status": p.status,
+        "learned": p.learned,
+        "configuration_changed": p.configuration_changed,
+        "usable_samples": p.history.usable_samples,
+        "samples_needed": p.history.samples_needed,
+        "gates": {g.gate: g.state for g in p.gates},
+        "next_steps": list(p.next_steps),
+    }
+
+
 def _packaged_thumbnail(build: Path, render: RenderResult | None,
                         thumbnail: Thumbnail | None) -> str | None:
     """The Thumbnail agent's image, only when it is genuinely this video's.
@@ -507,6 +525,9 @@ def build_job_json(job_id: str, root: Path | None = None) -> dict:
     performance = store.get(job_id, "PerformanceAnalysis", PerformanceAnalysis)
     if output is not None and performance is not None:
         output["performance"] = _project_performance(performance.payload)
+    learning = store.get(job_id, "Learning", Learning)
+    if output is not None and learning is not None:
+        output["learning"] = _project_learning(learning.payload)
     status, error = _project_status(graph, critic.payload if critic else None,
                                     output is not None)
 

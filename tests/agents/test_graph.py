@@ -106,13 +106,16 @@ def test_the_graph_has_the_cycle():
         assert ("thumbnail", "title") in edges
         assert ("title", "publishing") in edges
         assert ("publishing", "performance_analysis") in edges
-        assert ("performance_analysis", "__end__") in edges
+        assert ("performance_analysis", "learning") in edges
+        assert ("learning", "__end__") in edges
+        assert ("performance_analysis", "__end__") not in edges
         assert ("publishing", "__end__") not in edges
         assert ("title", "__end__") not in edges
         assert ("thumbnail", "__end__") not in edges
         assert ("finish", "__end__") not in edges
         assert ("escalate", "__end__") not in edges
-        after = ("thumbnail", "title", "publishing", "performance_analysis")
+        after = ("thumbnail", "title", "publishing", "performance_analysis",
+                 "learning")
         assert not any(src in after
                        and dst not in after[1:] + ("__end__",)
                        for src, dst in edges)
@@ -256,6 +259,16 @@ def test_max_revisions_is_enforced_and_escalates(agent_root, calm_clip,
     assert perf.payload.next_steps[0].startswith(
         "Resolve the publishing plan first")
     assert perf.degraded and perf.confidence == 0.0
+    # and nothing is learned from it - least of all from a critic that
+    # refused the video
+    assert final.get("learning_id"), final.get("learning_failed")
+    from agents.artifacts import Learning
+    learn = _store(job).get(job.job_id, "Learning", Learning)
+    assert learn.payload.status == "insufficient_data"
+    assert learn.payload.learned is False
+    assert learn.payload.configuration_changed is False
+    assert {i.kind: i.role for i in learn.payload.inputs}["CriticResult"] \
+        == "pre_publication"
     assert final["revision_count"] <= 2, "exceeded the revision cap"
     assert len(final["history"]) <= 3, "rendered more times than the cap allows"
     assert final["history"][-1]["verdict"] == "ESCALATE"
@@ -272,9 +285,10 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     a full pass over everything.
     """
     from agents.artifacts import (Animation, Caption, ContentStrategy,
-                                  Music, PerformanceAnalysis, Publishing,
-                                  ResearchReport, Story, Thumbnail, Title,
-                                  Transition, VisionAnalysis, Voiceover)
+                                  Learning, Music, PerformanceAnalysis,
+                                  Publishing, ResearchReport, Story,
+                                  Thumbnail, Title, Transition,
+                                  VisionAnalysis, Voiceover)
 
     job = _job(agent_root, calm_clip, lively_clip, "gnorerun")
     llm = llm_returning_plan(
@@ -297,7 +311,8 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
                         ("Thumbnail", Thumbnail),
                         ("Title", Title),
                         ("Publishing", Publishing),
-                        ("PerformanceAnalysis", PerformanceAnalysis)):
+                        ("PerformanceAnalysis", PerformanceAnalysis),
+                        ("Learning", Learning)):
         revs = store.all_revisions(job.job_id, kind, model)
         assert len(revs) == 1, f"{kind} re-ran on a revision ({len(revs)}x)"
 
@@ -322,6 +337,7 @@ def test_a_revision_does_not_rerun_the_upstream_understanding(
     assert nodes.count("title") == 1
     assert nodes.count("publishing") == 1
     assert nodes.count("performance_analysis") == 1
+    assert nodes.count("learning") == 1
     assert nodes.count("editing_director") == 2
 
 
@@ -375,6 +391,8 @@ def test_the_strategy_joins_vision_and_research_before_the_director(
     assert started["publishing"] >= ends["title"]
     assert "performance_analysis" in started
     assert started["performance_analysis"] >= ends["publishing"]
+    assert "learning" in started
+    assert started["learning"] >= ends["performance_analysis"]
 
 
 @pytest.mark.slow
@@ -399,7 +417,8 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
                      "ContentStrategy", "Story", "Voiceover", "Music",
                      "Animation", "Transition", "Caption", "EditPlan",
                      "RenderResult", "CriticResult", "Thumbnail",
-                     "Title", "Publishing", "PerformanceAnalysis"}
+                     "Title", "Publishing", "PerformanceAnalysis",
+                     "Learning"}
 
     producers = {r["kind"]: r["produced_by"] for r in rows}
     assert producers["ClipAnalysis"] == "clip_analysis"
@@ -416,6 +435,7 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     assert producers["Title"] == "title"
     assert producers["Publishing"] == "publishing"
     assert producers["PerformanceAnalysis"] == "performance_analysis"
+    assert producers["Learning"] == "learning"
     assert producers["EditPlan"] == "editing_director"
     assert producers["RenderResult"] == "rendering"
     assert producers["CriticResult"] == "critic"

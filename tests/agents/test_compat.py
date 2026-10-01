@@ -234,6 +234,27 @@ def test_performance_is_reported_unavailable_with_no_figure(
         assert key not in perf
 
 
+def test_learning_is_reported_insufficient_and_changes_nothing(
+        client, published_job):
+    """A real build through the real app: nothing learned, nothing
+    proposed, configuration unchanged - and the gate that says why."""
+    job, payload = published_job
+    learn = payload["output"]["learning"]
+    assert learn["status"] == "insufficient_data"
+    assert learn["learned"] is False
+    assert learn["configuration_changed"] is False
+    assert learn["usable_samples"] == 0 and learn["samples_needed"] == 30
+    assert learn["gates"]["sufficient_history"] == "failed"
+    assert learn["gates"]["human_approval"] == "not_evaluated"
+    assert "passed" not in learn["gates"].values()
+    served = client.get(f"/api/jobs/{job.job_id}").json()["output"]
+    assert served["learning"]["learned"] is False
+    assert served["learning"]["status"] == "insufficient_data"
+    for key in ("insights", "proposal", "proposals", "correlation",
+                "effect_size", "experiment", "causal_claim"):
+        assert key not in learn
+
+
 def test_notes_endpoint_reads_the_agent_output_json(client, published_job):
     job, _ = published_job
     r = client.get(f"/api/jobs/{job.job_id}/notes")
