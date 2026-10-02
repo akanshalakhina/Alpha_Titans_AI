@@ -87,9 +87,24 @@ Two things follow from that, and they are the point of the design:
 
 ## 2 · Architecture
 
-### The five agents
+There are **two layers**, and it matters which one you are looking at:
 
-The work is split into **five named agents**, each owning one job. An agent is
+| | Classic pipeline | Agent layer |
+|---|---|---|
+| What it is | Five named owners of pipeline stages | Eighteen agents on a LangGraph state machine |
+| Entry point | `POST /api/jobs/{id}/start` | `python -m agents.runner run` |
+| Who drives it | The web UI | the runner; results project back into the UI |
+| Reasoning | One optional vision call | Twelve model-backed agents |
+| Status | Shipping, unchanged | Shipping, **additive** |
+
+The agent layer did not replace the pipeline — it sits on top of it and calls
+the same renderer. Nothing in `pipeline/` or the original `server/` modules was
+modified to add it, which is why the classic path still behaves exactly as it
+always did. Both are described below, classic first.
+
+### The classic pipeline: five stage owners
+
+The original work is split into **five named agents**, each owning one job. An agent is
 not a separate process or a separate model — it is a named owner for a group of
 pipeline stages, the decisions those stages make, and the reasons behind them.
 The split is declared once in `server/adapter.py` (`AGENTS` and `STAGE_AGENT`)
@@ -129,6 +144,64 @@ what the model saw into the same rule-based Director that runs without it. With
 no API key the Vision Agent reports itself unavailable, the Editor Agent works
 from motion, dead air and recording timestamps alone, and the build completes —
 that fallback is a supported mode, not a degraded one.
+
+### The agent layer: eighteen agents on a real graph
+
+The classic pipeline answers *how do I cut this footage*. It never answers
+*what is this video saying*. The agent layer does, and it is a genuine
+multi-agent system rather than a renamed set of function calls:
+
+* **Eighteen agents**, each owning exactly one typed artifact. No two agents
+  produce the same kind, and no agent writes another's.
+* **A real LangGraph `StateGraph`** with a SQLite checkpointer, conditional
+  edges, a parallel fan-out and fan-in, and a genuine cycle.
+* **Typed artifacts** — frozen Pydantic models with `extra="forbid"`, so an
+  agent cannot smuggle a field past the schema. Each carries who produced it,
+  the hash of its inputs, its confidence, its decisions and their reasons.
+
+```
+clip_analysis ──┬──► vision ───┐
+                │              ├──► content_strategy ──► story ──► voiceover
+                └──► research ─┘                                       │
+                                                                       ▼
+   caption ◄── transition ◄── animation ◄── music ◄────────────────────┘
+      │
+      ▼
+ editing_director ──► render ──► critic ──┬── PASS ─────► finish ───┐
+      ▲                                   │                         │
+      └────────── REVISE (the cycle) ◄────┤                         │
+                                          └── ESCALATE ──► escalate ─┤
+                                                                     ▼
+            thumbnail ──► title ──► publishing ──► performance ──► learning
+```
+
+**The cycle is real, and bounded.** The critic watches the *actual rendered
+MP4* — not the plan that produced it — and returns PASS, REVISE or ESCALATE.
+REVISE routes back to the editing director with machine-readable constraints;
+`max_revisions` ends it, and a REVISE with nothing actionable escalates rather
+than spinning. Everything upstream of the editing director sits **outside** the
+cycle, so a revision re-plans and re-renders without re-deciding the message or
+re-authoring the story.
+
+**Both exits package the video.** PASS and ESCALATE both continue into
+thumbnail → title → publishing → performance → learning, so a video that
+escalated still arrives with everything a human needs to judge it.
+
+**Twelve of the eighteen reason; six measure.** The split is declared on each
+agent class and verified by a test that fails if an agent calls itself
+reasoning without ever calling a model. With **no API key configured**, every
+reasoning agent runs its own deterministic fallback and *says so*: the artifact
+carries `degraded=True` and a `fallback_used` string, the trace records it, and
+`GET /api/v2/health` reports `reasoning_enabled: false` with the reason. That
+is a supported mode — the pipeline completes and produces a video — but it is
+reported as degraded rather than passed off as reasoning.
+
+| | |
+|---|---|
+| Agent list | **derived** by `agents.base.agent_registry()`, never hand-maintained |
+| Health | `GET /api/v2/health` — agents, counts, model, whether reasoning is on |
+| Trace | `GET /api/v2/jobs/{id}/trace` — every span, decision and fallback |
+| Store | one SQLite artifact store, content-addressed by `inputs_hash` |
 
 ### The stack under the agents
 
@@ -363,6 +436,36 @@ The pipeline's own overrides (`AT_CANVAS`, `AT_CRF`, `AT_XFADES`,
 `AT_XFADE_T`) are set **per build** by the server from the UI settings — do not
 set them in `.env` or you will pin every build to the same values.
 
+### Turning the reasoning layer on
+
+The eighteen-agent layer runs with **no key at all** — every reasoning agent
+falls back to its deterministic path and marks the artifact `degraded`. To let
+those twelve agents actually reason, set a key:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `AT_LLM_API_KEY` | *(unset)* | **the switch.** Unset = every agent uses its fallback. Falls back to `AT_VISION_API_KEY` so an existing `.env` keeps working |
+| `AT_LLM_PROVIDER` | `anthropic` | `anthropic` or `openai` |
+| `AT_LLM_MODEL` | provider default | model id, e.g. `claude-sonnet-4-5` |
+| `AT_LLM_BASE_URL` | provider default | gateway or self-hosted endpoint |
+| `AT_LLM_TIMEOUT` | `60` | seconds per request (floor of 10) |
+| `AT_SEARCH_API_KEY` | *(unset)* | enables the Research agent's web lookups |
+| `AT_SEARCH_PROVIDER` | `none` | `tavily`, `brave`, `youtube` or `none` |
+| `AT_SEARCH_MAX` | `8` | results per query (clamped to 1–20) |
+| `AT_SEARCH_TIMEOUT` | `20` | seconds per query (floor of 5) |
+| `AT_RESEARCH_TTL` | `3600` | seconds a research report stays cacheable |
+
+Check it took effect:
+
+```bash
+curl -s localhost:8000/api/v2/health
+# "reasoning_enabled": true, "model": "...", "agent_count": 18
+```
+
+With no key that same call returns `"reasoning_enabled": false` and a
+`why_no_model` explaining which variable to set. **No key is a supported
+mode, not a broken one** — but it is reported honestly rather than silently.
+
 ---
 
 ## 7 · Running it
@@ -433,11 +536,45 @@ instead of quietly passing. Current result: **30 declared, 30 exercised, 29
 returning 2xx** — the one non-2xx is `GET /notes` before a build has finished,
 which is a correct 404.
 
+#### The agent layer: `/api/v2`
+
+Mounted by a guarded optional import in `main.py`, so if the agent layer's
+dependencies are missing the classic app still starts and behaves identically.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/v2/health` | agent list, counts, model, whether reasoning is on |
+| GET | `/api/v2/jobs` | agent-built jobs, with verdict and score |
+| GET | `/api/v2/jobs/{id}/status` | verdict, attempts, the delivered video |
+| GET | `/api/v2/jobs/{id}/trace` | every span, decision, cost and fallback |
+| POST/DELETE | `/api/v2/jobs/{id}/cancel` | request / clear cancellation |
+| POST | `/api/v2/jobs/{id}/project` | re-publish a finished agent job into the classic `/api/jobs` view (normally automatic) |
+
+**There is deliberately no v2 route that starts a build.** A graph run is
+started from the runner, which keeps minutes-long renders off the request
+path:
+
+```bash
+python -m agents.runner run --src uploads/<job> --job-id mydemo
+python -m agents.runner trace --job-id mydemo     # what every agent decided
+python -m agents.runner show  --job-id mydemo     # the artifacts themselves
+```
+
+When a run finishes it projects itself into the classic layer automatically,
+so the existing UI lists and plays an agent-built video with no changes to the
+frontend.
+
+The agent list in `/api/v2/health` is derived by walking the package, and a
+test asserts the endpoint and the package agree — an earlier version of this
+route answered from a hardcoded list of four and kept saying four while the
+system grew to eighteen.
+
 ---
 
 ## 8 · How the video pipeline works
 
-Ten stages, each owned by one of the five agents. Six are the pipeline's own,
+This section describes the **classic pipeline**. Ten stages, each owned by one
+of the five stage-owner agents. Six are the pipeline's own,
 invoked unchanged; one is the optional vision pass; one is the edit planner;
 two are the finishing pass. The UI shows all ten grouped under their agent,
 with real status, elapsed time and the streamed stdout of each.

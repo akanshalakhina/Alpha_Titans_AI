@@ -57,7 +57,7 @@ def strong_hook_video(media_root, calm_clip, lively_clip):
     return _render_pair(media_root / "strong_hook.mp4", lively_clip, calm_clip)
 
 
-def _artifacts_for(path, order):
+def _artifacts_for(path, order, audio=None):
     probe = VT.probe_final(path)
     segs = [
         Segment(index=1, clip_id=order[0], start=0.0, end=6.0, duration=6.0,
@@ -73,7 +73,8 @@ def _artifacts_for(path, order):
             duration=probe["duration"], width=probe["width"],
             height=probe["height"], fps=probe["fps"],
             video_codec=probe["video_codec"],
-            audio_codec=probe["audio_codec"]))
+            audio_codec=probe["audio_codec"]),
+        **(audio or {}))
     clip_set = ClipAnalysisSet(
         clips=[make_clip_analysis("01_calm.mp4", 6.0, 1.0),
                make_clip_analysis("02_lively.mp4", 6.0, 6.0)],
@@ -82,7 +83,10 @@ def _artifacts_for(path, order):
 
 
 def _judge(ctx, span_maker, path, order, **kw):
-    render, plan, clip_set = _artifacts_for(path, order)
+    # audio provenance belongs on the RenderResult, not on execute()
+    audio = {k: kw.pop(k) for k in ("music_source", "mood", "keep_audio")
+             if k in kw}
+    render, plan, clip_set = _artifacts_for(path, order, audio=audio)
     agent = CriticAgent()
     # artifacts are immutable, so a second judgement in the same test writes
     # the next revision rather than overwriting the first
@@ -252,15 +256,36 @@ def test_unscored_creative_dimensions_are_declared_not_invented(
     assert "1 of 10" in coverage.chose
 
 
-def test_loudness_is_measured_but_not_a_gate_while_audio_is_silent(
+def test_loudness_is_not_a_gate_when_no_bed_was_requested(
         director_ctx, tracer_span, strong_hook_video):
+    """A deliberately silent build is correct, so loudness is informational.
+
+    This test used to assert the check was ALWAYS informational, which is
+    what let every agent build ship silent with a 100/100 score. It now
+    pins only the half that is genuinely informational; the other half is
+    pinned by the test below and by test_music_render.py.
+    """
     ctx, _ = director_ctx
     art, _ = _judge(ctx, tracer_span, strong_hook_video,
                     ["02_lively.mp4", "01_calm.mp4"])
     lo = next(t for t in art.payload.technical if t.check == "loudness")
     assert lo.severity == "low"
     assert lo.passed
-    assert "Phase 4" in lo.threshold
+    assert "not judged" in lo.threshold
+
+
+def test_a_requested_bed_that_came_out_silent_blocks(director_ctx,
+                                                     tracer_span,
+                                                     strong_hook_video):
+    """The regression that mattered: silence must not score 100/100."""
+    ctx, _ = director_ctx
+    art, _ = _judge(ctx, tracer_span, strong_hook_video,
+                    ["02_lively.mp4", "01_calm.mp4"],
+                    music_source="generate", mood="beat")
+    lo = next(t for t in art.payload.technical if t.check == "loudness")
+    assert lo.passed is False
+    assert lo.severity == "blocking"
+    assert lo.routes_to == "music"
 
 
 def test_hook_scoring_handles_an_unmeasurable_file():

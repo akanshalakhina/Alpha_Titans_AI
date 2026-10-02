@@ -82,4 +82,47 @@ class Agent:
         return time.time()
 
 
-__all__ = ["Agent", "AgentContext"]
+# ------------------------------------------------------------- registry
+
+def agent_registry() -> dict[str, dict]:
+    """Every concrete agent in this package, discovered by walking it.
+
+    DERIVED, never hand-written. An earlier /api/v2/health answered from a
+    literal list of four agent ids and a literal phase string; fourteen
+    agents later it was still saying four, because nothing made it wrong.
+    Walking the package means the only way to change this answer is to add
+    or remove an agent, which is exactly when it should change.
+
+    Imported lazily inside the function: the agent modules import `base`,
+    so walking them at module scope would be a cycle.
+    """
+    import importlib
+    import inspect
+    import pkgutil
+
+    import agents as _pkg
+
+    out: dict[str, dict] = {}
+    for mi in pkgutil.iter_modules(_pkg.__path__):
+        if mi.ispkg:
+            continue
+        try:
+            mod = importlib.import_module(f"agents.{mi.name}")
+        except Exception:                      # noqa: BLE001
+            # an agent whose optional deps are missing must not take the
+            # health endpoint down with it
+            continue
+        for _, obj in inspect.getmembers(mod, inspect.isclass):
+            if (issubclass(obj, Agent) and obj is not Agent
+                    and obj.__module__ == mod.__name__):
+                out[obj.id] = {
+                    "id": obj.id,
+                    "produces": obj.produces,
+                    "agency": getattr(obj, "agency", "unknown"),
+                    "uses_llm": bool(getattr(obj, "uses_llm", False)),
+                    "module": mi.name,
+                }
+    return dict(sorted(out.items()))
+
+
+__all__ = ["Agent", "AgentContext", "agent_registry"]

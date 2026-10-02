@@ -23,8 +23,9 @@ import shutil
 import time
 from pathlib import Path
 
-from .artifacts import (Artifact, Cost, Decision, EditPlan, RenderResult,
-                        RenderSpec, RenderTechnical, SegmentRenderInfo)
+from .artifacts import (Artifact, Cost, Decision, EditPlan, Music,
+                        RenderResult, RenderSpec, RenderTechnical,
+                        SegmentRenderInfo)
 from .base import Agent, AgentContext
 from .tools import render_tools as RT
 from .tools import verify_tools as VT
@@ -59,6 +60,7 @@ class RenderingAgent(Agent):
     def execute(self, ctx: AgentContext, span: TraceSpan, plan: EditPlan,
                 attempt: int, revision: int = 0,
                 edit_plan_id: str = "",
+                music: Music | None = None,
                 stage_timeout_s: float | None = None
                 ) -> Artifact[RenderResult]:
         started = time.time()
@@ -68,7 +70,7 @@ class RenderingAgent(Agent):
             job_id=job.job_id, build_dir=job.build_dir, src_dir=job.src_dir,
             plan=plan, quality=job.settings.quality,
             xfade_duration=job.settings.transition_duration,
-            title=job.settings.title)
+            title=job.settings.title, music=music)
         inputs_hash = self.hash_inputs(spec.model_dump(mode="json"))
 
         # ---- projection: typed plan -> the interface ffmpeg reads ---------
@@ -109,6 +111,32 @@ class RenderingAgent(Agent):
                                pool=ctx.pool, timeout_s=stage_timeout_s)
         if rc != 0:
             raise RuntimeError(f"join failed (exit {rc}): {out[-500:]}")
+
+        # ---- the score, through the pipeline's own music stage ----------
+        # Must sit between join and master: music_stage measures _joined.mp4
+        # and writes _audio.json, which master_stage reads back. Skipping it
+        # is what made every agent-built video silent.
+        span.tool("extras.music_stage", stage="music",
+                  music_source=spec.music_source, mood=spec.mood,
+                  keep_audio=spec.keep_audio)
+        with _outputs_root(job.build_dir):
+            audio = ctx.pool.run(RT.run_music, job.job_id, spec, ctx.emit)
+        track = (audio or {}).get("track")
+        decisions.append(Decision(
+            what="Audio bed",
+            chose=(f"{spec.music_source}"
+                   + (f" / {spec.mood}" if spec.mood else "")
+                   + f", keep_audio={spec.keep_audio}"),
+            why=("compiled from the Music artifact, whose mood is the same "
+                 "closed vocabulary extras.MOODS implements; keep_audio is "
+                 "not an agent decision and follows the app's own default"
+                 if music is not None else
+                 "no Music artifact for this job, so the renderer takes the "
+                 "silent-mux path it has always taken"),
+            decided_by="policy", confidence=1.0))
+        if spec.music_source != "none" and not track:
+            warnings.append("music stage produced no track; the master will "
+                            "be muxed silent")
 
         span.tool("extras.master_stage", stage="master")
         with _outputs_root(job.build_dir):
@@ -162,6 +190,8 @@ class RenderingAgent(Agent):
             thumbnail_path=(str(Path(job.build_dir) / meta["thumbnail"])
                             if meta.get("thumbnail") else None),
             technical=technical, segments=seg_info,
+            music_source=spec.music_source, mood=spec.mood,
+            keep_audio=spec.keep_audio, audio_track=track,
             wall_s=round(time.time() - started, 2), warnings=warnings)
 
         ctx.emit("rendered attempt %d: %s  %.2fs  %sx%s  frames=%s"

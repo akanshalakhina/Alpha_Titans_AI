@@ -402,12 +402,23 @@ def test_the_guard_reads_only_the_marker(tmp_path, monkeypatch):
 # ------------------------------------------------- 7. v2 surface
 
 def test_v2_health_reports_the_agent_layer(client):
+    """The list is DERIVED, so this asserts against the package, not a literal.
+
+    This test used to hold its own copy of a four-id list. Both it and the
+    endpoint went stale together while the system grew to eighteen agents,
+    which is exactly the failure a hand-maintained list guarantees.
+    """
+    from agents.base import agent_registry
+
     r = client.get("/api/v2/health")
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is True
-    assert set(body["agents"]) == {"clip_analysis", "editing_director",
-                                   "rendering", "critic"}
+    assert set(body["agents"]) == set(agent_registry())
+    assert body["agent_count"] == len(agent_registry())
+    # the four originals must still be among them
+    assert {"clip_analysis", "editing_director", "rendering",
+            "critic"} <= set(body["agents"])
 
 
 def test_v2_status_exposes_artifacts_and_verdict(client, published_job):

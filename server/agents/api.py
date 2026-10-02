@@ -38,8 +38,11 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 
 from . import compat
-from .artifacts import ClipAnalysisSet, CriticResult, EditPlan, RenderResult
+from .artifacts import (SCHEMA_VERSION, ClipAnalysisSet, CriticResult,
+                        EditPlan, RenderResult)
+from .base import agent_registry
 from .store import ArtifactStore, resolve_job_db, shared_store
+from .tools.llm_tools import LLMClient
 from .trace import TraceRecorder
 
 router = APIRouter(prefix="/api/v2", tags=["agents"])
@@ -192,15 +195,33 @@ def project_agent_job(job_id: str):
 
 @router.get("/health")
 def agent_health():
-    """Is the agent layer present and what does it currently hold?"""
+    """Is the agent layer present, what does it hold, and can it reason?
+
+    The agent list and the counts are DERIVED from the package itself, not
+    typed in here. The previous version of this endpoint returned a literal
+    four-id list and a literal phase number, and kept returning them while
+    the system grew to eighteen agents - a hardcoded answer cannot go stale
+    loudly, so it goes stale silently. `reasoning_enabled` is reported for
+    the same reason: a reader must be able to tell a model-backed run from
+    the deterministic fallbacks without reading the artifacts.
+    """
     store = shared_store()
+    registry = agent_registry()
+    llm = LLMClient().describe()
     return {
         "ok": True,
         "shared_store": store.db_path,
         "jobs_in_store": len(store.jobs()),
         "agent_jobs_on_disk": compat.agent_jobs(),
-        "agents": ["clip_analysis", "editing_director", "rendering", "critic"],
-        "phase": "2.4",
+        "agents": list(registry),
+        "agent_detail": list(registry.values()),
+        "agent_count": len(registry),
+        "reasoning_agents": sum(1 for a in registry.values() if a["uses_llm"]),
+        "reasoning_enabled": bool(llm["enabled"]),
+        "model": llm.get("model"),
+        "provider": llm.get("provider"),
+        "why_no_model": llm.get("why_disabled"),
+        "schema_version": SCHEMA_VERSION,
     }
 
 

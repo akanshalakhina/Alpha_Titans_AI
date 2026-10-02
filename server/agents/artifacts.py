@@ -1490,6 +1490,13 @@ class SegmentRenderSpec(BaseModel):
     cache_key: str
 
 
+# The renderer's own audio vocabulary, read from the modules that
+# implement it. `Mood` is already declared above and is asserted equal to
+# extras.MOODS by the music parity test; these two complete the set.
+MusicSource = Literal["generate", "upload", "none"]
+KeepAudio = Literal["none", "mix", "only"]
+
+
 class RenderSpec(BaseModel):
     """Everything ffmpeg needs, compiled - never authored by an LLM.
 
@@ -1509,6 +1516,38 @@ class RenderSpec(BaseModel):
     xfade_list: list[str] = Field(default_factory=lambda: ["fade"])
     segments: list[SegmentRenderSpec]
     title: str = "ALPHA_TITANS"
+
+    # ---- audio -------------------------------------------------------
+    # Compiled from the Music artifact, never authored by a model. These
+    # three are exactly the keys `extras.music_stage` and
+    # `extras.master_stage` already read, so the typed Music decision
+    # reaches ffmpeg through the interface those stages have always used
+    # rather than through a second audio path.
+    #
+    # Before this existed the agent renderer passed music_source="none"
+    # and keep_audio="none" as literals, so every agent-built video came
+    # out as digital silence no matter what the Music agent decided.
+    music_source: MusicSource = "none"
+    mood: Mood | None = None
+    keep_audio: KeepAudio = "none"
+
+    @model_validator(mode="after")
+    def _mood_required_when_generating(self) -> "RenderSpec":
+        # generate_music() falls back to "beat" for an unknown mood, which
+        # would silently ignore the Music agent. Refuse instead.
+        if self.music_source == "generate" and self.mood is None:
+            raise ValueError(
+                "music_source='generate' needs a mood; it must come from "
+                "the Music artifact, not from a default")
+        return self
+
+    def audio_settings(self) -> dict[str, str]:
+        """The settings dict `music_stage`/`master_stage` already expect."""
+        out = {"music_source": self.music_source,
+               "keep_audio": self.keep_audio}
+        if self.mood is not None:
+            out["mood"] = self.mood
+        return out
 
     def env_overrides(self) -> dict[str, str]:
         return {
@@ -1568,6 +1607,22 @@ class RenderResult(BaseModel):
     segments: list[SegmentRenderInfo] = Field(default_factory=list)
     wall_s: float = 0.0
     warnings: list[str] = Field(default_factory=list)
+
+    # What the renderer was told to do about audio, carried forward from the
+    # RenderSpec so the chain Music -> RenderSpec -> ffmpeg -> critic is
+    # readable from the artifacts alone. The critic needs `music_source` in
+    # particular: silence is a PASS when none was asked for and a FAILURE
+    # when a bed was. Defaulted so artifacts written before this existed
+    # still load, and they describe the silent path, which is what they were.
+    music_source: MusicSource = "none"
+    mood: Mood | None = None
+    keep_audio: KeepAudio = "none"
+    audio_track: str | None = None      # the wav music_stage actually made
+
+    @property
+    def wanted_audio(self) -> bool:
+        """Was this render supposed to have an audible bed?"""
+        return self.music_source != "none" or self.keep_audio != "none"
 
     @property
     def cache_hits(self) -> int:

@@ -26,6 +26,15 @@ node_modules/
 dist/
 build/
 
+# generated state. Every one of these is written under outputs/ today, so
+# these lines are belt-and-braces: a run that ever writes one elsewhere must
+# not be able to commit it.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
 # footage in, renders out — never committed
 uploads/*
 outputs/*

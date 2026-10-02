@@ -925,6 +925,12 @@ async def node_render(state: GraphState) -> dict:
     if plan_art is None:                              # pragma: no cover
         raise RuntimeError("EditPlan artifact missing")
 
+    # The score. Optional on purpose: the music node is never blocking, and a
+    # job resumed from a checkpoint written before the Music agent existed has
+    # no such artifact. Absent, the renderer takes its silent-mux path exactly
+    # as it did before - present, the mood reaches generate_music.
+    music_art = rt.store.get(job_id, "Music", Music)
+
     async def body(span):
         rev = rt.store.next_revision(job_id, "RenderResult")
         span.tool("scheduler.submit", job_id=job_id, label="render",
@@ -933,12 +939,16 @@ async def node_render(state: GraphState) -> dict:
             job_id, agent.execute, rt.context(), span,
             plan=plan_art.payload, attempt=attempt, revision=rev,
             edit_plan_id=plan_art.artifact_id,
+            music=music_art.payload if music_art else None,
             stage_timeout_s=policy.timeout_s,
             label="render", timeout_s=policy.timeout_s)
         return await work
 
+    upstream = [plan_art.artifact_id]
+    if music_art:
+        upstream.append(music_art.artifact_id)
     art = await _run_node_async("render", RenderingAgent.id, job_id, attempt,
-                                [plan_art.artifact_id], body)
+                                upstream, body)
     return {"render_id": art.artifact_id}
 
 

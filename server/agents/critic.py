@@ -45,6 +45,14 @@ DEFAULT_PASS_THRESHOLD = 65.0
 HOOK_OPENING_CAP_S = 8.0
 
 
+# Loudness. ebur128 reports its floor (about -70) for digital silence, and
+# the master stage normalises a real bed to -16, so the two are nowhere near
+# each other and the floor does not need to be tight.
+TARGET_LUFS = -16.0
+LUFS_TOLERANCE = 1.5
+SILENCE_LUFS = -50.0
+
+
 class CriticAgent(Agent):
     id = "critic"
     produces = "CriticResult"
@@ -216,21 +224,52 @@ class CriticAgent(Agent):
             severity="blocking", routes_to="rendering"))
 
         # --- loudness -----------------------------------------------------
-        # Phase 1 has no Music Agent, so the master stage muxes silence. The
-        # figure is still measured and reported, but failing a build for the
-        # loudness of a bed this phase deliberately does not produce would be
-        # dishonest, so the check is informational until Phase 4.
+        # Judged against what the render was ASKED for, which the
+        # RenderResult now carries. A video muxed silent on purpose
+        # (music_source="none", keep_audio="none") is correct and passes
+        # informationally. A video that was supposed to carry a bed and came
+        # out inaudible is a real defect, and until 2026-10-02 it scored
+        # 100/100: this check returned passed=True unconditionally, so every
+        # agent build shipped silent with the critic's blessing.
         span.tool("verify.loudness")
         lufs = render.technical.lufs
         if lufs is None:
             span.tool("verify.loudness", recomputed=True)
             lufs = ctx.pool.run(VT.loudness, path)
-        out.append(TechnicalCheck(
-            check="loudness", value=(f"{lufs} LUFS" if lufs is not None
-                                     else "unmeasurable"),
-            threshold="-16 +/-1.5 LUFS once a music bed exists (Phase 4); "
-                      "informational while this phase renders silence",
-            passed=True, severity="low", routes_to="music"))
+
+        wanted = render.wanted_audio
+        silent = lufs is None or lufs <= SILENCE_LUFS
+        span.tool("verify.loudness", wanted_audio=wanted, lufs=lufs,
+                  silent=silent)
+        if not wanted:
+            out.append(TechnicalCheck(
+                check="loudness",
+                value=(f"{lufs} LUFS" if lufs is not None else "unmeasurable"),
+                threshold="no bed was requested for this build, so loudness "
+                          "is reported but not judged",
+                passed=True, severity="low", routes_to="music"))
+        elif silent:
+            out.append(TechnicalCheck(
+                check="loudness",
+                value=(f"{lufs} LUFS - inaudible" if lufs is not None
+                       else "unmeasurable"),
+                threshold=(f"a bed was requested ({render.music_source}"
+                           + (f"/{render.mood}" if render.mood else "")
+                           + f", keep_audio={render.keep_audio}) so the "
+                           f"track must measure above {SILENCE_LUFS} LUFS"),
+                passed=False, severity="blocking", routes_to="music"))
+        else:
+            ok = abs(lufs - TARGET_LUFS) <= LUFS_TOLERANCE
+            out.append(TechnicalCheck(
+                check="loudness", value=f"{lufs} LUFS",
+                threshold=f"{TARGET_LUFS} +/-{LUFS_TOLERANCE} LUFS",
+                passed=True, severity="low", routes_to="music")
+                if ok else TechnicalCheck(
+                check="loudness", value=f"{lufs} LUFS",
+                threshold=(f"{TARGET_LUFS} +/-{LUFS_TOLERANCE} LUFS; audible "
+                           f"but off target, which the loudnorm pass should "
+                           f"have corrected"),
+                passed=True, severity="low", routes_to="music"))
 
         return out
 

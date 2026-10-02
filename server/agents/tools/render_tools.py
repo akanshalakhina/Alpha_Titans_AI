@@ -35,7 +35,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..artifacts import (ClipAnalysisSet, EditPlan, RenderSpec,
+from ..artifacts import (ClipAnalysisSet, EditPlan, Music, RenderSpec,
                          SegmentRenderSpec)
 from .analysis_tools import read_manifest, run_pipeline_stage
 from .pipeline_bridge import adapter_mod, build_video, extras_mod
@@ -46,7 +46,9 @@ from .pipeline_bridge import adapter_mod, build_video, extras_mod
 def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
                         plan: EditPlan, quality: str = "high",
                         xfade_duration: float = 0.4,
-                        title: str = "ALPHA_TITANS") -> RenderSpec:
+                        title: str = "ALPHA_TITANS",
+                        music: Music | None = None,
+                        keep_audio: str = "none") -> RenderSpec:
     """EditPlan -> RenderSpec. Deterministic; never authored by a model.
 
     The transition list comes from the plan when the Transition agent chose
@@ -62,6 +64,22 @@ def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
     cyclically - `XFADES[(i - 1) % len(XFADES)]` - so a shorter sequence
     repeats and a longer one is simply not reached, both of which are
     harmless. Padding or truncating here would invent a choice nobody made.
+
+    AUDIO
+    -----
+    The Music artifact supplies `mood` only. `Music.mood` is the same closed
+    literal as `extras.MOODS`, asserted by a parity test, so the mood that
+    reaches `generate_music` is always one the engine implements.
+
+    No Music artifact means `music_source="none"` - the silent mux the agent
+    renderer used unconditionally before this, so a resumed checkpoint or a
+    job built before the Music agent existed renders exactly as it did.
+
+    `keep_audio` is NOT derived from any artifact, because no artifact
+    decides it: Music describes the score, not the footage's own audio. It
+    defaults to "none" - score only - which is the classic UI's own default
+    (`frontend/app.js`), so an agent build and a UI build treat the footage
+    audio the same way.
     """
     n_cuts = max(len(plan.segments) - 1, 1)
     return RenderSpec(
@@ -75,6 +93,9 @@ def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
         xfade_duration=float(xfade_duration),
         xfade_list=list(plan.xfade_list) or ["fade"] * n_cuts,
         title=title,
+        music_source="generate" if music is not None else "none",
+        mood=music.mood if music is not None else None,
+        keep_audio=keep_audio,
         segments=[
             SegmentRenderSpec(
                 index=s.index, clip_id=s.clip_id, start=s.start, end=s.end,
@@ -208,19 +229,44 @@ def run_join(spec: RenderSpec, on_line=None, *, pool=None,
                               job_id=spec.job_id, timeout_s=timeout_s)
 
 
-def run_master(job_id: str, spec: RenderSpec, on_line=None) -> dict:
-    """Mux, loudness-normalise, thumbnail and VERIFY, via existing extras.py.
+def run_music(job_id: str, spec: RenderSpec, on_line=None) -> dict:
+    """Stage 7, via the EXISTING extras.music_stage. No second audio engine.
 
-    Phase 1 has no Music Agent, so no audio track is produced and
-    `master_stage` takes its silent-mux path - the same path the current app
-    takes when music is set to none.
+    Must run after `join` and before `master`: `music_stage` measures
+    `_joined.mp4` for the post-speed duration and the rescaled transition
+    marks, then writes `_audio.json`, which `master_stage` reads back.
+
+    The settings it is given are compiled from the Music artifact by
+    `RenderSpec.audio_settings()`. With `music_source="none"` this is a
+    no-op that records a silent plan, which is exactly what a job with no
+    Music artifact should get.
     """
     settings = {
         "quality": _quality_for_crf(spec.crf),
         "title": spec.title,
         "speed": "normal",
-        "music_source": "none",
-        "keep_audio": "none",
+        **spec.audio_settings(),
+    }
+    return extras_mod.music_stage(job_id, settings,
+                                  on_line or (lambda _l: None))
+
+
+def run_master(job_id: str, spec: RenderSpec, on_line=None) -> dict:
+    """Mux, loudness-normalise, thumbnail and VERIFY, via existing extras.py.
+
+    The audio settings come from the spec, which compiled them from the
+    Music artifact. They were literal `"none"`s here until 2026-10-02, which
+    meant `master_stage` always took its silent-mux path and every
+    agent-built video shipped as digital silence regardless of what the
+    Music agent had decided. `music_stage` has normally already written
+    `_audio.json` by this point; passing the same settings keeps the two
+    stages reading one decision rather than two.
+    """
+    settings = {
+        "quality": _quality_for_crf(spec.crf),
+        "title": spec.title,
+        "speed": "normal",
+        **spec.audio_settings(),
     }
     return extras_mod.master_stage(job_id, settings, on_line or (lambda _l: None))
 
@@ -234,4 +280,4 @@ def _quality_for_crf(crf: int) -> str:
 
 __all__ = ["compile_render_spec", "project_manifest", "plan_cache",
            "invalidate_stale", "write_cache_keys", "run_cut", "run_join",
-           "run_master"]
+           "run_music", "run_master"]

@@ -1,5 +1,32 @@
 # Alpha Titans — Technical Context & Audit
 
+> ## ⚠ HISTORICAL BASELINE — superseded 2026-10-02
+>
+> This is the **pre-refactor** audit, dated 2026-09-22. It describes the system
+> *as it was before* the agent layer existed, and its central conclusion —
+> *"it is not a multi-agent AI system"* — **was true then and is no longer
+> true now.**
+>
+> It is kept, unedited apart from this banner and the two correction notes
+> below, because it is the baseline the rebuild was measured against. Read it
+> as the "before" picture.
+>
+> **For the current architecture see [README.md](README.md) § 2.** In short,
+> what changed:
+>
+> | | This document (2026-09-22) | Now |
+> |---|---|---|
+> | Agents | 5 named stage owners | **18 agents**, one typed artifact each |
+> | Model calls | 1 optional (vision) | **12 reasoning agents** |
+> | Orchestrator | a `for` loop over 10 stages | a **LangGraph `StateGraph`** with a checkpointer |
+> | Re-planning | none | a **real bounded cycle**, critic → editing director |
+> | Quality gate | none | a **critic that inspects the rendered MP4** |
+> | State | `job.json` | typed, content-addressed artifact store |
+>
+> Everything this document says about `pipeline/` and the original `server/`
+> modules **is still accurate**: none of those files were modified. The agent
+> layer is additive.
+
 **Prepared for external AI review. Nothing in the project was modified to produce this.**
 
 | | |
@@ -22,7 +49,7 @@ Five labels are used throughout and they are **not** interchangeable:
 | **USER INPUT** | A control the operator sets. **Not a system decision.** |
 | **NOT IMPLEMENTED** | Does not exist in the code. |
 
-A note on the word "agent": the codebase uses it to mean *a named component that owns a group of stages and reports its own status* — explicitly **not** "a language model". `server/adapter.py` lines 65–79 say so in a comment. Four of the five so-called agents contain no model call of any kind. This report keeps that distinction sharp because the brief asked for it.
+A note on the word "agent": **in this document** it means *a named component that owns a group of stages and reports its own status* — explicitly **not** "a language model". (Since 2026-10-02 the project also has a second, additive layer where "agent" does mean a model-backed decision maker with its own typed artifact; this document predates it.) `server/adapter.py` lines 65–79 say so in a comment. Four of the five so-called agents contain no model call of any kind. This report keeps that distinction sharp because the brief asked for it.
 
 ---
 
@@ -396,6 +423,16 @@ There are **five named "agents"** declared in `adapter.AGENTS` (`adapter.py:80`)
 The codebase is candid about this. `adapter.py:67–71`: *"'Agent' here means an autonomous component with its own inputs, its own decisions and its own reported status — NOT that each one is a language model. Exactly one of them (Vision) calls a model; the other four are deterministic."* The UI carries the same distinction as a per-agent badge reading `vision model` or `rule-based`.
 
 **Honest characterisation: this is a well-structured deterministic pipeline with named subsystems and one optional vision call. It is not a multi-agent AI system.**
+
+> **CORRECTION (2026-10-02).** The sentence above was accurate when written and
+> is the finding that prompted the rebuild. It no longer describes the system.
+> There is now a real orchestrator — a LangGraph `StateGraph` with a SQLite
+> checkpointer, a parallel fan-out/fan-in, conditional edges and a genuine
+> bounded cycle (`critic → editing_director`) driven by a critic that inspects
+> the rendered MP4 rather than the plan. Eighteen agents each own one typed,
+> immutable artifact; twelve of them call a model. The five stage owners
+> described above still exist and still drive the classic `/api/jobs` path —
+> they were not removed. See [README.md](README.md) § 2.
 
 ### What currently makes decisions
 
