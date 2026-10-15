@@ -129,3 +129,47 @@ test('a failed run is terminal whatever else it says', () => {
     status: { producing: true, verdict: null, failed: { error: 'x' } },
   }), false);
 });
+
+
+// ---------------------------------------- an interrupted build is not a
+// finished one, and not a failed one either
+//
+// A production runs in a thread of the server process. Kill the server and
+// the thread goes with it, while the artifacts and the LangGraph checkpoint
+// stay on disk. `/status` then answered with no verdict and nothing
+// producing - which the old rule drew as "still working", so the person
+// watched a spinner for a build that had stopped minutes earlier.
+
+const INTERRUPTED = {
+  jobId: JOB, job: PUBLISHED, settled: 0,
+  status: { producing: false, verdict: null, current_node: null,
+            interrupted: { resumable: true, nodes_done: 7,
+                           stopped_at: 'render' } },
+};
+
+test('an interrupted build keeps the working screen, not the result', () => {
+  assert.equal(isRunning(INTERRUPTED), true,
+    'it has no verdict and must not render as finished');
+});
+
+test('an interrupted build keeps polling for its resume', () => {
+  assert.equal(pollsAgain(INTERRUPTED), true);
+});
+
+test('a finished job is never called interrupted', () => {
+  const done = {
+    jobId: JOB, job: PUBLISHED, settled: 0,
+    status: { producing: false, verdict: 'PASS', current_node: null,
+              interrupted: null },
+  };
+  assert.equal(isRunning(done), false);
+  assert.equal(pollsAgain(done), false);
+});
+
+test('a failure is still terminal even if a checkpoint exists', () => {
+  assert.equal(pollsAgain({
+    jobId: JOB, job: null, settled: 0,
+    status: { producing: false, verdict: null, failed: { error: 'x' },
+              interrupted: { resumable: true, nodes_done: 2 } },
+  }), false, 'a crash with a reason is not a lost thread');
+});

@@ -145,6 +145,9 @@ def agent_status(job_id: str):
         # run. A job being produced by some other server would read false
         # here - correctly, since this server could not report on it.
         "producing": _is_running(job_id),
+        # Left half-built by a restart, with a checkpoint to continue
+        # from. None for everything else, which is almost every job.
+        "interrupted": _interrupted(job_id),
         "current_node": running[-1]["node"] if running else None,
         "artifacts": {
             "ClipAnalysis": clips.artifact_id if clips else None,
@@ -306,6 +309,90 @@ def approve_learning(job_id: str):
     return {"job_id": job_id, "approved": True, "already": not fresh,
             "note": ("the Learning report is rebuilt on the next run of "
                      "that node; approval alone changes nothing on disk")}
+
+
+def _interrupted(job_id: str) -> dict | None:
+    """Whether this job was left half-built, and what it had reached.
+
+    A production lives in a thread of THIS process. Close the server
+    mid-run - a crash, a restart, a Ctrl+C - and the thread goes with it
+    while the artifacts, the trace and the LangGraph checkpoint all stay
+    on disk. Nothing noticed: `/status` reported a job with no verdict
+    and nothing producing, which the UI drew as a run still in progress.
+    The person then watched a spinner for a build that had stopped
+    minutes ago.
+
+    `runner.resume_job` has always been able to finish these from the
+    checkpoint - `test_resume.py` proves it across a real process kill -
+    but only from the command line. Saying so here is what lets the
+    browser offer it.
+    """
+    if _is_running(job_id) or _FAILED.get(job_id):
+        return None
+    from . import runner
+    _src, build = runner.job_paths(job_id)
+    if not (build / runner.CHECKPOINT_DB).exists():
+        return None                       # never started under the graph
+    db, _ = resolve_job_db(job_id)
+    rows = TraceRecorder(db).for_job(job_id)
+    if not rows:
+        return None
+    if ArtifactStore(db).get(job_id, "CriticResult", CriticResult):
+        return None                       # it reached a verdict
+    done = [r["node"] for r in rows if r["status"] == "ok"]
+    stalled = [r["node"] for r in rows if r["status"] == "running"]
+    return {
+        "resumable": True,
+        "nodes_done": len(set(done)),
+        "stopped_at": stalled[-1] if stalled else (done[-1] if done else None),
+        "why": ("the server stopped while this was building; its "
+                "checkpoint survived, so it can continue from where it "
+                "got to rather than starting again"),
+    }
+
+
+@router.post("/jobs/{job_id}/resume", status_code=202)
+def resume(job_id: str):
+    """Continue an interrupted build from its checkpoint.
+
+    The nodes that already finished are not run again - LangGraph is
+    given `None` as the input, which resumes the thread rather than
+    starting it. That matters for more than time: re-running the
+    reasoning nodes would spend a second set of tokens against a daily
+    quota, and could reach different answers, so the second half of the
+    video would no longer match the first.
+    """
+    _require_agent_job(job_id)
+    with _RUN_LOCK:
+        if _is_running(job_id):
+            raise HTTPException(409, f"{job_id} is already being produced")
+        state = _interrupted(job_id)
+        if state is None:
+            raise HTTPException(
+                409, f"{job_id} has nothing to resume: it is either "
+                     f"finished, never started, or has no checkpoint")
+
+        from . import runner
+        _FAILED.pop(job_id, None)
+
+        def _go():
+            try:
+                runner.resume_job(job_id)
+            except Exception as exc:            # noqa: BLE001
+                _FAILED[job_id] = {
+                    "error": f"{type(exc).__name__}: {exc}"[:600],
+                    "traceback": traceback.format_exc()[-2000:],
+                    "at": time.time(),
+                }
+            finally:
+                _refresh_legacy_record(job_id)
+
+        t = threading.Thread(target=_go, name=f"resume-{job_id}", daemon=True)
+        _RUNNING[job_id] = t
+        t.start()
+
+    return {"job_id": job_id, "status": "running", "resumed_from": state,
+            "follow": {"status": f"/api/v2/jobs/{job_id}/status"}}
 
 
 @router.post("/jobs/{job_id}/cancel")

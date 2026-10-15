@@ -1,0 +1,106 @@
+# Run the tests on every push, because nobody reliably runs 1,800 of them
+# by hand.
+#
+# WHY THIS EXISTS
+# ---------------
+# On 14 Oct two changes were pushed to a green-looking tree that had in
+# fact broken existing tests: `fit_filter` grew a third return value and
+# its three callers were not updated, and a `store.get(..., "Animation")`
+# landed in the wrong function because `music_art = ...` appears in two
+# of them. Both were found minutes later by running the suite. Both
+# would have been found before the push by this file.
+#
+# THE TWO THINGS IT MUST GET RIGHT
+# --------------------------------
+# 1. ffmpeg. Most of this project is ffmpeg work and the agent suite
+#    BUILDS real clips in its fixtures. Without it the run does not fail
+#    honestly - it reports around a thousand errors from
+#    `conftest._make_clip`, which reads like a catastrophe and is only a
+#    missing binary.
+# 2. No live model calls. `tests/agents/conftest.py` empties the API keys,
+#    but a key reaching the environment some other way would turn a test
+#    run into real spend against a 200,000-token daily quota. They are
+#    emptied again here, belt and braces, at the job level.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+
+# A newer push makes an older run pointless; cancel it rather than queue
+# behind it. The suite takes twenty minutes and the runner is shared.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # `_env()` reads "" as absent, and `config._load_dotenv` uses
+  # `setdefault`, so an empty value here survives even if a .env appears.
+  AT_LLM_API_KEY: ""
+  AT_VISION_API_KEY: ""
+  AT_SEARCH_API_KEY: ""
+  # cp1252 cannot encode the typographic characters agents write into
+  # captions; a print of one killed a render before this was set.
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Refuse to run without ffmpeg
+        # Checked explicitly so a missing binary reads as what it is,
+        # rather than as a thousand fixture errors further down.
+        run: |
+          python - <<'PY'
+          import shutil, sys
+          missing = [b for b in ("ffmpeg", "ffprobe") if not shutil.which(b)]
+          if missing:
+              sys.exit("missing: %s - the suite builds real clips" % missing)
+          print("ffmpeg and ffprobe are on PATH")
+          PY
+
+      - name: Agent suite
+        # Run separately from tests/backend: both trees carry a conftest.py
+        # with the same module name, and pytest refuses to collect them in
+        # one invocation.
+        run: python -m pytest tests/agents -q --tb=short -rf
+
+      - name: Backend suite
+        run: python -m pytest tests/backend -q --tb=short -rf
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Frontend suite
+        # No install step and no lockfile on purpose: the frontend has
+        # zero npm dependencies and the tests run on node's own runner.
+        run: node --test tests/frontend/

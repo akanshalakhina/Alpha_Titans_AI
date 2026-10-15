@@ -23,6 +23,7 @@ import json
 import shutil
 import sys
 import uuid
+import time
 from pathlib import Path
 
 from .artifacts import (ClipAnalysisSet, CriticResult, EditPlan, JobSettings,
@@ -106,8 +107,7 @@ def run_job(job: JobState, llm: LLMClient | None = None,
             root: Path | None = None) -> dict:
     """Start a job from scratch. Returns the final graph state."""
     rt = build_runtime(job, llm=llm, pool=pool, root=root)
-    if on_line:
-        rt.log = _TeeLog(on_line)
+    rt.log = _RunLog(Path(job.build_dir) / RUN_LOG, on_line)
     cfg = {"configurable": {"thread_id": job.job_id},
            "recursion_limit": recursion_limit}
     try:
@@ -140,8 +140,7 @@ def resume_job(job_id: str, root: Path | None = None,
                    settings=settings or _restore_settings(build_dir),
                    max_revisions=max_revisions)
     rt = build_runtime(job, llm=llm, pool=pool, root=root)
-    if on_line:
-        rt.log = _TeeLog(on_line)
+    rt.log = _RunLog(build_dir / RUN_LOG, on_line)
     cfg = {"configurable": {"thread_id": job_id},
            "recursion_limit": recursion_limit}
     try:
@@ -251,6 +250,56 @@ class _TeeLog(list):
             self._sink(item)
         except Exception:
             pass
+
+
+RUN_LOG = "run.log"
+
+
+class _RunLog(list):
+    """A log list that also writes each line to `run.log` beside the build.
+
+    WHAT WAS BEING LOST
+    -------------------
+    `ctx.emit` appends to a plain list. The CLI passes `on_line` and sees
+    every line; the SERVER passes nothing, so the list was filled during
+    a twenty-minute build and then discarded with the object. The trace
+    database kept the structured record - status, tokens, errors,
+    fallbacks, per node - but the readable account of what happened
+    ("performance: measured from oct.csv - 10432 view(s)") existed only
+    while the run did.
+
+    That is the half somebody reads at nine the next morning when they
+    want to know what the thing actually did, so it is written down.
+
+    Appended line by line rather than at the end, because a run that
+    crashes is exactly the one whose log is wanted, and flushed for the
+    same reason. Failures are swallowed: a build must not die because a
+    log line could not be written.
+    """
+
+    def __init__(self, path, sink=None):
+        super().__init__()
+        self._path, self._sink = Path(path), sink
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:                                   # pragma: no cover
+            self._path = None
+
+    def append(self, item):
+        super().append(item)
+        if self._sink is not None:
+            try:
+                self._sink(item)
+            except Exception:                             # noqa: BLE001
+                pass
+        if self._path is None:
+            return
+        try:
+            with self._path.open("a", encoding="utf-8") as fh:
+                print(time.strftime("%H:%M:%S"), item, file=fh)
+                fh.flush()
+        except OSError:                                   # pragma: no cover
+            self._path = None          # stop trying; do not stop the build
 
 
 # ------------------------------------------------------------------- cli

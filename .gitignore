@@ -67,3 +67,6 @@ Thumbs.db
 data/_synthetic/
 # Warehouse exports the operator drops in. Their own analytics, not ours.
 data/analytics/*.csv
+# Written by scripts/dedupe_uploads.py: which upload is a hardlink to
+# which. Local bookkeeping about this machine's disk, not source.
+data/_dedupe_ledger.json

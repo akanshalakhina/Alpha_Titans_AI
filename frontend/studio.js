@@ -1032,6 +1032,44 @@ function workingScreen() {
   // the usual cause. The server now reports that instead of 404ing, and it
   // must be shown: the phase list below would otherwise sit at "queued"
   // forever and read as "still working".
+  // Left half-built when the server stopped. Different from a failure:
+  // nothing went wrong, the thread simply went away with the process,
+  // and the checkpoint on disk can carry it the rest of the way. Shown
+  // BEFORE the phase list, which would otherwise sit at "queued" and
+  // read as a build still in progress - which is exactly what happened
+  // three times in one afternoon.
+  const stopped = S.status?.interrupted;
+  if (stopped && !S.status?.failed) {
+    const box = el('div', 'wx-failed');
+    box.innerHTML = `<h3>This production was interrupted</h3>
+      <p class="sx-dim">${esc(stopped.why || '')}</p>
+      <p class="wx-count">${esc(stopped.nodes_done)} step(s) finished${
+        stopped.stopped_at ? `, stopped at ${esc(stopped.stopped_at)}` : ''}</p>`;
+    const go = el('button', 'wx-send');
+    go.innerHTML = `${svg(ICON.send)}<span>Continue from where it stopped</span>`;
+    go.addEventListener('click', async () => {
+      go.disabled = true;
+      go.querySelector('span').textContent = 'Continuing…';
+      try {
+        const r = await fetch(
+          `${V2}/jobs/${encodeURIComponent(S.jobId)}/resume`,
+          { method: 'POST' });
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          throw new Error(d.detail || `could not resume (${r.status})`);
+        }
+        await openProduction(S.jobId);
+      } catch (e) {
+        go.disabled = false;
+        go.querySelector('span').textContent = 'Continue from where it stopped';
+        box.append(el('p', 'cx-note is-warn', esc(String(e.message || e))));
+      }
+    });
+    box.append(go);
+    wrap.append(box);
+    return wrap;
+  }
+
   const failed = S.status?.failed;
   if (failed) {
     const box = el('div', 'wx-failed');
@@ -1224,7 +1262,7 @@ function viewProduction() {
   // to the old video with its Send button, as if nothing had happened.
   const running = !!(S.jobId && S.status &&
     (S.status.producing || S.status.starting ||
-     !S.status.verdict || finishing()));
+     S.status.interrupted || !S.status.verdict || finishing()));
   f.append(topBar(running ? 'In production' : 'Your video',
     S.jobId ? `<span class="sx-mono">${esc(S.jobId)}</span>` : 'Nothing open',
     picker));

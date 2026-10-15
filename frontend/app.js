@@ -14,7 +14,7 @@
    harmless), a warning is logged once, and the user is told to reload. */
 // versioned like the other assets: a cached copy of this module after
 // an update would leave the page running last release's studio
-import { initStudio } from './studio.js?v=24';
+import { initStudio } from './studio.js?v=25';
 
 /* The studio shell (overview, production workspace, agents, runs, health).
    Lazy: it makes no requests until a studio view is first shown. The create
