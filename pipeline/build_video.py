@@ -628,7 +628,155 @@ def stage_sheets(args):
 
 # --------------------------------------------------------------------- cut
 
-def fit_filter(seg, canvas, crop=None):
+# ----------------------------------------------------------- overlays
+#
+# A graphic laid over a segment: a sticker, a logo, a lower third.
+#
+# THE RULE THIS KEEPS
+# -------------------
+# The agent layer names an asset, a segment and an ANCHOR. It never names
+# a pixel or a second. Everything below turns those words into exact
+# numbers from measurements this file already has - the canvas size, the
+# segment's own duration, and the size ffmpeg reports for the asset at
+# render time. A model cannot put a sticker three seconds into a clip
+# that is two seconds long, because it is not given the vocabulary to
+# say so.
+#
+# Nine anchors, as ffmpeg overlay expressions. `W`/`H` are the canvas,
+# `w`/`h` the scaled overlay, and `%(m)d` the margin - so the position is
+# resolved against the real sizes rather than assumed.
+ANCHORS = {
+    "top-left":      "x=%(m)d:y=%(m)d",
+    "top-center":    "x=(W-w)/2:y=%(m)d",
+    "top-right":     "x=W-w-%(m)d:y=%(m)d",
+    "middle-left":   "x=%(m)d:y=(H-h)/2",
+    "center":        "x=(W-w)/2:y=(H-h)/2",
+    "middle-right":  "x=W-w-%(m)d:y=(H-h)/2",
+    "bottom-left":   "x=%(m)d:y=H-h-%(m)d",
+    "bottom-center": "x=(W-w)/2:y=H-h-%(m)d",
+    "bottom-right":  "x=W-w-%(m)d:y=H-h-%(m)d",
+}
+
+# Margin and default size, both as a share of the canvas WIDTH so a
+# sticker sits the same distance in on 720p and 4k.
+OVERLAY_MARGIN_PCT = 4.0
+OVERLAY_SCALE_PCT = 18.0
+
+# How long a graphic holds, as a share of its segment. A closed
+# vocabulary: the agent picks a word, this file picks the seconds.
+HOLDS = {
+    "full":  (0.00, 1.00),
+    "open":  (0.00, 0.45),
+    "close": (0.55, 1.00),
+}
+
+# Never right at the cut - a graphic that appears in the same frame as a
+# crossfade reads as a glitch.
+OVERLAY_EDGE = 0.15
+
+
+def _read_overlays(out_dir):
+    """`overlays.json`, grouped by segment index. Missing means none.
+
+    Written by the agent layer next to `captions.json`, in the same
+    shape: semantic only. Each entry names an `asset` relative to
+    `assets/`, a `segment_index`, an `anchor` and optionally
+    `scale_pct` and `hold`. A malformed file is reported and ignored
+    rather than failing a render that was otherwise fine - a build
+    losing its stickers is a disappointment; a build losing its video is
+    a defect.
+    """
+    path = os.path.join(out_dir, "overlays.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            rows = json.load(f)
+        if not isinstance(rows, list):
+            raise ValueError("expected a list")
+    except (OSError, ValueError) as exc:
+        print("WARNING: overlays.json unreadable (%s); rendering without "
+              "graphics." % exc)
+        return {}
+
+    assets = os.path.join(out_dir, "assets")
+    out = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            index = int(row.get("segment_index"))
+        except (TypeError, ValueError):
+            print("WARNING: overlay with no segment_index, skipping.")
+            continue
+        name = str(row.get("asset") or "").strip()
+        # a name only - never a path the caller chose, so nothing outside
+        # the build's own assets folder can be read
+        name = os.path.basename(name)
+        if not name:
+            print("WARNING: overlay with no asset name, skipping.")
+            continue
+        out.setdefault(index, []).append({
+            "path": os.path.join(assets, name),
+            "anchor": row.get("anchor"),
+            "scale_pct": row.get("scale_pct"),
+            "hold": row.get("hold"),
+        })
+    return out
+
+
+def overlay_chain(seg, canvas, overlays, first_input=1):
+    """Turn semantic overlay requests into inputs and a filter fragment.
+
+    Returns `(inputs, fragment, out_label)`, where `inputs` are extra
+    `-i` arguments in the order the fragment refers to them.
+
+    With no overlays it returns `([], "", None)` and the caller appends
+    nothing - the filtergraph for a segment without graphics is then
+    byte-identical to the one this file has always produced.
+    """
+    if not overlays:
+        return [], "", None
+    cw, ch = canvas
+    margin = max(8, int(round(cw * OVERLAY_MARGIN_PCT / 100.0)))
+    dur = float(seg["end"]) - float(seg["start"])
+
+    inputs, parts, idx = [], [], first_input
+    for ov in overlays:
+        path = ov.get("path")
+        if not path or not os.path.exists(path):
+            print("WARNING: overlay asset missing, skipping: %s" % (path,))
+            continue
+        anchor = ANCHORS.get(ov.get("anchor"), ANCHORS["top-right"])
+        pct = float(ov.get("scale_pct") or OVERLAY_SCALE_PCT)
+        pct = min(max(pct, 2.0), 60.0)            # neither invisible nor a wall
+        width = max(16, int(round(cw * pct / 100.0)))
+        lo, hi = HOLDS.get(ov.get("hold"), HOLDS["full"])
+        a = round(dur * lo + (OVERLAY_EDGE if lo == 0.0 else 0.0), 2)
+        b = round(dur * hi - (OVERLAY_EDGE if hi == 1.0 else 0.0), 2)
+        if b <= a:                                 # a segment too short to hold it
+            print("WARNING: segment %s is too short for an overlay, skipping."
+                  % seg.get("index"))
+            continue
+        inputs += ["-i", path]
+        parts.append((idx, width, anchor % {"m": margin}, a, b))
+        idx += 1
+
+    if not parts:
+        return [], "", None
+
+    frag, prev = "", None
+    for n, (i, width, pos, a, b) in enumerate(parts):
+        src = prev or "%s"                         # filled in by the caller
+        label = "[vo%d]" % n
+        frag += (";[%d:v]scale=%d:-1[ov%d]"
+                 ";%s[ov%d]overlay=%s:enable='between(t\\,%.2f\\,%.2f)'%s"
+                 % (i, width, n, src, n, pos, a, b, label))
+        prev = label
+    return inputs, frag, prev
+
+
+def fit_filter(seg, canvas, crop=None, overlays=None):
     """Filter chain putting one segment on the canvas, captioned."""
     cw, ch = canvas
     pre = "trim=start=%f:end=%f,setpts=PTS-STARTPTS" % (seg["start"], seg["end"])
@@ -648,9 +796,21 @@ def fit_filter(seg, canvas, crop=None):
                 "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1[v]"
                 % (pre, cw, ch, cw, ch, cw, ch))
 
+    def _with_overlays(chain, label):
+        """Append the graphics, if any were asked for.
+
+        Returns `(chain, label, inputs)`. When nothing was asked for the
+        chain and label come back exactly as they went in, so a build
+        with no overlays produces the filtergraph it always has.
+        """
+        ins, frag, out = overlay_chain(seg, canvas, overlays)
+        if not frag:
+            return chain, label, []
+        return chain + (frag % label), out, ins
+
     text = seg.get("caption") or ""
     if not text:
-        return body, "[v]"
+        return _with_overlays(body, "[v]")
     # vertical output keeps captions clear of the platform UI
     y = "h-470" if ch > cw else "h-160"
     size = 56 if ch > cw else 48
@@ -659,7 +819,7 @@ def fit_filter(seg, canvas, crop=None):
              "borderw=3:bordercolor=black@0.7:x=(w-text_w)/2:y=%s:"
              "enable='between(t\\,%.2f\\,%.2f)'[vc]"
              % (esc_path(FONT), esc(text), size, y, 0.25, max(dur - 0.35, 0.5)))
-    return body, "[vc]"
+    return _with_overlays(body, "[vc]")
 
 
 def stage_cut(args):
@@ -678,6 +838,11 @@ def stage_cut(args):
         s["caption"] = str(cap).strip()
     save(args.out, m)
 
+    # Graphics, beside the captions and read the same way. Absent is the
+    # normal case and must stay completely silent: with no overlays.json
+    # every filtergraph below is the one this file has always built.
+    overlays = _read_overlays(args.out)
+
     parts = os.path.join(args.out, "parts")
     os.makedirs(parts, exist_ok=True)
     pending = []
@@ -693,9 +858,10 @@ def stage_cut(args):
           % (len(pending), len(m["segments"]) - len(pending)))
     for s, dest in pending:
         src = os.path.join(m["src"], s["clip"])
-        fc, out_label = fit_filter(s, m["canvas"], s.get("crop"))
-        sh(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src,
-            "-filter_complex", fc, "-map", out_label, "-an",
+        fc, out_label, extra = fit_filter(s, m["canvas"], s.get("crop"),
+                                          overlays.get(s["index"]))
+        sh(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src] + extra +
+           ["-filter_complex", fc, "-map", out_label, "-an",
             "-c:v", "libx264", "-preset", PRESET, "-crf", CRF,
             "-profile:v", "high", "-pix_fmt", "yuv420p", dest])
         print("  p%02d  %-18s %.1f-%.1f  %s"
@@ -705,6 +871,118 @@ def stage_cut(args):
 
 
 # -------------------------------------------------------------------- join
+
+ROLLS = ("intro", "outro")
+
+
+def _roll_source(out_dir, which):
+    """An `intro.*` / `outro.*` in the build's assets folder, or None."""
+    assets = os.path.join(out_dir, "assets")
+    if not os.path.isdir(assets):
+        return None
+    for name in sorted(os.listdir(assets)):
+        stem, ext = os.path.splitext(name)
+        if stem.lower() == which and ext.lower() in (
+                ".mp4", ".mov", ".m4v", ".webm"):
+            return os.path.join(assets, name)
+    return None
+
+
+def _normalise_roll(src, dest, canvas, on_missing=print):
+    """Bring a pre- or post-roll onto the cut's own canvas and frame rate.
+
+    A roll that is 25fps, or a different aspect, or carries its own
+    audio cannot simply be concatenated: ffmpeg's concat demuxer needs
+    every input to agree, and a mismatch shows up as a stutter or a
+    silent failure rather than an error.
+
+    VIDEO ONLY, deliberately. The score is mixed across the whole cut in
+    `stage_mux`, so a roll's own soundtrack would fight it. Dropping it
+    here is a decision worth seeing rather than a surprise later.
+    """
+    cw, ch = canvas
+    if good_video(dest):
+        return dest
+    rc, out = sh(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src,
+                  "-vf", ("scale=%d:%d:force_original_aspect_ratio=decrease,"
+                          "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=%d"
+                          % (cw, ch, cw, ch, FPS)),
+                  "-an", "-c:v", "libx264", "-preset", PRESET, "-crf", CRF,
+                  "-profile:v", "high", "-pix_fmt", "yuv420p", dest])
+    if rc != 0 or not good_video(dest):
+        on_missing("WARNING: could not normalise %s (%s); continuing without "
+                   "it." % (os.path.basename(src), (out or "").strip()[-160:]))
+        return None
+    return dest
+
+
+def _duration_of(path):
+    rc, out = sh(["ffprobe", "-v", "error", "-show_entries",
+                  "format=duration", "-of", "csv=p=0", path])
+    try:
+        return round(float((out or "").strip()), 3)
+    except ValueError:
+        return 0.0
+
+
+def _attach_rolls(out_dir, m, joined, canvas):
+    """Concatenate an intro and/or outro around the finished body.
+
+    Runs AFTER the crossfade chain and leaves it untouched: the rolls are
+    butt-joined, not faded. An intro that dissolves into itself reads as
+    a mistake, and a logo that bleeds into the first shot is worse than
+    no logo at all.
+
+    Nothing happens when no roll is present, which is the normal case.
+
+    THE PART THAT IS EASY TO GET WRONG
+    ----------------------------------
+    `m["transitions"]` are the beat marks `stage_music` scores against.
+    Prepending an intro moves every cut later by exactly the intro's
+    length, so the marks are shifted by that amount. Leaving them alone
+    would key the whole score to moments that no longer exist.
+    """
+    found = [(w, _roll_source(out_dir, w)) for w in ROLLS]
+    found = [(w, src) for w, src in found if src]
+    if not found:
+        return
+
+    ready = []
+    for which, src in found:
+        dest = os.path.join(out_dir, "_%s_norm.mp4" % which)
+        got = _normalise_roll(src, dest, canvas)
+        if got:
+            ready.append((which, got))
+    if not ready:
+        return
+
+    intro = next((p for w, p in ready if w == "intro"), None)
+    outro = next((p for w, p in ready if w == "outro"), None)
+    order = ([intro] if intro else []) + [joined] + ([outro] if outro else [])
+
+    listing = os.path.join(out_dir, "_rolls.txt")
+    with open(listing, "w", encoding="utf-8") as fh:
+        for p in order:
+            fh.write("file '%s'\n" % p.replace("'", "'\\''"))
+    stitched = os.path.join(out_dir, "_withrolls.mp4")
+    rc, out = sh(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "concat",
+                  "-safe", "0", "-i", listing, "-c", "copy", stitched])
+    if rc != 0 or not good_video(stitched):
+        print("WARNING: could not attach intro/outro (%s); the cut is "
+              "unchanged." % (out or "").strip()[-160:])
+        return
+
+    lead = _duration_of(intro) if intro else 0.0
+    if lead:
+        m["transitions"] = [round(t + lead, 3) for t in m.get("transitions", [])]
+    m["total_duration"] = _duration_of(stitched)
+    m["rolls"] = {w: os.path.basename(p) for w, p in ready}
+    save(out_dir, m)
+    os.replace(stitched, joined)
+    print("Attached %s -> %.1fs%s"
+          % (" + ".join(w for w, _ in ready), m["total_duration"],
+             ("; transition marks shifted %.2fs" % lead) if lead else ""))
+
 
 def stage_join(args):
     m = load(args.out)
@@ -739,6 +1017,8 @@ def stage_join(args):
         sh(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", parts[0],
             "-c:v", "copy", joined])
         print("Wrote _joined.mp4  %.1fs" % total)
+        # a one-segment cut still gets its intro and outro
+        _attach_rolls(args.out, m, joined, canvas=m["canvas"])
         return
 
     inputs = []
@@ -758,6 +1038,7 @@ def stage_join(args):
         "-c:v", "libx264", "-preset", PRESET, "-crf", CRF,
         "-profile:v", "high", "-pix_fmt", "yuv420p", joined])
     print("Wrote _joined.mp4  %.1fs   transitions at %s" % (total, offsets))
+    _attach_rolls(args.out, m, joined, canvas=m["canvas"])
 
 
 # ------------------------------------------------------------------- music

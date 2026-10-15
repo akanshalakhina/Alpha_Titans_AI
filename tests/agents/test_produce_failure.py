@@ -161,7 +161,7 @@ def test_a_reply_cut_off_at_the_cap_says_so(monkeypatch):
     """
     monkeypatch.setattr(
         LT.LLMClient, "complete",
-        lambda self, p, m=1600, i=None, r=None: LT.LLMReply(
+        lambda self, p, m=1600, i=None, r=None, e=None: LT.LLMReply(
             text='{"title": "half a repl',
             tokens_in=500, tokens_out=700, stop_reason="length"))
     parsed, reply = LT.LLMClient().complete_json("x", max_tokens=700)
@@ -175,7 +175,7 @@ def test_a_reply_cut_off_at_the_cap_says_so(monkeypatch):
 def test_a_genuinely_malformed_reply_is_not_blamed_on_the_cap(monkeypatch):
     monkeypatch.setattr(
         LT.LLMClient, "complete",
-        lambda self, p, m=1600, i=None, r=None: LT.LLMReply(
+        lambda self, p, m=1600, i=None, r=None, e=None: LT.LLMReply(
             text="I would rather not answer in JSON.",
             tokens_in=10, tokens_out=9, stop_reason="stop"))
     parsed, reply = LT.LLMClient().complete_json("x", max_tokens=700)
@@ -200,7 +200,7 @@ def test_an_empty_truncated_reply_is_still_named_as_truncation(monkeypatch):
     """
     monkeypatch.setattr(
         LT.LLMClient, "complete",
-        lambda self, p, m=1600, i=None, r=None: LT.LLMReply(
+        lambda self, p, m=1600, i=None, r=None, e=None: LT.LLMReply(
             text="", tokens_in=100, tokens_out=700, stop_reason="length"))
     parsed, reply = LT.LLMClient().complete_json("x", max_tokens=700)
     assert parsed is None
@@ -212,7 +212,7 @@ def test_a_truncated_reply_that_still_parsed_is_not_an_error(monkeypatch):
     """Cut off after the JSON closed is a usable answer."""
     monkeypatch.setattr(
         LT.LLMClient, "complete",
-        lambda self, p, m=1600, i=None, r=None: LT.LLMReply(
+        lambda self, p, m=1600, i=None, r=None, e=None: LT.LLMReply(
             text='{"title": "fine"} and then it rambled',
             tokens_out=700, stop_reason="length"))
     parsed, reply = LT.LLMClient().complete_json("x", max_tokens=700)
@@ -516,7 +516,8 @@ def test_a_cut_off_reply_is_retried_with_a_bigger_budget(monkeypatch):
     rather than guessed per agent."""
     seen = []
 
-    def fake(self, prompt, max_tokens=1600, images=None, retries=None):
+    def fake(self, prompt, max_tokens=1600, images=None, retries=None,
+         effort=None):
         seen.append(max_tokens)
         if max_tokens < 2000:
             return LT.LLMReply(text="", tokens_out=max_tokens,
@@ -535,7 +536,8 @@ def test_it_widens_only_once(monkeypatch):
     """Doubling for ever would turn one bad reply into a runaway bill."""
     seen = []
 
-    def always_cut(self, prompt, max_tokens=1600, images=None, retries=None):
+    def always_cut(self, prompt, max_tokens=1600, images=None, retries=None,
+               effort=None):
         seen.append(max_tokens)
         return LT.LLMReply(text="", tokens_out=max_tokens,
                            stop_reason="length")
@@ -551,7 +553,8 @@ def test_a_reply_that_parsed_is_never_widened(monkeypatch):
     """Truncated AFTER the JSON closed is a usable answer - leave it."""
     seen = []
 
-    def fake(self, prompt, max_tokens=1600, images=None, retries=None):
+    def fake(self, prompt, max_tokens=1600, images=None, retries=None,
+         effort=None):
         seen.append(max_tokens)
         return LT.LLMReply(text='{"ok": true} then it rambled',
                            tokens_out=max_tokens, stop_reason="length")
@@ -565,7 +568,8 @@ def test_a_reply_that_parsed_is_never_widened(monkeypatch):
 def test_a_call_already_at_the_ceiling_is_not_widened(monkeypatch):
     seen = []
 
-    def fake(self, prompt, max_tokens=1600, images=None, retries=None):
+    def fake(self, prompt, max_tokens=1600, images=None, retries=None,
+         effort=None):
         seen.append(max_tokens)
         return LT.LLMReply(text="", tokens_out=max_tokens,
                            stop_reason="length")

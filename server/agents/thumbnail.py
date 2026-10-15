@@ -418,7 +418,7 @@ class ThumbnailAgent(Agent):
         span.tool("llm.complete_json", purpose="thumbnail",
                   candidates=len(basis["candidates"]),
                   prompt_chars=len(prompt))
-        raw, reply = ctx.llm.complete_json(prompt, max_tokens=900)
+        raw, reply = ctx.llm.complete_json(prompt, max_tokens=900, effort="low")
         cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
                     usd=reply.usd, wall_s=round(time.time() - started, 2))
         span.llm(reply.tokens_in, reply.tokens_out, reply.usd)

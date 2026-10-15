@@ -930,6 +930,10 @@ async def node_render(state: GraphState) -> dict:
     # no such artifact. Absent, the renderer takes its silent-mux path exactly
     # as it did before - present, the mood reaches generate_music.
     music_art = rt.store.get(job_id, "Music", Music)
+    # The visual directions, for the graphics they may carry. Optional for
+    # the same reason the score is: a job resumed from an older checkpoint,
+    # or one whose Animation node degraded, renders exactly as before.
+    animation_art = rt.store.get(job_id, "Animation", Animation)
 
     async def body(span):
         rev = rt.store.next_revision(job_id, "RenderResult")
@@ -940,6 +944,7 @@ async def node_render(state: GraphState) -> dict:
             plan=plan_art.payload, attempt=attempt, revision=rev,
             edit_plan_id=plan_art.artifact_id,
             music=music_art.payload if music_art else None,
+            animation=animation_art.payload if animation_art else None,
             stage_timeout_s=policy.timeout_s,
             label="render", timeout_s=policy.timeout_s)
         return await work
@@ -947,6 +952,8 @@ async def node_render(state: GraphState) -> dict:
     upstream = [plan_art.artifact_id]
     if music_art:
         upstream.append(music_art.artifact_id)
+    if animation_art:
+        upstream.append(animation_art.artifact_id)
     art = await _run_node_async("render", RenderingAgent.id, job_id, attempt,
                                 upstream, body)
     return {"render_id": art.artifact_id}

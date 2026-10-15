@@ -42,6 +42,8 @@ from .pipeline_bridge import SERVER_DIR  # noqa: F401  (ensures sys.path)
 
 import vision as _vision                 # existing module, unmodified
 
+from . import json_repair as _repair
+
 DEFAULT_MODEL = {"anthropic": "claude-sonnet-4-5", "openai": "gpt-4o"}
 DEFAULT_BASE = {"anthropic": "https://api.anthropic.com",
                 "openai": "https://api.openai.com"}
@@ -135,6 +137,54 @@ _MAX_RETRY_TOKENS = 4000
 # deadline is worse than falling back, because a killed node writes
 # nothing at all.
 _RETRY_BUDGET_S = 150.0
+
+
+# Which models take `reasoning_effort`, and are helped by it.
+#
+# Measured on one Title-shaped prompt, same key, same day:
+#
+#     openai/gpt-oss-20b   default 863 out  ->  low  82 out
+#     qwen/qwen3.8-27b     default  73 out  ->  low 562 out
+#     allam-2-7b           low -> HTTP 400, "not supported with this model"
+#
+# So this is NOT a flag to set globally. On gpt-oss it removes ninety per
+# cent of the output on a task that needs no deep thought; on qwen it
+# makes the reply eight times longer than leaving it alone; on allam it
+# fails the call outright. Only the family it was measured to help is
+# listed, and an unlisted model simply runs as before.
+_LOW_EFFORT_MODELS = ("openai/gpt-oss",)
+
+# Groq rejects anything else outright, so the vocabulary is closed here
+# rather than discovered at runtime.
+EFFORTS = ("low", "medium", "high")
+
+
+def _takes_effort(model_name: str) -> bool:
+    return any(model_name.startswith(p) for p in _LOW_EFFORT_MODELS)
+
+
+def _carry_cost(kept: LLMReply, discarded: LLMReply) -> None:
+    """Add a thrown-away attempt's tokens onto the reply that is kept.
+
+    Each `LLMReply` carries the usage of ITS OWN http call, and
+    `complete_json` returns only the last one - so a reply that was
+    truncated, discarded and asked again at a wider budget cost real
+    tokens that appeared in no trace and no total. The Title agent does
+    this on every run, and its 2,751 reported output tokens were missing
+    the 1,400 it had already spent being cut off.
+
+    Under-reporting spend is not a cosmetic fault here: the daily quota
+    is the binding constraint on how many videos a day can be made, and
+    a budget cannot be managed from figures that leave out the waste.
+    """
+    kept.tokens_in += discarded.tokens_in
+    kept.tokens_out += discarded.tokens_out
+    kept.usd += discarded.usd
+    spent = discarded.tokens_in + discarded.tokens_out
+    if spent:
+        kept.meta = {**(kept.meta or {}),
+                     "discarded_tokens": spent + (kept.meta or {})
+                     .get("discarded_tokens", 0)}
 
 
 def _retry_after(exc, attempt: int) -> float:
@@ -302,7 +352,8 @@ class LLMClient:
 
     def complete(self, prompt: str, max_tokens: int = 1600,
                  images: list[str] | None = None,
-                 retries: int | None = None) -> LLMReply:
+                 retries: int | None = None,
+                 effort: str | None = None) -> LLMReply:
         """One call. `images` are base64 JPEGs, for the vision path.
 
         The injected transport is given the images too, so a test can assert
@@ -342,7 +393,8 @@ class LLMClient:
             waited = 0.0
             for attempt in range(tries + 1):
                 try:
-                    reply = self._http(prompt, max_tokens, images, alt)
+                    reply = self._http(prompt, max_tokens, images, alt,
+                                       effort)
                     if spent:
                         # the trace must show that the answer came from a
                         # stand-in, not from the model that was configured
@@ -388,7 +440,8 @@ class LLMClient:
 
     def complete_json(self, prompt: str, max_tokens: int = 1600,
                       images: list[str] | None = None,
-                      retries: int | None = None) -> tuple[Any, LLMReply]:
+                      retries: int | None = None,
+                      effort: str | None = None) -> tuple[Any, LLMReply]:
         """Call, then pull a JSON value out of whatever came back.
 
         Reuses vision._json_from, which walks the reply for a balanced JSON
@@ -396,8 +449,12 @@ class LLMClient:
         Returns (parsed_or_None, reply) - a None here is a normal, expected
         outcome that the caller must handle by falling back.
         """
-        reply = self.complete(prompt, max_tokens, images, retries)
-        parsed = _vision._json_from(reply.text) if reply.text else None
+        reply = self.complete(prompt, max_tokens, images, retries, effort)
+        parsed, how = _repair.parse(reply.text)
+        if how not in ("clean", "empty"):
+            # worth seeing: a model that always needs its commas fixed is
+            # a prompt problem, and nobody notices a silent repair
+            reply.meta = {**(reply.meta or {}), "json_repair": how}
 
         # This check sits BEFORE the `ok` gate on purpose. A reasoning model
         # that runs out of budget mid-thought returns finish_reason "length"
@@ -420,15 +477,42 @@ class LLMClient:
         # going to be thrown away.
         if parsed is None and reply.truncated and max_tokens < _MAX_RETRY_TOKENS:
             wider = min(max_tokens * 2, _MAX_RETRY_TOKENS)
-            retried = self.complete(prompt, wider, images, retries)
-            if retried.text:
-                parsed = _vision._json_from(retried.text)
+            retried = self.complete(prompt, wider, images, retries, effort)
+            _carry_cost(retried, reply)
+            parsed, how = _repair.parse(retried.text)
+            if how not in ("clean", "empty"):
+                retried.meta = {**(retried.meta or {}), "json_repair": how}
             if parsed is not None:
                 retried.meta = {**(retried.meta or {}),
                                 "widened_from": max_tokens}
                 return parsed, retried
             reply = retried
             max_tokens = wider
+
+        # A reply that arrived WHOLE and still is not JSON is a formatting
+        # slip, not a budget problem, and the model can fix it if it is
+        # told what went wrong. Saying "that was not JSON" alone teaches
+        # nothing, so the complaint quotes what actually came back.
+        #
+        # Found when the daily quota pushed the chain onto a smaller
+        # model and Story reported "not a JSON object": a whole reasoned
+        # narrative thrown away over punctuation. One retry only - a model
+        # that cannot produce JSON twice will not produce it on the third
+        # try either, and the deterministic fallback is waiting.
+        if (parsed is None and reply.text and not reply.truncated
+                and not reply.error):
+            again = self.complete(
+                _repair.with_complaint(prompt, reply.text),
+                max_tokens, images, retries, effort)
+            _carry_cost(again, reply)
+            parsed, how = _repair.parse(again.text)
+            if parsed is not None:
+                again.meta = {**(again.meta or {}),
+                              "json_retry": True,
+                              **({"json_repair": how}
+                                 if how != "clean" else {})}
+                return parsed, again
+            reply = again
 
         if parsed is None and reply.truncated and not reply.error:
             reply.error = (f"the reply was cut off at the {max_tokens}-token "
@@ -441,7 +525,8 @@ class LLMClient:
 
     def _http(self, prompt: str, max_tokens: int,
               images: list[str] | None = None,
-              model_override: str | None = None) -> LLMReply:
+              model_override: str | None = None,
+              effort: str | None = None) -> LLMReply:
         key, prov = api_key(), provider()
         use_model, use_base = model_override or model(), base_url()
         # A call carrying images goes to the vision model when one is
@@ -488,6 +573,24 @@ class LLMClient:
                 content.append({"type": "text", "text": prompt})
             body = {"model": use_model, "max_tokens": max_tokens,
                     "messages": [{"role": "user", "content": content}]}
+            # Every caller of this client goes through `complete_json`, so
+            # every reply is meant to be JSON - say so, rather than asking
+            # in the prose and hoping. Checked against both models on this
+            # key: gpt-oss-20b and qwen3.8-27b each honour it.
+            #
+            # TEXT ONLY. The vision path goes to a different provider's
+            # OpenAI-compatible endpoint, which may not implement this at
+            # all; a 400 there would lose a clip's analysis to a flag that
+            # was only ever meant to tidy up formatting. Opt out with
+            # AT_LLM_JSON_MODE=0 if a future model rejects it.
+            if not images and _env("AT_LLM_JSON_MODE", "1") != "0":
+                body["response_format"] = {"type": "json_object"}
+            # Only where it was measured to help - see `_LOW_EFFORT_MODELS`.
+            # A model that is not on that list runs exactly as before,
+            # which matters because the fallback chain can put any of them
+            # behind any agent.
+            if effort in EFFORTS and _takes_effort(use_model):
+                body["reasoning_effort"] = effort
 
         req = urllib.request.Request(use_base + path,
                                      data=json.dumps(body).encode(),

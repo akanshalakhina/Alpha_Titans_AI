@@ -387,7 +387,7 @@ class CaptionAgent(Agent):
         span.tool("llm.complete_json", purpose="caption",
                   beats=len(b.candidates), max_chars=b.max_chars,
                   prompt_chars=len(prompt))
-        raw, reply = ctx.llm.complete_json(prompt, max_tokens=1400)
+        raw, reply = ctx.llm.complete_json(prompt, max_tokens=1400, effort="low")
         cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
                     usd=reply.usd, wall_s=round(time.time() - started, 2))
         span.llm(reply.tokens_in, reply.tokens_out, reply.usd)

@@ -62,7 +62,8 @@ class _Client(LT.LLMClient):
         self._transport = None          # the real __init__ is not run
         self._exc, self.calls, self.slept = exc, 0, []
 
-    def _http(self, prompt, max_tokens, images=None, model_override=None):
+    def _http(self, prompt, max_tokens, images=None, model_override=None,
+              effort=None):
         self.calls += 1
         raise self._exc
 
@@ -165,7 +166,8 @@ class _Chain(LT.LLMClient):
         self._transport = None
         self.out, self.tried = set(out_of_quota), []
 
-    def _http(self, prompt, max_tokens, images=None, model_override=None):
+    def _http(self, prompt, max_tokens, images=None, model_override=None,
+              effort=None):
         used = model_override or LT.model()
         self.tried.append(used)
         if used in self.out:

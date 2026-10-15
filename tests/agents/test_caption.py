@@ -155,7 +155,7 @@ def test_the_style_literal_is_the_renderers_only_style():
 def test_the_measured_placement_is_what_fit_filter_emits(canvas, orient):
     """Not a regex over the source: the filter the renderer actually builds."""
     e = _engine_caption()
-    body, label = build_video.fit_filter(seg_dict("hello"), canvas)
+    body, label, _ = build_video.fit_filter(seg_dict("hello"), canvas)
     assert label == "[vc]"
     assert body.count("drawtext") == 1, "one caption slot per segment"
     assert "x=(w-text_w)/2" in body
@@ -177,7 +177,7 @@ def test_there_is_no_second_position_or_style_in_the_renderer():
 
 
 def test_an_empty_caption_draws_nothing():
-    body, label = build_video.fit_filter(seg_dict(""), (1920, 1080))
+    body, label, _ = build_video.fit_filter(seg_dict(""), (1920, 1080))
     assert "drawtext" not in body and label == "[v]"
 
 
@@ -929,7 +929,7 @@ def test_the_caption_reaches_the_render_spec_and_the_drawtext(cap_ctx,
     assert any(r.caption for r in spec.segments)
     for p, r in zip(plan.segments, spec.segments):
         assert r.caption == p.caption
-        body, _ = build_video.fit_filter(
+        body, _label, _ins = build_video.fit_filter(
             {"start": r.start, "end": r.end, "orientation": r.orientation,
              "caption": r.caption}, spec.canvas)
         if r.caption:

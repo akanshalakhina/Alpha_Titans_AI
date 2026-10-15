@@ -52,15 +52,30 @@ expressed: the schema has no field for it.
 from __future__ import annotations
 
 import math
+import os
 import time
+import typing
 
 from .artifacts import (Animation, AnimationDirection, Artifact,
                         ClipAnalysisSet, ContentStrategy, Cost, Decision,
+                        OverlayAnchor, OverlayHold, OverlayPlacement,
                         Story, VisionAnalysis)
 from .base import Agent, AgentContext
+from .tools import asset_library as _AL
 from .trace import TraceSpan
 
-PROMPT_VERSION = "animation-prompt-v1"
+PROMPT_VERSION = "animation-prompt-v2"
+
+# Shown only when the job HAS graphics. With an empty folder the model is
+# never given the shape, so it has no way to express a placement and
+# cannot name a file that is not there.
+_OVERLAY_SHAPE = """,
+      "overlay": {"asset": "<one of the files listed above>",
+                  "anchor": "top-left|top-center|top-right|middle-left|\
+center|middle-right|bottom-left|bottom-center|bottom-right",
+                  "scale_pct": <2-60>, "hold": "full|open|close"}"""
+OVERLAY_ANCHORS = typing.get_args(OverlayAnchor)
+OVERLAY_HOLDS = typing.get_args(OverlayHold)
 MAX_DIRECTIONS = 12
 MAX_LIST = 8
 
@@ -103,8 +118,7 @@ RULES - these are checked after you reply, not taken on trust
 - Do NOT give timings, durations, positions, sizes, colours, filters, file
   paths or render settings. There is no field for them and a reply containing
   `start`, `end`, `duration`, `zoom`, `filter` or `path` is rejected outright.
-- Do NOT name an overlay, a graphic, a template or a font. There is no asset
-  library in this project and you cannot refer to one.
+{assets}
 
 Reply with ONLY a JSON object, no prose around it:
 
@@ -115,7 +129,7 @@ Reply with ONLY a JSON object, no prose around it:
     {{"beat_index": <index from the list above>,
       "emphasis": "{emphases_pipe}",
       "caption_intent": "{captions_pipe}",
-      "intent": "<why this beat is presented that way>"}}
+      "intent": "<why this beat is presented that way>"{overlay_shape}}}
   ],
   "unsupported_requests": ["<anything you wanted that this renderer cannot do>"],
   "risks": ["<what could make this look wrong>"],
@@ -230,11 +244,24 @@ class AnimationAgent(Agent):
                 revision, started, inputs_hash, st_ok, cs_ok, v_ok, caps,
                 why=(ldesc.get("why_disabled") or "no model configured"))
 
-        prompt = self._build_prompt(story, strategy, vision, caps)
+        # The graphics this job can actually use, written from its own
+        # assets folder. Defaults are generated once so a fresh install
+        # can use overlays without the operator going to find artwork;
+        # a file the operator put there themselves is never replaced.
+        made = _AL.ensure_defaults(ctx.job.build_dir)
+        assets = _AL.available(ctx.job.build_dir)
+        if made:
+            span.tool("assets.generate_defaults", created=len(made))
+        span.tool("assets.offer", available=len(assets))
+
+        prompt = self._build_prompt(
+            story, strategy, vision, caps,
+            assets=_AL.describe(ctx.job.build_dir),
+            overlay_shape=_OVERLAY_SHAPE if assets else "")
         span.tool("llm.complete_json", purpose="animation",
                   beats=len(story.beats) if st_ok else 0,
                   capabilities=len(caps), prompt_chars=len(prompt))
-        raw, reply = ctx.llm.complete_json(prompt, max_tokens=1600)
+        raw, reply = ctx.llm.complete_json(prompt, max_tokens=1600, effort="low")
         cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
                     usd=reply.usd, wall_s=round(time.time() - started, 2))
         span.llm(reply.tokens_in, reply.tokens_out, reply.usd)
@@ -248,7 +275,8 @@ class AnimationAgent(Agent):
                 why="the model reply was unusable", cost=cost)
 
         payload, notes = self._validate(raw, domain, clip_set, story,
-                                        st_ok, cs_ok, v_ok, caps, ldesc)
+                                        st_ok, cs_ok, v_ok, caps, ldesc,
+                                        assets)
         for note in notes:
             span.note(note)
 
@@ -269,8 +297,11 @@ class AnimationAgent(Agent):
     def _build_prompt(self, story: Story | None,
                       strategy: ContentStrategy | None,
                       vision: VisionAnalysis | None,
-                      caps: list[str]) -> str:
+                      caps: list[str],
+                      assets: str = "", overlay_shape: str = "") -> str:
         return PROMPT.format(
+            assets=assets or _AL.describe(None),
+            overlay_shape=overlay_shape,
             story=self._story_section(story),
             strategy=self._strategy_section(strategy),
             vision=self._vision_section(vision),
@@ -280,6 +311,39 @@ class AnimationAgent(Agent):
             emphases_pipe="|".join(EMPHASES),
             captions=", ".join(CAPTION_INTENTS),
             captions_pipe="|".join(CAPTION_INTENTS))
+
+    @staticmethod
+    def _overlay_for(item: dict, allowed: set, dropped: list):
+        """The graphic this direction asks for, if it exists.
+
+        A name that is not in the folder is DROPPED and recorded, never
+        passed on. A model asked for `lower_third_blue.png` would
+        otherwise produce an artifact that reads as a placement and a
+        video with nothing on it - the gap between the two being exactly
+        the kind of quiet lie this project is built to avoid.
+        """
+        raw = item.get("overlay")
+        if not isinstance(raw, dict):
+            return None
+        name = os.path.basename(str(raw.get("asset") or "").strip())
+        if not name:
+            return None
+        if name not in allowed:
+            dropped.append(name)
+            return None
+        try:
+            return OverlayPlacement(
+                asset=name,
+                anchor=_one_of(raw.get("anchor"), OVERLAY_ANCHORS,
+                               "top-right"),
+                scale_pct=float(raw.get("scale_pct") or 18.0),
+                hold=_one_of(raw.get("hold"), OVERLAY_HOLDS, "full"),
+                why=_text(raw.get("why"), 160))
+        except (TypeError, ValueError):
+            # an out-of-range scale, say: the direction survives, the
+            # graphic does not
+            dropped.append(name)
+            return None
 
     @staticmethod
     def _story_section(story: Story | None) -> str:
@@ -337,12 +401,13 @@ class AnimationAgent(Agent):
     def _validate(self, raw: dict, domain: str,
                   clip_set: ClipAnalysisSet | None, story: Story | None,
                   st_ok: bool, cs_ok: bool, v_ok: bool,
-                  caps: list[str], ldesc: dict
+                  caps: list[str], ldesc: dict,
+                  assets: list[str] | None = None
                   ) -> tuple[Animation, list[str]]:
         """Everything the model returned is untrusted input."""
         beats = {b.index: b for b in story.beats} if st_ok and story else {}
         directions, notes = self._directions(raw.get("directions"), beats,
-                                             clip_set)
+                                             clip_set, assets)
 
         # anything asking for movement is a gap, not a direction
         unsupported = _texts(raw.get("unsupported_requests"), each=160)
@@ -401,11 +466,20 @@ class AnimationAgent(Agent):
         return payload, notes
 
     def _directions(self, raw, beats: dict,
-                    clip_set: ClipAnalysisSet | None
+                    clip_set: ClipAnalysisSet | None,
+                    assets: list[str] | None = None
                     ) -> tuple[list[AnimationDirection], list[str]]:
-        """Build the per-beat directions, deriving everything derivable."""
+        """Build the per-beat directions, deriving everything derivable.
+
+        `assets` is the allowlist of graphics this job actually has. A
+        name outside it is dropped and reported: an artifact that reads
+        as a placement over a video with nothing on it is the quiet kind
+        of wrong this project exists to avoid.
+        """
         kept: list[AnimationDirection] = []
         seen: set[int] = set()
+        allowed = set(assets or ())
+        dropped: list[str] = []
         bad_beat = dupe = 0
         if not isinstance(raw, list):
             return [], []
@@ -434,6 +508,7 @@ class AnimationAgent(Agent):
                 caption_intent=_one_of(item.get("caption_intent"),
                                        CAPTION_INTENTS, "none"),
                 intent=intent,
+                overlay=self._overlay_for(item, allowed, dropped),
                 # an intent asking for movement cannot be honoured
                 supported=not _has_motion(intent)))
 
@@ -445,6 +520,10 @@ class AnimationAgent(Agent):
         if bad_beat:
             notes.append(f"{bad_beat} direction(s) referenced a beat that "
                          f"does not exist and were dropped")
+        if dropped:
+            notes.append(f"{len(dropped)} overlay(s) named a graphic this "
+                         f"job does not have and were dropped: "
+                         f"{', '.join(sorted(set(dropped))[:4])}")
         if dupe:
             notes.append(f"{dupe} duplicate direction(s) for a beat already "
                          f"covered were dropped")

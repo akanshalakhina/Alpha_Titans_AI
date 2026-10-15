@@ -286,6 +286,28 @@ def clear_published_video(job_id: str):
     return {"job_id": job_id, "cleared": AS.clear_reference(build)}
 
 
+@router.post("/jobs/{job_id}/learning/approve")
+def approve_learning(job_id: str):
+    """Grant the one gate that no amount of data opens.
+
+    Six of the seven gates are arithmetic over stored reports and open
+    themselves when the evidence is there. This one does not, and must
+    not: it is the step at which a person looks at a measured difference
+    and decides whether to act on it. A system that approved its own
+    conclusions would have six checks and no judgement.
+
+    The approval is for THIS job's report. It does not apply anywhere
+    else and it is not remembered across a restart, because an approval
+    that outlives the evidence it was given for is not an approval.
+    """
+    _require_agent_job(job_id)
+    from .learning import approve as _approve
+    fresh = _approve(job_id)
+    return {"job_id": job_id, "approved": True, "already": not fresh,
+            "note": ("the Learning report is rebuilt on the next run of "
+                     "that node; approval alone changes nothing on disk")}
+
+
 @router.post("/jobs/{job_id}/cancel")
 def cancel_agent_job(job_id: str):
     """Cancel an agent job, killing its ffmpeg process tree.

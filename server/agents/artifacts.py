@@ -1059,6 +1059,41 @@ CaptionIntent = Literal["none", "short_label", "key_phrase"]
 AnimationType = Literal["reasoned", "degraded", "minimal"]
 
 
+# Where a graphic sits and how long it holds, in WORDS. Both vocabularies
+# are the renderer's own - `build_video.ANCHORS` and `build_video.HOLDS` -
+# and a parity test fails if they ever drift apart. Expressing position as
+# a word rather than a coordinate is what keeps the model out of the
+# geometry: `top-right` becomes `x=W-w-77:y=77` in deterministic code that
+# knows the canvas, and `full` becomes `between(t,0.15,5.85)` in code that
+# knows the segment's measured duration.
+OverlayAnchor = Literal["top-left", "top-center", "top-right",
+                        "middle-left", "center", "middle-right",
+                        "bottom-left", "bottom-center", "bottom-right"]
+OverlayHold = Literal["full", "open", "close"]
+
+
+class OverlayPlacement(BaseModel):
+    """A graphic laid over one beat, named semantically.
+
+    `extra="forbid"` is the guard and it is structural: a reply carrying
+    `x`, `y`, `start`, `end`, `t`, `px` or `filter` fails validation. The
+    model has no vocabulary for a pixel or a second, so it cannot put a
+    sticker three seconds into a two-second shot.
+
+    `asset` is a bare filename, and the renderer takes only its basename
+    from the job's own `assets/` folder - so a name cannot reach outside
+    the build, and an asset that is not there is skipped with a warning
+    rather than failing the render.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    asset: str                          # a file in this job's assets/
+    anchor: OverlayAnchor = "top-right"
+    scale_pct: float = Field(default=18.0, ge=2.0, le=60.0)
+    hold: OverlayHold = "full"
+    why: str = ""
+
+
 class AnimationDirection(BaseModel):
     """How ONE story beat should be presented on the canvas.
 
@@ -1087,6 +1122,10 @@ class AnimationDirection(BaseModel):
     caption_intent: CaptionIntent = "none"
     intent: str = ""                    # why, in words
     supported: bool = True              # can the engine do this today?
+    # A graphic over this beat, when the job has assets to choose from.
+    # None is the normal case and the one every build took until an
+    # operator could put files in the job's assets/ folder.
+    overlay: OverlayPlacement | None = None
 
 
 class Animation(BaseModel):
@@ -1572,6 +1611,10 @@ class SegmentRenderSpec(BaseModel):
     caption: str
     orientation: Literal["vertical", "horizontal"]
     cache_key: str
+    # Graphics over this segment, already resolved from beats. Empty is
+    # the normal case; the renderer then builds exactly the filtergraph
+    # it always has.
+    overlays: list[OverlayPlacement] = Field(default_factory=list)
 
 
 # The renderer's own audio vocabulary, read from the modules that
@@ -2347,7 +2390,9 @@ class PerformanceAnalysis(BaseModel):
 # its threshold, where that threshold comes from, and what was observed -
 # and what each input was, so a pre-publication signal can never be taken
 # for an outcome.
-LearningStatus = Literal["insufficient_data"]
+# "learned" exists only now that a finding can: see the Learning
+# validator, which refuses the word unless every gate passed.
+LearningStatus = Literal["insufficient_data", "learned"]
 LearningGateName = Literal[
     "sufficient_history", "valid_nonzero_data", "cohort_size", "time_window",
     "holdout_validation", "practical_effect", "human_approval"]
@@ -2360,6 +2405,47 @@ LearningInputRole = Literal["outcome", "decision", "pre_publication"]
 _OUTCOME_KINDS = ("PerformanceAnalysis",)
 _DECISION_KINDS = ("ContentStrategy", "Story", "EditPlan", "Transition",
                    "Caption", "Music", "Animation", "Voiceover")
+
+
+# The creative choice a comparison is made ACROSS. Closed, because a
+# cohort can only be formed on something every sample records: `pacing`
+# is on every ContentStrategy, so two groups can be built from it
+# without asking anyone to label anything.
+CohortDimension = Literal["pacing"]
+
+
+class CohortArm(BaseModel):
+    """One side of a comparison: a group of videos and what they did."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    value: str                          # e.g. "fast"
+    videos: int = Field(ge=0)
+    mean_views: float = 0.0
+    mean_watch_minutes: float = 0.0
+    job_ids: list[str] = Field(default_factory=list)
+
+
+class CohortFinding(BaseModel):
+    """A measured difference between two arms, and whether it held.
+
+    Every number here is arithmetic over stored reports - no model sees
+    this and nothing is estimated. `lift` is the treatment mean over the
+    control mean, so 1.0 is no difference and 2.5 is two and a half
+    times. `holdout_lift` is the same ratio recomputed on videos held
+    out of the comparison: a pattern that does not survive that is a
+    pattern in the noise, and `holdout_agrees` is False.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    dimension: CohortDimension
+    metric: PerformanceMetric = "views"
+    treatment: CohortArm
+    control: CohortArm
+    lift: float = 1.0
+    effect: float = 0.0                 # |lift - 1|, against MIN_EFFECT
+    holdout_videos: int = 0
+    holdout_lift: float | None = None   # None = nothing held out to check
+    holdout_agrees: bool = False
 
 
 class LearningGate(BaseModel):
@@ -2439,8 +2525,15 @@ class Learning(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     status: LearningStatus = "insufficient_data"
-    learned: Literal[False] = False
-    configuration_changed: Literal[False] = False
+    # No longer `Literal[False]`. A finding CAN exist now - but only
+    # when all six measurable gates pass AND a person has approved it,
+    # which is checked by a validator below rather than by convention.
+    learned: bool = False
+    # Still nothing writes configuration automatically. A proposal is a
+    # proposal; applying one is a separate, deliberate act.
+    configuration_changed: bool = False
+    finding: CohortFinding | None = None
+    approved_by: str = ""               # who, or "" for nobody
     performance_status: PerformanceStatus | None = None
 
     history: LearningHistory
@@ -2452,21 +2545,73 @@ class Learning(BaseModel):
     limitations: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
+    def _nothing_applies_itself(self):
+        """`configuration_changed` is a bool that cannot yet be True.
+
+        The field is typed `bool` rather than `Literal[False]` because a
+        day may come when an approved proposal is applied, and the
+        schema should not have to change for it. That day is not today:
+        no code anywhere writes configuration, so a True here could only
+        be a mistake or a claim. Refusing it in a validator - where the
+        reason can be written down - beats a type that silently makes
+        the question unaskable.
+        """
+        if self.configuration_changed:
+            raise ValueError("nothing applies a proposal, so no "
+                             "configuration has changed")
+        return self
+
+    @model_validator(mode="after")
     def _the_gate_holds(self):
         names = [g.gate for g in self.gates]
         if names != list(get_args(LearningGateName)):
             raise ValueError("every gate is reported exactly once, in order")
-        if all(g.state == "passed" for g in self.gates):
-            raise ValueError("insufficient data means a gate did not pass")
-        open_ = False
-        for g in self.gates:
-            if open_ and g.state == "passed":
-                raise ValueError(f"{g.gate} cannot pass after an earlier gate "
-                                 f"did not")
-            open_ = open_ or g.state != "passed"
-        if next(g for g in self.gates
-                if g.gate == "human_approval").state == "passed":
-            raise ValueError("there is no proposal, so nothing was approved")
+        every = {g.gate: g.state for g in self.gates}
+        if all(st == "passed" for st in every.values()):
+            # every gate passed: this is the one shape in which something
+            # may be claimed, and then it MUST be
+            if self.status != "learned" or not self.learned:
+                raise ValueError("every gate passed; say so")
+            if self.finding is None:
+                raise ValueError("a learned report must carry its finding")
+            if not self.approved_by:
+                raise ValueError("a learned report names who approved it")
+        else:
+            if self.learned:
+                still_open = [g for g, st in every.items()
+                              if st != "passed"]
+                raise ValueError("learned=True needs every gate, including "
+                                 "human_approval; open: %s" % still_open)
+            if self.status == "learned":
+                raise ValueError("status 'learned' needs every gate")
+        # The gates are two kinds of thing, and conflating them was wrong.
+        #
+        # The first four each measure something about the store, and each
+        # is true or false on its own: three published videos really do
+        # carry measured, non-zero figures even though three is not
+        # thirty. A strict "nothing may pass after something didn't"
+        # order made that impossible to state, which only looked right
+        # while nothing could pass at all.
+        #
+        # What the order was protecting is real, though, and is kept
+        # exactly: no JUDGEMENT may be claimed on evidence that has not
+        # cleared every data gate first.
+        data = ("sufficient_history", "valid_nonzero_data", "cohort_size",
+                "time_window")
+        judgement = ("holdout_validation", "practical_effect",
+                     "human_approval")
+        evidence_ok = all(every[g] == "passed" for g in data)
+        if not evidence_ok:
+            claimed = [g for g in judgement if every[g] == "passed"]
+            if claimed:
+                raise ValueError(
+                    "%s cannot pass while the evidence has not: %s"
+                    % (claimed, [g for g in data if every[g] != "passed"]))
+        if every["human_approval"] == "passed" and not self.approved_by:
+            raise ValueError("approval is never assumed; name the approver")
+        if self.finding is not None and every["practical_effect"] != "passed":
+            raise ValueError("a finding is only carried once its effect "
+                             "cleared the threshold")
         if self.history.usable_samples > self.history.performance_reports:
             raise ValueError("a usable sample is a performance report")
         return self

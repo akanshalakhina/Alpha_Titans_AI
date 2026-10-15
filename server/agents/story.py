@@ -206,7 +206,7 @@ class StoryAgent(Agent):
         span.tool("llm.complete_json", purpose="story",
                   strategy=s_ok, vision=v_ok, research=r_ok,
                   prompt_chars=len(prompt))
-        raw, reply = ctx.llm.complete_json(prompt, max_tokens=2000)
+        raw, reply = ctx.llm.complete_json(prompt, max_tokens=3000)
         cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
                     usd=reply.usd, wall_s=round(time.time() - started, 2))
         span.llm(reply.tokens_in, reply.tokens_out, reply.usd)

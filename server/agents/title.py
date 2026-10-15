@@ -347,7 +347,7 @@ class TitleAgent(Agent):
         # returned an empty `content`, so it fell back to a deterministic
         # title every single time. 1400 matches Caption and Transition, the
         # two agents with comparably sized replies.
-        raw, reply = ctx.llm.complete_json(prompt, max_tokens=1400)
+        raw, reply = ctx.llm.complete_json(prompt, max_tokens=2800, effort="low")
         cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
                     usd=reply.usd, wall_s=round(time.time() - started, 2))
         span.llm(reply.tokens_in, reply.tokens_out, reply.usd)

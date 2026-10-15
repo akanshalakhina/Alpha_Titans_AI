@@ -23,7 +23,7 @@ import shutil
 import time
 from pathlib import Path
 
-from .artifacts import (Artifact, Cost, Decision, EditPlan, Music,
+from .artifacts import (Animation, Artifact, Cost, Decision, EditPlan, Music,
                         RenderResult, RenderSpec, RenderTechnical,
                         SegmentRenderInfo)
 from .base import Agent, AgentContext
@@ -61,6 +61,7 @@ class RenderingAgent(Agent):
                 attempt: int, revision: int = 0,
                 edit_plan_id: str = "",
                 music: Music | None = None,
+                animation: Animation | None = None,
                 stage_timeout_s: float | None = None
                 ) -> Artifact[RenderResult]:
         started = time.time()
@@ -73,7 +74,10 @@ class RenderingAgent(Agent):
             framing=job.settings.framing,
             # the operator asking for no music beats any mood the agent chose
             title=job.settings.title,
-            music=None if job.settings.music == "none" else music)
+            music=None if job.settings.music == "none" else music,
+            # the graphics the Animation agent chose, if the job has any
+            # assets for it to have chosen from
+            animation=animation)
         inputs_hash = self.hash_inputs(spec.model_dump(mode="json"))
 
         # ---- projection: typed plan -> the interface ffmpeg reads ---------

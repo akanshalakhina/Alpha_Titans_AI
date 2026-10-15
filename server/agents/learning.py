@@ -51,7 +51,8 @@ from __future__ import annotations
 import inspect
 import time
 
-from .artifacts import (Artifact, ConfigTarget, ContentStrategy, Cost,
+from .artifacts import (CohortArm, CohortFinding, ContentStrategy,
+                        Artifact, ConfigTarget, ContentStrategy, Cost,
                         CriticResult, Decision, EditPlan, JobSettings,
                         Learning, LearningGate, LearningHistory,
                         LearningInput, PerformanceAnalysis, Publishing)
@@ -128,6 +129,184 @@ def _history(store, job_id: str) -> LearningHistory:
         usable_samples=usable, samples_needed=max(0, MIN_HISTORY - usable))
 
 
+# --------------------------------------------------------- the comparison
+
+class _Sample:
+    """One published video: what was decided, and what happened.
+
+    The two halves live in different artifacts of the same job, which is
+    the only thing that joins them. `PerformanceAnalysis` records the
+    outcome and knows nothing about the edit; `ContentStrategy` records
+    the pacing and knows nothing about the result. A sample exists only
+    where both are present for one `job_id`.
+    """
+
+    __slots__ = ("job_id", "pacing", "views", "watch", "window", "at")
+
+    def __init__(self, job_id, pacing, views, watch, window, at):
+        self.job_id, self.pacing = job_id, pacing
+        self.views, self.watch = views, watch
+        self.window, self.at = window, at
+
+
+def _metric(payload, name: str) -> float:
+    for m in payload.measured:
+        if m.metric == name:
+            return float(m.value)
+    return 0.0
+
+
+def _samples(store, job_id: str) -> list[_Sample]:
+    """Every job that has BOTH a measured outcome and a recorded pacing.
+
+    A job missing either is not a sample. That is stricter than counting
+    performance reports, and deliberately so: a video whose pacing is
+    unknown cannot be put on either side of a comparison about pacing,
+    and guessing which side would be inventing the finding.
+    """
+    out = []
+    for jid in sorted(set(store.jobs()) | {job_id}):
+        try:
+            perf = store.get(jid, "PerformanceAnalysis", PerformanceAnalysis)
+            strat = store.get(jid, "ContentStrategy", ContentStrategy)
+        except Exception:                             # noqa: BLE001
+            continue
+        if perf is None or strat is None:
+            continue
+        p = perf.payload
+        if p.status != "measured" or not any(m.value > 0 for m in p.measured):
+            continue
+        pacing = (strat.payload.pacing or "").strip()
+        if not pacing:
+            continue
+        out.append(_Sample(jid, pacing, _metric(p, "views"),
+                           _metric(p, "watch_time"), p.window_days,
+                           perf.produced_at))
+    out.sort(key=lambda s: s.at)
+    return out
+
+
+def _arm(value: str, rows: list[_Sample]) -> CohortArm:
+    n = len(rows) or 1
+    return CohortArm(
+        value=value, videos=len(rows),
+        mean_views=round(sum(r.views for r in rows) / n, 2),
+        mean_watch_minutes=round(sum(r.watch for r in rows) / n, 2),
+        job_ids=sorted(r.job_id for r in rows)[:MIN_COHORT])
+
+
+def _group(rows: list[_Sample]) -> dict:
+    out: dict = {}
+    for r in rows:
+        out.setdefault(r.pacing, []).append(r)
+    return out
+
+
+def compare(samples: list[_Sample]) -> CohortFinding | None:
+    """Split the samples on pacing and measure the difference.
+
+    Arithmetic only - no model sees any of this. The most recent
+    `HOLDOUT_VIDEOS` are set aside BEFORE the comparison is made, so the
+    check is on data the comparison never saw. A pattern that does not
+    reappear there is a pattern in the noise, and `holdout_agrees` says
+    so rather than quietly rounding in its favour.
+
+    Returns None when there is nothing to compare: fewer than two
+    pacings, or either side short of a full cohort. None is the honest
+    answer, not a weak finding.
+    """
+    if len(samples) <= HOLDOUT_VIDEOS:
+        return None
+    held, pool = samples[-HOLDOUT_VIDEOS:], samples[:-HOLDOUT_VIDEOS]
+
+    groups = _group(pool)
+    if len(groups) < MIN_COHORTS:
+        return None
+    # the two biggest arms; treatment is whichever did better, so `lift`
+    # is always >= 1 and the winner is named rather than implied
+    pair = sorted(groups.items(), key=lambda kv: -len(kv[1]))[:MIN_COHORTS]
+    arms = sorted((_arm(v, rows) for v, rows in pair),
+                  key=lambda a: -a.mean_views)
+    treatment, control = arms[0], arms[1]
+    if control.mean_views <= 0:
+        return None
+
+    lift = round(treatment.mean_views / control.mean_views, 4)
+    hg = _group(held)
+    hl = None
+    t_rows, c_rows = hg.get(treatment.value), hg.get(control.value)
+    if t_rows and c_rows:
+        t_mean = sum(r.views for r in t_rows) / len(t_rows)
+        c_mean = sum(r.views for r in c_rows) / len(c_rows)
+        if c_mean > 0:
+            hl = round(t_mean / c_mean, 4)
+    # agreement means the held-out videos lean the SAME WAY, not that the
+    # numbers match: a smaller effect out of sample is normal, a reversed
+    # one is the finding failing
+    agrees = bool(hl is not None and (hl - 1.0) * (lift - 1.0) > 0)
+
+    return CohortFinding(
+        dimension="pacing", metric="views",
+        treatment=treatment, control=control,
+        lift=lift, effect=round(abs(lift - 1.0), 4),
+        holdout_videos=len(held), holdout_lift=hl, holdout_agrees=agrees)
+
+
+def latest_validated(store) -> "Learning | None":
+    """The most recent report whose finding cleared every gate.
+
+    This is how a conclusion reaches the NEXT job. Learning runs last,
+    after the video it analysed is finished, so it can never change that
+    video - it can only tell the one after it what was measured.
+
+    Only `learned=True` is returned, which by the artifact's own
+    validator means six measurable gates passed AND a person approved
+    it. An unapproved finding is still just a number somebody has not
+    looked at yet.
+    """
+    best = None
+    try:
+        jobs = store.jobs()
+    except Exception:                                 # noqa: BLE001
+        return None
+    for jid in jobs:
+        try:
+            art = store.get(jid, "Learning", Learning)
+        except Exception:                             # noqa: BLE001
+            continue
+        if art is None or not art.payload.learned or not art.payload.finding:
+            continue
+        if best is None or art.produced_at > best.produced_at:
+            best = art
+    return best.payload if best else None
+
+
+def as_guidance(report: "Learning | None") -> str:
+    """The learned finding as a line for a prompt, or "" for nothing.
+
+    Written as EVIDENCE, not an instruction. The agent is told what was
+    measured over how many videos and left to decide whether this video
+    is the kind that applies - a past average is not an order, and a
+    strategist that cannot disagree with one is not reasoning.
+    """
+    if report is None or not report.learned or report.finding is None:
+        return ""
+    f = report.finding
+    n = f.treatment.videos + f.control.videos
+    return (
+        "MEASURED ON PAST VIDEOS\n"
+        "  Across %d published videos of this channel, a %s %s averaged "
+        "%gx the %s\n  of a %s one (%g against %g). The pattern held on "
+        "%d videos kept out of\n  that comparison, and it was approved "
+        "by %s.\n"
+        "  This is evidence about past videos, not an instruction about "
+        "this one. Use it\n  where it fits the footage you have been "
+        "given, and say so in `limitations`\n  when it does not.\n"
+        % (n, f.treatment.value, f.dimension, f.lift, f.metric,
+           f.control.value, f.treatment.mean_views, f.control.mean_views,
+           f.holdout_videos, report.approved_by))
+
+
 def _fmt(v) -> str:
     if v is None:
         return "unset"
@@ -160,7 +339,41 @@ def _configurable() -> list[ConfigTarget]:
     return out
 
 
-def _gates(h: LearningHistory) -> list[LearningGate]:
+def _approval(job_id: str) -> tuple[bool, str]:
+    """Whether a person has approved a finding for this job, and who.
+
+    Never inferred and never defaulted. `AT_LEARNING_AUTO_APPROVE` exists
+    so the path can be exercised in development, and it records
+    `auto_dev_override` as the approver precisely so it can never be
+    mistaken for a review that happened: a reader of the artifact sees
+    the word, not a human's name.
+    """
+    import os
+    if _approved_here(job_id):
+        return True, "operator"
+    if os.environ.get("AT_LEARNING_AUTO_APPROVE") == "1":
+        return True, "auto_dev_override"
+    return False, ""
+
+
+_APPROVALS: set = set()
+
+
+def approve(job_id: str) -> bool:
+    """Record an operator's approval. Returns False if already given."""
+    if job_id in _APPROVALS:
+        return False
+    _APPROVALS.add(job_id)
+    return True
+
+
+def _approved_here(job_id: str) -> bool:
+    return job_id in _APPROVALS
+
+
+def _gates(h: LearningHistory,
+           finding: "CohortFinding | None" = None,
+           approved: bool = False, approver: str = "") -> list[LearningGate]:
     """The architecture's gate, against what the store actually holds.
 
     Each data gate either FAILS on a count that is measurably short, or is
@@ -168,7 +381,15 @@ def _gates(h: LearningHistory) -> list[LearningGate]:
     u = h.usable_samples
 
     def short(ok: bool) -> str:
-        return "not_evaluated" if ok else "failed"
+        """A data gate's state.
+
+        It used to answer "not_evaluated" for a satisfied gate, because
+        nothing downstream could evaluate anything and calling it passed
+        would have implied a conclusion that could not exist. A cohort
+        comparison runs now, so a satisfied data gate really has passed
+        and says so.
+        """
+        return "passed" if ok else "failed"
 
     if u:
         none_measured = (f"{u} report(s) carry a measured, non-zero figure; "
@@ -196,10 +417,27 @@ def _gates(h: LearningHistory) -> list[LearningGate]:
                       "- never estimated, never taken before publication"),
             observed=none_measured, threshold_from="architecture"),
         LearningGate(
-            gate="cohort_size", state=short(u >= MIN_COHORT * MIN_COHORTS),
+            gate="cohort_size",
+            state=("failed" if finding is None
+                   or min(finding.treatment.videos,
+                          finding.control.videos) < MIN_COHORT
+                   else "passed"),
             required=(f"at least {MIN_COHORT} videos in each of the "
                       f"{MIN_COHORTS} cohorts compared"),
-            observed=f"{u} usable sample(s) - no cohort can be formed",
+            # Reachable for the first time now that samples can exist.
+            # "no cohort can be formed" was true of zero samples and is a
+            # lie about thirty: enough of them is not the same as having
+            # SPLIT them, and nothing in this project splits them yet.
+            observed=(
+                "%s: %d video(s) against %s: %d"
+                % (finding.treatment.value, finding.treatment.videos,
+                   finding.control.value, finding.control.videos)
+                if finding is not None else
+                f"{u} usable sample(s) - enough for {u // MIN_COHORT} "
+                f"cohort(s) of {MIN_COHORT}, but none could be formed: a "
+                f"sample needs a pacing recorded beside its outcome"
+                if u >= MIN_COHORT else
+                f"{u} usable sample(s) - no cohort can be formed"),
             threshold_from="architecture"),
         LearningGate(
             gate="time_window",
@@ -219,25 +457,52 @@ def _gates(h: LearningHistory) -> list[LearningGate]:
                          "no span can be read from it")),
             threshold_from="architecture"),
         LearningGate(
-            gate="holdout_validation", state="not_evaluated",
+            gate="holdout_validation",
+            state=("not_evaluated" if finding is None
+                   else "passed" if finding.holdout_agrees else "failed"),
             required=(f"a pattern found on the older videos must also hold "
                       f"on the {HOLDOUT_VIDEOS} most recent, held out"),
-            observed="no pattern exists to validate, and none is invented "
-                     "to test",
+            observed=("no pattern exists to validate, and none is invented "
+                      "to test" if finding is None else
+                      "held-out lift %s against %s in the comparison - %s"
+                      % (_fmt(finding.holdout_lift), _fmt(finding.lift),
+                         "same direction" if finding.holdout_agrees
+                         else "it does not hold")),
             threshold_from="policy"),
         LearningGate(
-            gate="practical_effect", state="not_evaluated",
+            gate="practical_effect",
+            state=("not_evaluated" if finding is None
+                   else "passed" if finding.effect >= MIN_EFFECT
+                   else "failed"),
             required=(f"a difference of at least {MIN_EFFECT:.0%} of the "
                       f"baseline, with a bootstrap confidence interval that "
                       f"excludes zero"),
-            observed="no effect was measured, so none is claimed",
+            # The confidence interval is NOT computed. The size of the
+            # difference is, and it is reported as exactly that - a lift,
+            # measured over two groups - rather than dressed up as a
+            # result with statistics behind it that nobody ran.
+            observed=("no effect was measured, so none is claimed"
+                      if finding is None else
+                      "%s mean views %s vs %s %s: lift %s (%.0f%% of the "
+                      "baseline); no confidence interval is computed"
+                      % (finding.treatment.value,
+                         _fmt(finding.treatment.mean_views),
+                         finding.control.value,
+                         _fmt(finding.control.mean_views),
+                         _fmt(finding.lift), finding.effect * 100)),
             threshold_from="policy"),
         LearningGate(
-            gate="human_approval", state="not_evaluated",
+            gate="human_approval",
+            state=("not_evaluated" if finding is None
+                   else "passed" if approved else "failed"),
             required=("an operator approves a proposal before any "
                       "configuration changes - nothing applies itself"),
-            observed="no proposal exists to approve, and approval is never "
-                     "assumed",
+            observed=(("approved by %s" % approver)
+                      if (approved and finding is not None) else
+                      "a finding is waiting for an operator to approve it"
+                      if finding is not None else
+                      "no proposal exists to approve, and approval is "
+                      "never assumed"),
             threshold_from="architecture"),
     ]
 
@@ -325,18 +590,53 @@ class LearningAgent(Agent):
             span.skipped("cache hit - upstream inputs identical")
             return cached
 
-        gates = _gates(history)
+        # The comparison, from the store. Arithmetic over stored reports -
+        # no model is involved and nothing here is estimated. None means
+        # there was nothing to compare, which is an answer, not a failure.
+        finding = None
+        if history.usable_samples >= MIN_HISTORY:
+            finding = compare(_samples(ctx.store, ctx.job.job_id))
+            span.tool("learning.compare_cohorts",
+                      dimension=finding.dimension if finding else None,
+                      lift=finding.lift if finding else None,
+                      holdout_agrees=finding.holdout_agrees if finding
+                      else None)
+
+        approved, approver = _approval(ctx.job.job_id)
+        gates = _gates(history, finding, approved, approver)
         span.tool("learning.evaluate_gates",
                   failed=[g.gate for g in gates if g.state == "failed"],
                   not_evaluated=[g.gate for g in gates
                                  if g.state == "not_evaluated"])
 
+        passed_all = all(g.state == "passed" for g in gates)
         payload = Learning(
+            status="learned" if passed_all else "insufficient_data",
+            learned=passed_all,
+            # Still False, always. A proposal is a proposal; applying one
+            # is a separate, deliberate act that nothing here performs.
+            configuration_changed=False,
+            finding=finding if (finding is not None and any(
+                g.gate == "practical_effect" and g.state == "passed"
+                for g in gates)) else None,
+            approved_by=approver if approved else "",
             performance_status=performance.status if performance else None,
             history=history, gates=gates, inputs=inputs,
             configurable=configurable,
             next_steps=self._next_steps(performance, history, configurable),
             limitations=self._limitations(configurable))
+
+        if passed_all:
+            told = (f"{finding.treatment.value} over {finding.control.value}: "
+                    f"lift {finding.lift:g} on views, held out and agreed, "
+                    f"approved by {approver}")
+            ctx.emit(f"learning: {told}; configuration unchanged - a "
+                     f"proposal is not an application")
+            return self.wrap(
+                ctx, payload, revision=revision, inputs_hash=inputs_hash,
+                span=span, decisions=self._decisions(payload, performance),
+                confidence=0.8, degraded=False,
+                cost=Cost(wall_s=round(time.time() - started, 2)))
 
         why = (f"insufficient data: {history.usable_samples} usable "
                f"sample(s) of {MIN_HISTORY} needed; "

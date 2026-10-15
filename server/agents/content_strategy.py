@@ -51,6 +51,7 @@ from .artifacts import (Artifact, ClipAnalysisSet, ClipPriority,
                         ContentStrategy, Cost, Decision, Hook, KeyPoint,
                         ResearchReport, VisionAnalysis)
 from .base import Agent, AgentContext
+from . import learning as _LN
 from .trace import TraceSpan
 
 PROMPT_VERSION = "strategy-prompt-v1"
@@ -71,7 +72,7 @@ owns the edit, and they are good at it.
 SUBJECT
 {subject}
 {brief}
-{vision}
+{learned}{vision}
 {research}
 YOUR TASK
 Decide what this video is actually about and who it is for.
@@ -183,8 +184,17 @@ class ContentStrategyAgent(Agent):
         # ---- cache: keyed on BOTH upstreams ----------------------------
         # Deliberately no time bucket. Research goes stale on the clock; a
         # strategy goes stale when what it was derived from changes.
+        # What past videos measurably showed, if anything cleared every
+        # gate AND a person approved it. In the hash because a new
+        # finding must produce a new strategy rather than a cache hit on
+        # the one written before anybody had learned anything.
+        learned = _LN.as_guidance(_LN.latest_validated(ctx.store))
+        if learned:
+            span.tool("learning.apply", source="validated LearningReport")
+
         inputs_hash = self.hash_inputs(
             domain, ctx.job.settings.brief(), sorted(names), PROMPT_VERSION,
+            learned,
             ldesc.get("model"),
             ldesc.get("provider"),
             vision_hash or self._vision_digest(vision),
@@ -207,7 +217,7 @@ class ContentStrategyAgent(Agent):
                 why=(ldesc.get("why_disabled") or "no model configured"))
 
         prompt = self._build_prompt(domain, clip_set, vision, research, names,
-                                    ctx.job.settings.brief())
+                                    ctx.job.settings.brief(), learned)
         span.tool("llm.complete_json", purpose="content-strategy",
                   vision=v_ok, research=r_ok, prompt_chars=len(prompt))
         raw, reply = ctx.llm.complete_json(prompt, max_tokens=1800)
@@ -247,7 +257,8 @@ class ContentStrategyAgent(Agent):
     def _build_prompt(self, domain: str, clip_set: ClipAnalysisSet,
                       vision: VisionAnalysis | None,
                       research: ResearchReport | None,
-                      names: list[str], brief: str = "") -> str:
+                      names: list[str], brief: str = "",
+                      learned: str = "") -> str:
         """Both upstreams, digested - never dumped in as raw JSON.
 
         Blind JSON pasting is how an agent ends up reasoning over fields it
@@ -259,6 +270,7 @@ class ContentStrategyAgent(Agent):
                      "not stated by the operator - infer it from the material "
                      "below, and say so in `limitations`"),
             brief=self._brief_section(brief),
+            learned=learned,
             vision=self._vision_section(vision, clip_set),
             research=self._research_section(research),
             names=", ".join(names) or "(none)")

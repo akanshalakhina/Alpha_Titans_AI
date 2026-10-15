@@ -35,7 +35,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..artifacts import (ClipAnalysisSet, EditPlan, Music, RenderSpec,
+from ..artifacts import (Animation, ClipAnalysisSet, EditPlan, Music,
+                         RenderSpec,
                          SegmentRenderSpec)
 from .analysis_tools import read_manifest, run_pipeline_stage
 from .pipeline_bridge import adapter_mod, build_video, extras_mod
@@ -49,7 +50,8 @@ def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
                         framing: str = "fill",
                         title: str = "ALPHA_TITANS",
                         music: Music | None = None,
-                        keep_audio: str = "none") -> RenderSpec:
+                        keep_audio: str = "none",
+                        animation: "Animation | None" = None) -> RenderSpec:
     """EditPlan -> RenderSpec. Deterministic; never authored by a model.
 
     The transition list comes from the plan when the Transition agent chose
@@ -83,6 +85,7 @@ def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
     audio the same way.
     """
     n_cuts = max(len(plan.segments) - 1, 1)
+    by_segment = _overlays_by_segment(plan, animation)
     return RenderSpec(
         job_id=job_id,
         build_dir=str(build_dir),
@@ -103,6 +106,7 @@ def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
                 index=s.index, clip_id=s.clip_id, start=s.start, end=s.end,
                 duration=s.duration, caption=s.caption,
                 orientation=s.orientation, cache_key=s.cache_key(),
+                overlays=by_segment.get(s.index, []),
             )
             for s in plan.segments
         ],
@@ -110,6 +114,31 @@ def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
 
 
 # ------------------------------------------------------------ projection
+
+def _overlays_by_segment(plan: EditPlan,
+                         animation: "Animation | None") -> dict:
+    """Resolve each beat's graphic onto the segments cut from that clip.
+
+    The Animation agent names a BEAT. A beat can become more than one
+    segment - a clip used twice is two moments of the same beat - so the
+    placement applies to every segment cut from that beat's clip. The
+    mapping is done here, from the plan, because the plan is the only
+    thing that knows which segment came from where; asking the model for
+    a segment index would be asking it to know the edit before the edit
+    exists.
+    """
+    if animation is None:
+        return {}
+    wanted = [d for d in (animation.directions or []) if d.overlay]
+    if not wanted:
+        return {}
+    out: dict[int, list] = {}
+    for d in wanted:
+        for s in plan.segments:
+            if s.clip_id == d.clip_id:
+                out.setdefault(s.index, []).append(d.overlay)
+    return out
+
 
 def project_manifest(spec: RenderSpec) -> dict:
     """Write the compatibility projection the existing stages read.
@@ -157,6 +186,22 @@ def project_manifest(spec: RenderSpec) -> dict:
 
     caps = [s.caption for s in spec.segments]
     (build_dir / "captions.json").write_text(json.dumps(caps, indent=2))
+
+    # Graphics, beside the captions and in the same semantic shape: an
+    # asset name, a segment and a word for where and how long. No pixel
+    # and no second crosses this boundary - `build_video` computes both
+    # from the canvas and the segment's own measured duration.
+    rows = [
+        {"segment_index": s.index, "asset": ov.asset, "anchor": ov.anchor,
+         "scale_pct": ov.scale_pct, "hold": ov.hold}
+        for s in spec.segments for ov in s.overlays
+    ]
+    target = build_dir / "overlays.json"
+    if rows:
+        target.write_text(json.dumps(rows, indent=2))
+    elif target.exists():
+        # a re-render after the overlays were removed must not keep them
+        target.unlink()
     return m
 
 

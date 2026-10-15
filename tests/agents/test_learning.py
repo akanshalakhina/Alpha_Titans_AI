@@ -29,7 +29,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from agents.artifacts import (Artifact, ConfigTarget, ContentStrategy,
+from agents.artifacts import (CohortArm, CohortFinding,
+                              Artifact, ConfigTarget, ContentStrategy,
                               CreativeCheck, CriticResult, EditPlan,
                               GateState, Hook, JobSettings, Learning,
                               LearningGate, LearningGateName, LearningHistory,
@@ -172,11 +173,45 @@ def test_the_sample_rule_is_measured_and_non_zero():
     assert "any(m.value > 0 for m in payload.measured)" in rule
 
 
-def test_the_schema_has_one_honest_state():
-    assert typing.get_args(LearningStatus) == ("insufficient_data",)
-    for field in ("learned", "configuration_changed"):
-        assert typing.get_args(
-            Learning.model_fields[field].annotation) == (False,)
+def test_a_claim_is_possible_but_only_the_hard_way():
+    """This asserted `Literal[False]` while nothing could be learned.
+
+    A finding can exist now, so what has to be pinned instead is the
+    price of making one: `learned` is reachable, and the validator -
+    not a convention - refuses it unless every gate including
+    human_approval passed, a finding is attached and an approver is
+    named. `configuration_changed` stays unreachable in practice because
+    nothing applies a proposal by itself.
+    """
+    assert typing.get_args(LearningStatus) == ("insufficient_data", "learned")
+    assert Learning.model_fields["learned"].annotation is bool
+
+    passed = every_gate(**{g: "passed" for g in GATES})
+    finding = a_finding()
+    ok = dict(history=history(usable_samples=MIN_HISTORY,
+                              performance_reports=MIN_HISTORY,
+                              unavailable_reports=0, samples_needed=0))
+    for missing in ("finding", "approved_by", "learned", "status"):
+        kw = dict(status="learned", learned=True, finding=finding,
+                  approved_by="operator", gates=passed, **ok)
+        kw[missing] = {"finding": None, "approved_by": "",
+                       "learned": False, "status": "insufficient_data"
+                       }[missing]
+        with pytest.raises(ValidationError):
+            Learning(**kw)
+
+    whole = Learning(status="learned", learned=True, finding=finding,
+                     approved_by="operator", gates=passed, **ok)
+    assert whole.learned and whole.configuration_changed is False
+
+
+def a_finding(lift: float = 2.2, agrees: bool = True) -> CohortFinding:
+    arm = lambda v, m: CohortArm(value=v, videos=MIN_COHORT, mean_views=m)
+    return CohortFinding(
+        dimension="pacing", treatment=arm("fast", 9000.0),
+        control=arm("slow", 9000.0 / lift), lift=lift,
+        effect=abs(lift - 1.0), holdout_videos=6,
+        holdout_lift=lift if agrees else 1 / lift, holdout_agrees=agrees)
 
 
 def test_the_gate_is_the_architectures():
@@ -359,15 +394,39 @@ def test_every_gate_states_its_bar_and_where_it_comes_from(learn_ctx,
     assert "30 short" in gate(p, "sufficient_history").observed
 
 
-@pytest.mark.parametrize("usable", [0, 5, 29, 30, 500])
-def test_no_code_path_passes_a_gate(usable):
+@pytest.mark.parametrize("usable", [0, 5, 29])
+def test_a_short_history_fails_the_first_gate(usable):
+    """Below the bar, nothing opens. This test used to assert that
+    NOTHING ever opened at any count, which was true while no comparison
+    existed; a data gate can be satisfied now, so what it pins is that
+    the count is what decides it."""
     h = history(performance_reports=max(usable, 1), usable_samples=usable,
                 unavailable_reports=0,
-                samples_needed=max(0, MIN_HISTORY - usable))
+                samples_needed=MIN_HISTORY - usable)
     gates = _gates(h)
-    assert not [g for g in gates if g.state == "passed"]
-    if usable < MIN_HISTORY:
-        assert gates[0].state == "failed"
+    assert gates[0].state == "failed"
+    assert not [g for g in gates if g.gate in ("holdout_validation",
+                                               "practical_effect",
+                                               "human_approval")
+                and g.state == "passed"], "no finding exists to judge"
+
+
+@pytest.mark.parametrize("usable", [30, 500])
+def test_enough_samples_open_the_data_gates_and_no_others(usable):
+    """Samples are what the data gates measure. They say nothing about
+    whether a pattern exists, so the three that need one stay shut."""
+    h = history(performance_reports=usable, usable_samples=usable,
+                unavailable_reports=0, samples_needed=0,
+                window_days=MIN_WINDOW_DAYS)
+    states = {g.gate: g.state for g in _gates(h)}
+    assert states["sufficient_history"] == "passed"
+    assert states["valid_nonzero_data"] == "passed"
+    assert states["time_window"] == "passed"
+    # no finding was passed in, so there is nothing to size or validate
+    assert states["cohort_size"] == "failed"
+    assert states["holdout_validation"] == "not_evaluated"
+    assert states["practical_effect"] == "not_evaluated"
+    assert states["human_approval"] == "not_evaluated"
 
 
 def test_the_gate_cannot_be_misreported():
@@ -380,9 +439,9 @@ def test_the_gate_cannot_be_misreported():
         Learning(gates=list(reversed(every_gate())), **ok)
     with pytest.raises(ValidationError):            # a gate twice
         Learning(gates=every_gate() + every_gate()[:1], **ok)
-    with pytest.raises(ValidationError):            # passing after a failure
-        Learning(gates=every_gate(cohort_size="passed"), **ok)
-    with pytest.raises(ValidationError):            # every gate passed
+    with pytest.raises(ValidationError):            # judgement without evidence
+        Learning(gates=every_gate(practical_effect="passed"), **ok)
+    with pytest.raises(ValidationError):            # every gate, nothing to show
         Learning(gates=every_gate(**{g: "passed" for g in GATES}), **ok)
     with pytest.raises(ValidationError):            # approval of nothing
         Learning(gates=every_gate(**{g: "passed" for g in GATES[:-1]},
@@ -406,7 +465,15 @@ def test_the_gate_cannot_be_misreported():
     {"proposals": []}, {"applied_changes": ["x"]},
     {"code_change": "critic.py"}, {"views": 1200},
 ])
-def test_the_schema_cannot_carry_a_finding_or_a_change(kw):
+def test_the_schema_still_cannot_carry_an_invented_claim(kw):
+    """A measured cohort difference can be recorded now. A correlation,
+    a causal claim, an effect size with a confidence interval nobody
+    computed, or a configuration change applied by the system itself
+    still cannot - those were never measured here.
+
+    `configuration_changed=True` is refused by a validator rather than
+    by its type, so the reason is written down: nothing applies a
+    proposal, so nothing has changed."""
     base = dict(history=history(), gates=every_gate())
     Learning(**base)                               # the base itself is valid
     with pytest.raises(ValidationError):
@@ -681,3 +748,114 @@ def test_nothing_is_learned_however_many_samples_arrive(learn_ctx,
     assert p.learned is False and p.configuration_changed is False
     for g in ("holdout_validation", "practical_effect", "human_approval"):
         assert gate(p, g).state == "not_evaluated"
+
+
+# ====================== 10. a finding reaching the job that comes after
+#
+# Learning runs LAST - `performance_analysis -> learning -> END` - so it
+# can never change the video it analysed. The only thing it can do is
+# tell the next job what was measured. Until now nothing read its
+# artifact at all, which made the whole loop decorative.
+
+from agents.learning import as_guidance, latest_validated     # noqa: E402
+
+
+def _learned_report(store, job="prior", lift=2.2, approved="operator"):
+    passed = every_gate(**{g: "passed" for g in GATES})
+    art = Artifact[Learning](
+        job_id=job, kind="Learning", produced_by="learning",
+        inputs_hash=f"h-{job}",
+        payload=Learning(
+            status="learned", learned=True, finding=a_finding(lift=lift),
+            approved_by=approved, gates=passed,
+            history=history(usable_samples=MIN_HISTORY,
+                            performance_reports=MIN_HISTORY,
+                            unavailable_reports=0, samples_needed=0)))
+    store.put(art)
+    return art
+
+
+def test_nothing_is_offered_when_nothing_was_learned(learn_ctx):
+    assert latest_validated(learn_ctx.store) is None
+    assert as_guidance(None) == ""
+
+
+def test_a_validated_finding_is_offered_to_the_next_job(learn_ctx):
+    _learned_report(learn_ctx.store)
+    got = latest_validated(learn_ctx.store)
+    assert got is not None and got.finding.lift == 2.2
+
+
+def test_an_unapproved_finding_is_not_offered(learn_ctx):
+    """Six gates of arithmetic are not a decision. Until a person says
+    so, a measured difference is a number nobody has looked at."""
+    open_gates = every_gate(**{g: "passed" for g in GATES[:-1]},
+                            human_approval="failed")
+    learn_ctx.store.put(Artifact[Learning](
+        job_id="unapproved", kind="Learning", produced_by="learning",
+        inputs_hash="h", payload=Learning(
+            status="insufficient_data", learned=False,
+            gates=open_gates,
+            history=history(usable_samples=MIN_HISTORY,
+                            performance_reports=MIN_HISTORY,
+                            unavailable_reports=0, samples_needed=0))))
+    assert latest_validated(learn_ctx.store) is None
+
+
+def test_the_newest_validated_report_wins(learn_ctx):
+    import time
+    _learned_report(learn_ctx.store, "older", lift=1.5)
+    time.sleep(0.01)
+    _learned_report(learn_ctx.store, "newer", lift=3.0)
+    assert latest_validated(learn_ctx.store).finding.lift == 3.0
+
+
+# ------------------------------------------- what the prompt actually says
+
+def test_the_guidance_names_the_numbers_and_the_approver(learn_ctx):
+    said = as_guidance(_learned_report(learn_ctx.store).payload)
+    assert "fast pacing" in said and "2.2x" in said
+    assert "6 videos kept out" in said
+    assert "approved by operator" in said
+
+
+def test_the_guidance_is_evidence_not_an_instruction(learn_ctx):
+    """A past average is not an order. A strategist that cannot
+    disagree with one is not reasoning."""
+    said = as_guidance(_learned_report(learn_ctx.store).payload)
+    assert "not an instruction" in said
+    assert "where it fits the footage" in said
+    assert "`limitations`" in said
+
+
+# ------------------------------------------------ it reaches both prompts
+
+def test_the_strategist_is_given_the_finding(learn_ctx):
+    from agents.content_strategy import ContentStrategyAgent
+    said = as_guidance(_learned_report(learn_ctx.store).payload)
+    prompt = ContentStrategyAgent()._build_prompt(
+        "lego", _clip_set(), None, None, ["a.mp4"], "", said)
+    assert "MEASURED ON PAST VIDEOS" in prompt and "2.2x" in prompt
+
+
+def test_the_strategist_prompt_is_unchanged_with_nothing_learned():
+    from agents.content_strategy import ContentStrategyAgent
+    prompt = ContentStrategyAgent()._build_prompt(
+        "lego", _clip_set(), None, None, ["a.mp4"], "", "")
+    assert "MEASURED ON PAST VIDEOS" not in prompt
+
+
+def _clip_set():
+    from agents.artifacts import (ClipAnalysis, ClipAnalysisSet, ClipMotion,
+                                  ClipTechnical, ClipUsability)
+    return ClipAnalysisSet(
+        clips=[ClipAnalysis(
+            clip_id="a.mp4", path="/tmp/a.mp4",
+            technical=ClipTechnical(duration=10.0, coded=(1920, 1080),
+                                    display=(1920, 1080), fps=30.0,
+                                    orientation="horizontal"),
+            motion=ClipMotion(sample_fps=10.0, mean_ydif=3.0, max_ydif=6.0,
+                              live_share=1.0, freeze_runs=[],
+                              ydif_series=[1.0] * 100),
+            usability=ClipUsability(usable=True))],
+        orientation="horizontal", canvas=(1920, 1080), target_seconds=30.0)

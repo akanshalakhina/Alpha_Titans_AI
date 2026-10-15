@@ -47,6 +47,17 @@ from .artifacts import (Artifact, Caption, ClipAnalysis, ClipAnalysisSet,
                         Animation, Music, RevisionRequest, Segment,
                         Story, Transition, VisionAnalysis, Voiceover)
 from .base import Agent, AgentContext
+from . import learning as _LN
+
+
+def _learned(ctx) -> str:
+    """What past videos measurably showed, approved and validated.
+
+    Read here rather than passed down the graph because Learning runs
+    LAST: the report that reaches this job was written by the job before
+    it. Nothing is read that did not clear all seven gates.
+    """
+    return _LN.as_guidance(_LN.latest_validated(ctx.store))
 from .tools import select_tools as ST
 from .tools.llm_tools import LLMReply
 from .trace import TraceSpan
@@ -67,7 +78,7 @@ BATCH FACTS
   output shape      {orientation} {canvas}
   target length     {target:.0f}s
   median motion     {median:.2f}
-{strategy}{constraints}
+{strategy}{learned}{constraints}
 YOUR TASK
 Choose which clips to use, what order they run in, and roughly how long each
 should be on screen. Open on whatever will hold a viewer.
@@ -127,6 +138,8 @@ class EditingDirectorAgent(Agent):
         constraints = dict(revision_request.constraints) if revision_request else {}
 
         inputs_hash = self.hash_inputs(
+            # a finding approved since the last plan is a different input
+            _learned(ctx),
             [c.clip_id for c in clip_set.clips],
             clip_set.target_seconds, clip_set.canvas,
             constraints,
@@ -454,7 +467,8 @@ class EditingDirectorAgent(Agent):
 
         prompt = self._build_prompt(clip_set, usable, constraints, vision,
                                     strategy, story, voiceover, music,
-                                    animation, transition, caption)
+                                    animation, transition, caption,
+                                    _learned(ctx))
         span.tool("llm.complete_json", provider=ctx.llm.describe().get("provider"),
                   model=ctx.llm.describe().get("model"),
                   prompt_chars=len(prompt))
@@ -480,7 +494,8 @@ class EditingDirectorAgent(Agent):
                       music: Music | None = None,
                       animation: Animation | None = None,
                       transition: Transition | None = None,
-                      caption: Caption | None = None) -> str:
+                      caption: Caption | None = None,
+                      learned: str = "") -> str:
         from .tools.pipeline_bridge import build_video
 
         rows = "\n".join(
@@ -724,6 +739,7 @@ class EditingDirectorAgent(Agent):
                      "check enforces them after you reply:\n" + lines + "\n")
 
         return PROMPT.format(
+            learned=learned,
             clips=rows + vtext, orientation=clip_set.orientation,
             canvas="%dx%d" % clip_set.canvas,
             target=clip_set.target_seconds, median=median,
