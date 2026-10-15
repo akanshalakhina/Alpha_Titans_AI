@@ -209,6 +209,32 @@ class ArtifactStore:
             row = con.execute(sql, args).fetchone()
         return self._hydrate(row, payload_type) if row else None
 
+    def get_raw(self, job_id: str, kind: str,
+                revision: int | None = None) -> dict | None:
+        """The stored artifact as plain JSON, without a payload type.
+
+        `get` needs the pydantic class for the kind, which a caller that
+        only wants to SHOW the thing - the UI, a trace viewer - has no
+        business knowing. The envelope fields travel with it so nobody can
+        present a degraded answer as a reasoned one.
+        """
+        sql = ("SELECT * FROM artifacts WHERE job_id = ? AND kind = ?"
+               + (" AND revision = ?" if revision is not None
+                  else " ORDER BY revision DESC") + " LIMIT 1")
+        args = (job_id, kind) + ((revision,) if revision is not None else ())
+        with self._connect() as con:
+            row = con.execute(sql, args).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        for f in ("payload", "decisions", "input_artifacts"):
+            if isinstance(out.get(f), str):
+                try:
+                    out[f] = json.loads(out[f])
+                except json.JSONDecodeError:
+                    pass
+        return out
+
     def get_by_inputs(self, job_id: str, kind: str, inputs_hash: str,
                       payload_type: Type[T]) -> Artifact[T] | None:
         """Cache lookup: has this agent already run on exactly these inputs?"""

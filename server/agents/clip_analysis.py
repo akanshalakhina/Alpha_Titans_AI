@@ -33,6 +33,7 @@ from .artifacts import (Artifact, ClipAnalysisSet, Cost, Decision,
                         content_hash)
 from .base import Agent, AgentContext
 from .tools import analysis_tools as AT
+from .tools import measure_cache as MC
 from .tools.pipeline_bridge import build_video
 from .trace import TraceSpan
 
@@ -42,6 +43,17 @@ from .trace import TraceSpan
 # Vision Agent instead of being judged here.
 AMBIGUOUS_LIVE_SHARE = 0.80
 AMBIGUOUS_MEAN_YDIF = 1.0
+
+
+def _measure_cache_dir():
+    """Beside the shared artifact store, so it is as durable as the jobs.
+
+    Keyed on file content, so it is safe to share across every job on this
+    machine - two uploads of the same video are the same measurement.
+    """
+    from pathlib import Path
+    from .store import shared_db_path
+    return Path(shared_db_path()).parent / "measure_cache"
 
 
 class ClipAnalysisAgent(Agent):
@@ -89,8 +101,32 @@ class ClipAnalysisAgent(Agent):
         if not n_clips:
             raise RuntimeError("probe found no readable clips")
 
+        # ---- reuse: the same file measured before gives the same answer --
+        # Measuring an eight-minute clip decodes it twice and took 586s -
+        # half of a twenty-minute production - and four runs over the same
+        # upload produced four byte-identical .ydif.txt files. The cache
+        # writes those results into the manifest and the measure folder,
+        # which is where `stage_measure` looks before deciding what to do,
+        # so it is that stage, unmodified, which then skips them.
+        cached = MC.restore(_measure_cache_dir(), job.src_dir, job.build_dir,
+                            manifest, ctx.emit)
+        if cached:
+            build_video.save(str(job.build_dir), manifest)
+            span.cache(len(cached))
+            span.note(f"{len(cached)} clip(s) were measured in an earlier "
+                      f"build of the same footage and were not re-measured")
+            decisions.append(Decision(
+                what="Motion measurement",
+                chose=f"{len(cached)} of {n_clips} clip(s) reused",
+                why=("the measurement is a pure function of the file's "
+                     "bytes, so an identical file measured before gives an "
+                     "identical series; the key is a sha256 of the file "
+                     "itself, never its name or timestamp"),
+                decided_by="policy", confidence=1.0))
+
         # ---- measure: the existing stage, unmodified, on the pool ---------
-        span.tool("pipeline.measure", stage="measure", clips=n_clips)
+        span.tool("pipeline.measure", stage="measure", clips=n_clips,
+                  reused=len(cached))
         rc, out = ctx.pool.run(AT.run_pipeline_stage, "measure",
                                job.build_dir, None, None, None, ctx.emit,
                                pool=ctx.pool, job_id=job.job_id)
@@ -108,6 +144,10 @@ class ClipAnalysisAgent(Agent):
                 decided_by="fallback", confidence=0.3))
 
         manifest = AT.read_manifest(job.build_dir) or manifest
+
+        # Store whatever this build actually measured, so the next job over
+        # the same footage starts where this one finished.
+        MC.store(_measure_cache_dir(), job.src_dir, job.build_dir, manifest)
         orientation = manifest.get("orientation") or "horizontal"
         canvas = AT.canvas_for(orientation, settings.resolution)
 

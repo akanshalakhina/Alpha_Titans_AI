@@ -46,6 +46,7 @@ import os
 import time
 from pathlib import Path
 
+from .tools.llm_tools import VISION_RETRIES
 from .artifacts import (Artifact, CandidateWindow, ClipAnalysis,
                         ClipAnalysisSet, Cost, Decision, InterestingMoment,
                         VisionAnalysis, VisionClip)
@@ -280,8 +281,12 @@ class VisionAgent(Agent):
                                     dur=dur, windows=listing)
         span.tool("llm.complete_json", clip=clip.clip_id, images=len(frames),
                   prompt_chars=len(prompt))
+        # Worth far more patience than a text call: a clip refused here is
+        # a clip nothing downstream can ground a beat in, so the whole story
+        # ends up built on whatever else succeeded.
         raw, reply = ctx.llm.complete_json(prompt, max_tokens=1200,
-                                           images=frames)
+                                           images=frames,
+                                           retries=VISION_RETRIES)
         cost = (reply.tokens_in, reply.tokens_out, reply.usd)
         span.llm(reply.tokens_in, reply.tokens_out, reply.usd)
 

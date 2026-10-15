@@ -123,6 +123,64 @@ def _is_our_projection(target: Path) -> bool:
     return (existing.get("settings") or {}).get("_produced_by") == MARKER
 
 
+def _is_untouched_placeholder(existing: dict) -> bool:
+    """A job record created but never built: no run has written to it.
+
+    `POST /api/jobs` stamps one of these out the moment a job is created,
+    before anybody chooses which engine will build it. Nothing in it is worth
+    protecting - every field is still the default.
+    """
+    if existing.get("status") != "draft":
+        return False
+    if existing.get("output") or existing.get("started") \
+            or existing.get("finished") or existing.get("error"):
+        return False
+    stages = existing.get("stages") or {}
+    return all((s or {}).get("status") == "pending" for s in stages.values())
+
+
+def claim_placeholder(job_id: str, root: Path | None = None) -> bool:
+    """Mark an empty legacy job record as belonging to the agent path.
+
+    THE BUG THIS FIXES
+    ------------------
+    The browser's create flow calls `POST /api/jobs` and then
+    `POST /api/v2/jobs/{id}/produce`. The first writes a legacy job.json;
+    `project()` then refuses to overwrite it, because overwriting a real
+    legacy build's state file would corrupt it. That refusal is right in
+    general and wrong here: the file is an empty placeholder, not a build.
+
+    The cost was invisible and total - `_auto_project` swallows the
+    FileExistsError, so every run finished, rendered a verified video, and
+    left `output: null` with `status: "draft"`. `/api/jobs/{id}/download`
+    reads `job.output`, so EVERY video made through the UI answered 409
+    while the file sat on disk beside it. Only CLI-built jobs, which never
+    create a legacy record, could be downloaded.
+
+    Returns True when the job may now be projected. Refuses - and returns
+    False - for anything that has actually been built, so a real legacy
+    build is still never touched.
+    """
+    _, build = job_paths(job_id, root)
+    target = build / JOB_FILE
+    if not target.exists():
+        return True                      # nothing in the way
+    if _is_our_projection(target):
+        return True                      # already ours
+    try:
+        existing = json.loads(target.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False                     # unreadable: leave it alone
+    if not _is_untouched_placeholder(existing):
+        return False                     # a real build owns this file
+    existing.setdefault("settings", {})["_produced_by"] = MARKER
+    try:
+        target.write_text(json.dumps(existing, indent=2))
+    except OSError:
+        return False
+    return True
+
+
 # --------------------------------------------------------------- locating
 
 def job_paths(job_id: str, root: Path | None = None) -> tuple[Path, Path]:
@@ -145,7 +203,19 @@ def is_agent_job(job_id: str, root: Path | None = None) -> bool:
     if not Path(db).exists():
         return False
     try:
-        return ArtifactStore(db).has_job(job_id)
+        if ArtifactStore(db).has_job(job_id):
+            return True
+    except Exception:                            # pragma: no cover
+        pass
+    # An artifact only exists once the FIRST agent has finished. Measuring an
+    # eight-minute clip takes minutes, and for all of that time `/status` and
+    # `/trace` answered 404 - so the activity view showed every node greyed
+    # out as "queued" with "0 agents ran . 0ms . 0 tool calls" while
+    # clip_analysis was demonstrably running, with its probe tool calls
+    # already recorded. A job that has started tracing IS an agent job; it
+    # just has not finished anything yet.
+    try:
+        return bool(TraceRecorder(db).for_job(job_id))
     except Exception:                            # pragma: no cover
         return False
 

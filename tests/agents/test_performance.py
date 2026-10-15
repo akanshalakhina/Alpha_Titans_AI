@@ -26,7 +26,8 @@ import pytest
 from pydantic import ValidationError
 
 from agents.artifacts import (AnalyticsProvider, CreativeCheck, CriticResult,
-                              EvidenceItem, PerformanceAnalysis,
+                              EvidenceItem, MeasuredMetric,
+                              PerformanceAnalysis,
                               PerformanceGap, PerformanceMetric,
                               PerformanceStatus, PublishAsset, PublishCheck,
                               Publishing, ResearchReport, Title,
@@ -114,13 +115,27 @@ def everything(ctx, tracer_span, **kw):
 
 # -------------------- 1. what the project can actually do
 
-def test_nothing_in_the_project_can_read_analytics():
-    assert _analytics()["analytics"] == [], \
-        "an analytics path exists - the provider literal must be revisited"
-    assert typing.get_args(AnalyticsProvider) == ("none",)
-    assert typing.get_args(PerformanceStatus) == ("unavailable",)
-    assert typing.get_args(
-        PerformanceAnalysis.model_fields["published"].annotation) == (False,)
+def test_the_only_analytics_path_is_a_file_the_operator_exports():
+    """There is still no API this project can call for statistics.
+
+    This test used to assert that performance could not be measured at
+    all. It can now - but only from a CSV the operator exported from
+    their own warehouse and dropped in `data/analytics`, because no
+    Databricks or BigQuery driver is installed and reaching YouTube
+    Analytics would need the channel owner's OAuth consent. That is the
+    whole reason the provider is called `youtube_export` and not
+    `youtube`: these numbers are as fresh as that file, and nothing in
+    the code can refresh them.
+    """
+    assert _analytics()["analytics"] == [],         "a live analytics path exists - the provider literal must say so"
+    assert typing.get_args(AnalyticsProvider) == ("none", "youtube_export")
+    assert typing.get_args(PerformanceStatus) == ("unavailable", "measured")
+
+    from pathlib import Path as _P
+    from agents.tools import analytics_store as AS
+    src = _P(AS.__file__).read_text(encoding="utf-8")
+    for reaching_out in ("urllib", "requests", "httpx", "socket"):
+        assert reaching_out not in src,             f"the export reader must not reach the network ({reaching_out})"
 
 
 def test_nothing_publishes_so_nothing_can_have_performed():
@@ -223,23 +238,66 @@ def test_an_unready_plan_is_resolved_before_anything_else(
 
 # ----------------------------------- 3. the schema cannot hold a figure
 
-@pytest.mark.parametrize("kw", [
-    {"views": 1200}, {"view_count": 1200}, {"ctr": 0.084},
-    {"click_through_rate": 0.084}, {"retention": 0.51},
-    {"audience_retention": [1.0, 0.6]}, {"likes": 48}, {"revenue": 3.2},
-    {"url": "https://youtu.be/abc123XYZ"}, {"video_id": "abc123XYZ"},
-    {"metrics": {"views": 1}}, {"published": True},
-    {"provider": "youtube_analytics"}, {"status": "insufficient_data"},
-    {"status": "available"},
-])
-def test_the_schema_cannot_carry_a_figure_or_a_claim(kw):
+def _unavailable(**kw):
     base = dict(publishing_status="ready",
                 gaps=[PerformanceGap(reason="not_published", evidence="x")],
                 unmeasured=[UnmeasuredMetric(metric=m, needs="x")
                             for m in METRICS])
-    PerformanceAnalysis(**base)                    # the base itself is valid
+    return PerformanceAnalysis(**{**base, **kw})
+
+
+@pytest.mark.parametrize("kw", [
+    {"views": 1200}, {"view_count": 1200}, {"ctr": 0.084},
+    {"click_through_rate": 0.084}, {"retention": 0.51},
+    {"audience_retention": [1.0, 0.6]}, {"likes": 48}, {"revenue": 3.2},
+    {"url": "https://youtu.be/abc123XYZ"}, {"metrics": {"views": 1}},
+    {"provider": "youtube_analytics"}, {"status": "insufficient_data"},
+    {"status": "available"},
+])
+def test_the_schema_cannot_carry_a_figure_or_a_claim(kw):
+    _unavailable()                                 # the base itself is valid
     with pytest.raises(ValidationError):
-        PerformanceAnalysis(**{**base, **kw})
+        _unavailable(**kw)
+
+
+def test_an_unavailable_report_may_not_carry_a_number():
+    """The one thing that must never happen: a report saying it knows
+    nothing while holding a figure everything downstream would believe."""
+    with pytest.raises(ValidationError):
+        _unavailable(measured=[MeasuredMetric(metric="views", value=1200,
+                                              source="oct.csv")])
+
+
+def test_recording_the_upload_is_not_a_performance_claim():
+    """`published` and `video_id` may be set the moment the operator
+    pastes the link - before any export exists. Saying WHICH video this
+    became is not the same as saying how it did, so this is allowed and
+    the report stays unavailable."""
+    p = _unavailable(published=True, video_id="dQw4w9WgXcQ")
+    assert p.status == "unavailable" and p.measured == []
+
+
+@pytest.mark.parametrize("kw", [
+    {},                                             # no metric at all
+    {"measured": [MeasuredMetric(metric="views", value=1, source="x.csv")]},
+    {"measured": [MeasuredMetric(metric="views", value=1, source="x.csv")],
+     "video_id": "dQw4w9WgXcQ"},                    # not marked published
+])
+def test_a_measured_report_must_say_what_and_whose(kw):
+    """An empty "measured" is the worst of both: it reads as real
+    performance and contains nothing, and Learning would count it."""
+    with pytest.raises(ValidationError):
+        PerformanceAnalysis(status="measured", provider="youtube_export",
+                            **kw)
+
+
+def test_a_complete_measured_report_is_accepted():
+    p = PerformanceAnalysis(
+        status="measured", provider="youtube_export", published=True,
+        video_id="dQw4w9WgXcQ", window_days=30,
+        measured=[MeasuredMetric(metric="views", value=10432,
+                                 source="oct.csv")])
+    assert p.measured[0].value == 10432 and p.measured[0].source == "oct.csv"
 
 
 @pytest.mark.parametrize("kw", [{"value": 1200}, {"views": 1200}])
@@ -410,7 +468,8 @@ def test_the_trace_records_what_was_read_and_the_fallback(perf_ctx,
     tools = [t["tool"] for r in rows for t in r["tool_calls"]]
     assert tools == ["performance.scan_analytics",
                      "performance.find_video_reference",
-                     "performance.read_publication"]
+                     "performance.read_publication",
+                     "performance.read_analytics_export"]
     read = rows[-1]["tool_calls"][2]
     assert read["plan"] is True and read["published"] is False
     assert rows[-1]["fallback_used"] == art.fallback_used

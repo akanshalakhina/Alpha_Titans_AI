@@ -89,12 +89,21 @@ def _history(store, job_id: str) -> LearningHistory:
     whether or not it has written anything yet, so the count (and the cache
     key built on it) does not shift when this agent's own output lands.
 
-    A report is a usable sample only if it carries measured, non-zero
-    performance. No PerformanceAnalysis can: its status is "unavailable"
-    alone, so none qualifies. When that literal grows, its parity test
-    fails and this rule gets written against the real fields."""
+    A report is a usable sample only if it carries measured, NON-ZERO
+    performance. Both halves matter. "Measured" rules out the reports
+    that say they know nothing - the only kind that existed until an
+    operator could record an upload and drop a warehouse export beside
+    it. "Non-zero" rules out a video that was published and genuinely
+    got nothing: a row of zeroes is a true fact about that video and a
+    useless one to compare against, and counting it would let thirty
+    unwatched uploads open a gate that is there to keep conclusions
+    honest.
+
+    A report that is measured but all zero is counted separately rather
+    than called unreadable: it was read perfectly well."""
     jobs = sorted(set(store.jobs()) | {job_id})
-    reports = unavailable = unreadable = 0
+    reports = unavailable = unreadable = zero = usable = 0
+    window = 0
     for job_id in jobs:
         try:
             art = store.get(job_id, "PerformanceAnalysis", PerformanceAnalysis)
@@ -104,14 +113,18 @@ def _history(store, job_id: str) -> LearningHistory:
         if art is None:
             continue
         reports += 1
-        if art.payload.status == "unavailable":
+        payload = art.payload
+        if payload.status == "unavailable":
             unavailable += 1
-        else:                                         # pragma: no cover
-            unreadable += 1                           # no such state exists
-    usable = 0
+        elif any(m.value > 0 for m in payload.measured):
+            usable += 1
+            window = max(window, payload.window_days)
+        else:
+            zero += 1
     return LearningHistory(
         jobs_in_store=len(jobs), performance_reports=reports,
         unavailable_reports=unavailable, unreadable_reports=unreadable,
+        zero_reports=zero, window_days=window,
         usable_samples=usable, samples_needed=max(0, MIN_HISTORY - usable))
 
 
@@ -157,9 +170,16 @@ def _gates(h: LearningHistory) -> list[LearningGate]:
     def short(ok: bool) -> str:
         return "not_evaluated" if ok else "failed"
 
-    none_measured = (f"{h.unavailable_reports} report(s) unavailable and "
-                     f"{h.unreadable_reports} unreadable - not one carries a "
-                     f"measured figure")
+    if u:
+        none_measured = (f"{u} report(s) carry a measured, non-zero figure; "
+                         f"{h.unavailable_reports} unavailable, "
+                         f"{h.zero_reports} measured but all zero, "
+                         f"{h.unreadable_reports} unreadable")
+    else:
+        none_measured = (f"{h.unavailable_reports} report(s) unavailable, "
+                         f"{h.zero_reports} measured but all zero and "
+                         f"{h.unreadable_reports} unreadable - not one "
+                         f"carries a measured, non-zero figure")
     return [
         LearningGate(
             gate="sufficient_history", state=short(u >= MIN_HISTORY),
@@ -182,12 +202,21 @@ def _gates(h: LearningHistory) -> list[LearningGate]:
             observed=f"{u} usable sample(s) - no cohort can be formed",
             threshold_from="architecture"),
         LearningGate(
-            gate="time_window", state=short(u > 0),
+            gate="time_window",
+            state=short(u > 0 and h.window_days >= MIN_WINDOW_DAYS),
             required=(f"samples spanning at least {MIN_WINDOW_DAYS} days, "
                       f"each read at least {MIN_METRIC_AGE_DAYS} days after "
                       f"publication"),
-            observed="no sample has a publication date - nothing was "
-                     "published",
+            # A span is read from the export's own MIN(date)/MAX(date). A
+            # warehouse total summed over all time carries none, and a
+            # missing span is reported as missing rather than assumed to
+            # be wide enough.
+            observed=("no sample has a publication date - nothing was "
+                      "published" if not u else
+                      f"the widest export covers {h.window_days} day(s)"
+                      + ("" if h.window_days else
+                         "; the export carries no MIN(date)/MAX(date), so "
+                         "no span can be read from it")),
             threshold_from="architecture"),
         LearningGate(
             gate="holdout_validation", state="not_evaluated",

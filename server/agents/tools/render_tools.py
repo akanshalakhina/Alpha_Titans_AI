@@ -46,6 +46,7 @@ from .pipeline_bridge import adapter_mod, build_video, extras_mod
 def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
                         plan: EditPlan, quality: str = "high",
                         xfade_duration: float = 0.4,
+                        framing: str = "fill",
                         title: str = "ALPHA_TITANS",
                         music: Music | None = None,
                         keep_audio: str = "none") -> RenderSpec:
@@ -91,6 +92,7 @@ def compile_render_spec(job_id: str, build_dir: str, src_dir: str,
         preset="fast",
         fps=30,
         xfade_duration=float(xfade_duration),
+        framing=framing if framing in ("fill", "fit") else "fill",
         xfade_list=list(plan.xfade_list) or ["fade"] * n_cuts,
         title=title,
         music_source="generate" if music is not None else "none",
@@ -129,7 +131,19 @@ def project_manifest(spec: RenderSpec) -> dict:
             "end": round(s.end, 2),
             "duration": round(s.duration, 2),
             "score": 0.0,
-            "orientation": s.orientation,
+            # `build_video.fit_filter` reads this ONE field to decide how to
+            # place the clip: equal to the canvas means crop-to-fill, any
+            # other value means blur-pad. So "fill" is expressed by telling
+            # the stage the segment already matches the canvas - which is
+            # exactly what it is being asked to treat it as. The true
+            # orientation is untouched on `SegmentRenderSpec`, which is what
+            # every artifact and the critic read.
+            #
+            # Without this, one vertical clip among landscape ones rendered
+            # as a narrow strip with blurred bars while the rest filled the
+            # frame, and the finished video did not read as one piece.
+            "orientation": (spec.canvas_orientation if spec.framing == "fill"
+                            else s.orientation),
             "slowmo": False,
             "mean_ydif": 0.0,
             "reason": "from the typed EditPlan",
@@ -229,7 +243,24 @@ def run_join(spec: RenderSpec, on_line=None, *, pool=None,
                               job_id=spec.job_id, timeout_s=timeout_s)
 
 
-def run_music(job_id: str, spec: RenderSpec, on_line=None) -> dict:
+def _cut_shape(spec: RenderSpec) -> tuple[float, list[float]]:
+    """How long the cut runs, and where its joins fall.
+
+    Each crossfade overlaps its neighbours, so the finished length is the
+    sum of the segments less one overlap per join - the same arithmetic
+    that makes a 30-second brief arrive as 28.4 seconds of video.
+    """
+    durs = [sg.duration for sg in spec.segments]
+    total = sum(durs) - max(0, len(durs) - 1) * spec.xfade_duration
+    marks, t = [], 0.0
+    for d in durs[:-1]:
+        t += d - spec.xfade_duration
+        marks.append(round(t, 3))
+    return max(0.1, round(total, 3)), marks
+
+
+def run_music(job_id: str, spec: RenderSpec, on_line=None,
+              music: "Music | None" = None) -> dict:
     """Stage 7, via the EXISTING extras.music_stage. No second audio engine.
 
     Must run after `join` and before `master`: `music_stage` measures
@@ -240,6 +271,22 @@ def run_music(job_id: str, spec: RenderSpec, on_line=None) -> dict:
     `RenderSpec.audio_settings()`. With `music_source="none"` this is a
     no-op that records a silent plan, which is exactly what a job with no
     Music artifact should get.
+
+    THE SCORE THE AGENT ACTUALLY ASKED FOR
+    --------------------------------------
+    `extras.MOODS` maps a mood to `--style lofi` or `--style bright` and
+    nothing else, so seven moods produced two scores and the same mood
+    produced a byte-identical wav every time - while the Music agent had
+    decided a tempo, an energy arc, an instrumentation and a per-beat
+    section plan that reached nothing.
+
+    So when there is a Music artifact to read, the score is rendered here
+    first, from all of it, and handed to `music_stage` down the path it
+    already has for an operator's own track. `prepare_track` still does
+    the fitting, `master_stage` still does the mix, and no protected file
+    changes. If the render fails for any reason the settings are left
+    exactly as they were and the mood-only engine runs, so this can make
+    the music better and cannot make the build silent.
     """
     settings = {
         "quality": _quality_for_crf(spec.crf),
@@ -247,8 +294,24 @@ def run_music(job_id: str, spec: RenderSpec, on_line=None) -> dict:
         "speed": "normal",
         **spec.audio_settings(),
     }
-    return extras_mod.music_stage(job_id, settings,
-                                  on_line or (lambda _l: None))
+    emit = on_line or (lambda _l: None)
+    plan: dict = {}
+    if music is not None and settings.get("music_source") == "generate":
+        from . import score_tools as _score
+        duration, marks = _cut_shape(spec)
+        wav, plan = _score.compose(music, job_id,
+                                   Path(spec.build_dir) / "_agent_score.wav",
+                                   duration, marks, on_line=emit)
+        if wav is not None:
+            settings["music_source"] = "upload"
+            settings["music_file"] = str(wav)
+
+    out = extras_mod.music_stage(job_id, settings, emit)
+    if plan:
+        # carried back so the trace can account for the score; a piece of
+        # music nobody can explain is no better than a random one
+        out = {**(out or {}), "score_plan": plan}
+    return out
 
 
 def run_master(job_id: str, spec: RenderSpec, on_line=None) -> dict:

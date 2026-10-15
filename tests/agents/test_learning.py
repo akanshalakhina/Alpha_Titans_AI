@@ -148,9 +148,28 @@ def history(**kw) -> LearningHistory:
 
 # -------------------- 1. what there is to learn from, in the real project
 
-def test_no_performance_report_can_be_a_usable_sample():
-    assert typing.get_args(PerformanceStatus) == ("unavailable",), \
-        "performance can now be measured - write the sample rule against it"
+def test_the_sample_rule_is_measured_and_non_zero():
+    """What counts as something to learn FROM.
+
+    This test used to assert that nothing could: `PerformanceStatus` had
+    one value and it was "unavailable". It has two now - an operator can
+    record the YouTube id of an upload and drop a warehouse export beside
+    it - so the rule has to be written out rather than assumed.
+
+    Both halves are load-bearing. "measured" keeps out the reports that
+    say they know nothing. "non-zero" keeps out a video that really was
+    published and really got nothing: that row is a true fact and a
+    useless one to compare against, and without this half thirty
+    unwatched uploads would open a gate that exists to keep conclusions
+    honest.
+    """
+    assert typing.get_args(PerformanceStatus) == ("unavailable", "measured")
+
+    import inspect
+    from agents.learning import _history
+    rule = inspect.getsource(_history)
+    assert 'payload.status == "unavailable"' in rule
+    assert "any(m.value > 0 for m in payload.measured)" in rule
 
 
 def test_the_schema_has_one_honest_state():
@@ -576,3 +595,89 @@ def test_the_projection_has_no_place_for_a_finding(learn_ctx, tracer_span):
     assert not set(out) & {"insights", "proposal", "proposals",
                            "correlation", "effect_size", "experiment"}
     json.dumps(out)
+
+
+# ================================ 9. the first outcomes it can learn from
+#
+# Until an operator could record an upload and drop a warehouse export
+# beside it, `_history` returned a hard-coded `usable = 0` and every gate
+# failed on the same number. These pin the rule that replaced it.
+
+from agents.artifacts import MeasuredMetric                 # noqa: E402
+
+
+def _measured(views=1000.0, window=30, vid="dQw4w9WgXcQ"):
+    return PerformanceAnalysis(
+        status="measured", provider="youtube_export", published=True,
+        video_id=vid, window_days=window,
+        measured=[MeasuredMetric(metric="views", value=views,
+                                 source="oct.csv")])
+
+
+def test_a_measured_non_zero_report_is_a_usable_sample(learn_ctx):
+    other_job(learn_ctx, "published01", _measured())
+    h = _history(learn_ctx.store, learn_ctx.job.job_id)
+    assert h.usable_samples == 1
+    assert h.samples_needed == MIN_HISTORY - 1
+
+
+def test_a_published_video_nobody_watched_is_not_a_sample(learn_ctx):
+    """A row of zeroes is a true fact about that video and a useless one
+    to compare against. Without this, thirty unwatched uploads would open
+    a gate that exists to keep conclusions honest."""
+    other_job(learn_ctx, "published01", _measured(views=0.0))
+    h = _history(learn_ctx.store, learn_ctx.job.job_id)
+    assert h.usable_samples == 0
+    assert h.zero_reports == 1
+    assert h.unreadable_reports == 0, "it was read perfectly well"
+
+
+def test_an_unavailable_report_is_still_not_a_sample(learn_ctx):
+    other_job(learn_ctx, "unpublished01")
+    h = _history(learn_ctx.store, learn_ctx.job.job_id)
+    assert h.usable_samples == 0 and h.unavailable_reports >= 1
+
+
+def test_the_widest_export_window_is_what_the_gate_reads(learn_ctx):
+    other_job(learn_ctx, "a", _measured(window=12, vid="aaaaaaaaaaa"))
+    other_job(learn_ctx, "b", _measured(window=45, vid="bbbbbbbbbbb"))
+    assert _history(learn_ctx.store, learn_ctx.job.job_id).window_days == 45
+
+
+def test_samples_short_of_the_bar_still_fail_the_gate(learn_ctx,
+                                                      tracer_span):
+    """Three real videos are three real videos, and still not thirty."""
+    for i in range(3):
+        other_job(learn_ctx, f"pub{i}", _measured(vid=f"vid{i:08d}xyz"[:11]))
+    p = run(learn_ctx, tracer_span).payload
+
+    assert p.status == "insufficient_data"
+    assert gate(p, "sufficient_history").state == "failed"
+    assert "3 usable" in gate(p, "sufficient_history").observed
+    assert gate(p, "cohort_size").state == "failed"
+
+
+def test_the_window_gate_reports_the_span_it_read(learn_ctx, tracer_span):
+    other_job(learn_ctx, "pub", _measured(window=12))
+    g = gate(run(learn_ctx, tracer_span).payload, "time_window")
+    assert g.state == "failed" and "12 day(s)" in g.observed
+
+
+def test_an_export_with_no_dates_says_no_span_could_be_read(learn_ctx,
+                                                            tracer_span):
+    other_job(learn_ctx, "pub", _measured(window=0))
+    g = gate(run(learn_ctx, tracer_span).payload, "time_window")
+    assert g.state == "failed" and "no span can be read" in g.observed
+
+
+def test_nothing_is_learned_however_many_samples_arrive(learn_ctx,
+                                                        tracer_span):
+    """The schema still cannot carry a finding. Counting samples is not
+    the same as drawing a conclusion from them, and the holdout,
+    practical-effect and human-approval gates are all still unevaluated."""
+    for i in range(3):
+        other_job(learn_ctx, f"pub{i}", _measured(vid=f"vid{i:08d}xyz"[:11]))
+    p = run(learn_ctx, tracer_span).payload
+    assert p.learned is False and p.configuration_changed is False
+    for g in ("holdout_validation", "practical_effect", "human_approval"):
+        assert gate(p, g).state == "not_evaluated"

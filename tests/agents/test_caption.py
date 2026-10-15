@@ -515,22 +515,38 @@ def test_a_line_cannot_say_nothing():
 
 # ------------------------------------- 7. one line, and it fits
 
-def test_a_phrase_too_wide_for_one_line_is_dropped(cap_ctx, tracer_span):
+def test_a_phrase_too_wide_for_one_line_is_cut_back(cap_ctx, tracer_span):
+    """It used to be dropped, and the segment lost its caption entirely.
+
+    On a real six-segment cut that cost two of three eligible beats their
+    words and only one line reached the screen. A prefix at a word boundary
+    is still the upstream's own text - the same thing `_extract` already
+    does on the deterministic path - so the line is cut back instead.
+    """
     ctx, clip_set = cap_ctx
     longest = "Watch the drive gear bite into the idler, tooth by tooth"
-    assert len(longest) > _max_chars(_engine_caption(), clip_set.canvas)
+    budget = _max_chars(_engine_caption(), clip_set.canvas)
+    assert len(longest) > budget
     ctx.llm = cap_llm({"captions": [{"beat": 1, "text": longest}]})
     p = full(ctx, tracer_span, clip_set).payload
-    assert p.lines == []
-    assert any("would not fit on one line" in x for x in p.limitations)
+
+    assert p.lines, "the beat must keep a caption"
+    line = p.lines[0].text
+    assert len(line) <= budget, "it still has to fit on one line"
+    assert longest.startswith(line.rstrip(",;:- ")),         "it must be a PREFIX of the upstream text, never a paraphrase"
+    assert any("cut back to their opening words" in x for x in p.limitations)
 
 
-def test_a_label_over_its_word_limit_is_dropped(cap_ctx, tracer_span):
+def test_a_label_over_its_word_limit_is_cut_back(cap_ctx, tracer_span):
+    """Same for the word cap: shorten to the limit rather than say nothing."""
     ctx, clip_set = cap_ctx
     six = "Every stage halves the speed and"
     assert len(six.split()) > WORD_CAP["short_label"]
     ctx.llm = cap_llm({"captions": [{"beat": 2, "text": six}]})
-    assert full(ctx, tracer_span, clip_set).payload.lines == []
+    p = full(ctx, tracer_span, clip_set).payload
+    assert p.lines, "the beat must keep a caption"
+    assert len(p.lines[0].text.split()) <= WORD_CAP["short_label"]
+    assert six.startswith(p.lines[0].text.rstrip(",;:- "))
 
 
 def test_the_artifact_rejects_a_line_wider_than_its_budget():

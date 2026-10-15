@@ -34,6 +34,29 @@ import config  # noqa: E402
 
 config.ensure_dirs()
 
+# Popping the keys above is not enough on its own. `config` loads the
+# project's .env on import - the two lines above run BEFORE that import -
+# and it uses `os.environ.setdefault`, so a real key in .env is put straight
+# back. On a machine with credentials configured, `LLMClient()` then
+# reported itself available and the fallback tests made live API calls and
+# failed, asserting a deterministic result against a reasoned one. Clearing
+# per test happens after every import, so nothing can re-inject them.
+_LLM_ENV = ("AT_LLM_API_KEY", "AT_VISION_API_KEY", "AT_LLM_PROVIDER",
+            "AT_LLM_MODEL", "AT_LLM_BASE_URL", "AT_VISION_PROVIDER",
+            "AT_VISION_MODEL", "AT_VISION_BASE_URL")
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_model():
+    """No test here may reach a real model. Injected transports still work."""
+    saved = {k: os.environ.pop(k, None) for k in _LLM_ENV}
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
 from agents.artifacts import (ClipAnalysis, ClipAnalysisSet, ClipMotion,  # noqa: E402
                               ClipTechnical, ClipUsability)
 from agents.render_pool import MediaPool  # noqa: E402

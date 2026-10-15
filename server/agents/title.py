@@ -71,6 +71,9 @@ PLACEHOLDER = JobSettings.model_fields["title"].default
 FUNCTION_WORDS = frozenset("""
 a an the and or but nor of to in on at for with without from by into onto
 out up down over under through about as than then so vs versus via per
+toward towards across between among against during after before upon
+within beyond near off again while because although until since
+amid along around behind beside inside outside past throughout
 this that these those it its it's is are was were be been being has have had
 do does did can could will would should may might
 i me my we us our you your he him his she her they them their
@@ -337,7 +340,14 @@ class TitleAgent(Agent):
                                     research if r_ok else None)
         span.tool("llm.complete_json", purpose="title",
                   prompt_chars=len(prompt))
-        raw, reply = ctx.llm.complete_json(prompt, max_tokens=700)
+        # 700 was enough for a model that answers straight away, and far too
+        # little for a reasoning model, which spends most of the output
+        # budget thinking before it writes anything. Measured against
+        # gpt-oss-120b this agent hit exactly 700/700 on every run and
+        # returned an empty `content`, so it fell back to a deterministic
+        # title every single time. 1400 matches Caption and Transition, the
+        # two agents with comparably sized replies.
+        raw, reply = ctx.llm.complete_json(prompt, max_tokens=1400)
         cost = Cost(tokens_in=reply.tokens_in, tokens_out=reply.tokens_out,
                     usd=reply.usd, wall_s=round(time.time() - started, 2))
         span.llm(reply.tokens_in, reply.tokens_out, reply.usd)

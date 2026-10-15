@@ -129,14 +129,28 @@ def test_invalid_timestamps_are_rejected(director_ctx, tracer_span, bad):
     assert "deterministic_planner" in art.fallback_used
 
 
-def test_a_repeated_clip_is_rejected(director_ctx, tracer_span):
+def test_a_repeated_clip_becomes_two_different_moments(director_ctx,
+                                                      tracer_span):
+    """A repeat used to be refused outright, which is why two uploads could
+    only ever make one cut. It is allowed now - but the second use must be a
+    DIFFERENT stretch of the clip, never the same frames again."""
     ctx, clip_set = director_ctx
     ctx.llm = llm_returning_plan(
         [{"clip_id": "02_lively.mp4", "target_seconds": 4.0, "reason": "a"},
          {"clip_id": "02_lively.mp4", "target_seconds": 4.0, "reason": "b"}])
     art = run(ctx, clip_set, tracer_span)
-    assert art.degraded is True
-    assert "more than once" in art.fallback_used
+    assert art.degraded is False, art.fallback_used
+    segs = art.payload.segments
+    assert segs, "the plan must not come back empty"
+    assert {s.clip_id for s in segs} == {"02_lively.mp4"}
+
+    # The guarantee is not "two segments" - a short clip may have no second
+    # window of that length free, and the extra use is then DROPPED rather
+    # than handed the same frames again. What must always hold is that no
+    # two segments share any footage.
+    spans = sorted((s.start, s.end) for s in segs)
+    for (a1, b1), (a2, b2) in zip(spans, spans[1:]):
+        assert a2 >= b1, f"{(a1, b1)} and {(a2, b2)} overlap"
 
 
 def test_a_transport_failure_falls_back(director_ctx, tracer_span):

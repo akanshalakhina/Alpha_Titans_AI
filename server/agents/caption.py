@@ -248,9 +248,33 @@ def _max_chars(engine: dict, canvas) -> int:
 
 # ---------------------------------------------------------------- words
 
+# Typographic characters a model reaches for, and the plain ones that mean
+# the same thing on screen. They are all `isprintable`, so the filter below
+# kept them, and a single U+2011 in "Watch the four-blade propeller whirl"
+# killed a whole render: `stage_cut` prints each caption, the child python
+# had cp1252 stdout, and the print raised UnicodeEncodeError. The subprocess
+# is now told to speak UTF-8 as well, but these belong in neither a log line
+# nor a burned-in caption - the render font often has no glyph for them.
+_TYPOGRAPHIC = {
+    # True HYPHENS join one word, so they close up: "four-blade".
+    "‐": "-", "‑": "-", "‒": "-", "−": "-",
+    # DASHES separate clauses, so they need their own air. Closing them up
+    # read as a compound word that was never written - an em dash in
+    # "Hear that snap - powers on" became "snap-powers on". The spaces
+    # collapse with the rest of the whitespace a few lines below.
+    "–": " - ", "—": " - ", "―": " - ",
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "“": '"', "”": '"', "„": '"', "‟": '"',
+    "…": "...",                                   # ellipsis
+    " ": " ", " ": " ", " ": " ", "​": "",
+}
+_TYPO_TABLE = str.maketrans(_TYPOGRAPHIC)
+
+
 def _clean(text: str, dropped) -> str:
     """What drawtext will actually show: one line, minus what esc() strips."""
-    s = "".join(ch if ch.isprintable() else " " for ch in text)
+    s = text.translate(_TYPO_TABLE)
+    s = "".join(ch if ch.isprintable() else " " for ch in s)
     for ch in dropped:
         s = s.replace(ch, "")
     return " ".join(s.split())
@@ -554,6 +578,7 @@ class CaptionAgent(Agent):
         chosen: dict = {}
         unsupported: list[str] = []
         bad_beat = not_eligible = no_words = ungrounded = too_long = 0
+        trimmed = 0
         timing = 0
         if isinstance(raw, list):
             for item in raw[:MAX_LINES]:
@@ -593,6 +618,19 @@ class CaptionAgent(Agent):
                     item.get("intent"), ("short_label", "key_phrase"),
                     "key_phrase")
                 text = _clean(found[1], b.dropped)
+                if text and (len(text) > b.max_chars
+                             or len(text.split()) > WORD_CAP[intent]):
+                    # Too long used to be DROPPED outright. A model that
+                    # overruns by a word then costs the segment its caption
+                    # entirely: on a real six-segment cut, two of three
+                    # eligible beats came back captionless and only one line
+                    # reached the screen. `_extract` already takes a prefix
+                    # at a word boundary for the deterministic path, so do
+                    # the same here - a prefix of the located span is still
+                    # the upstream's own words, never a paraphrase of them.
+                    text = _extract(found[1], intent, b.max_chars, b.dropped)
+                    if text:
+                        trimmed += 1
                 if not text or len(text) > b.max_chars \
                         or len(text.split()) > WORD_CAP[intent]:
                     too_long += 1
@@ -620,6 +658,9 @@ class CaptionAgent(Agent):
                          f"word in their beat's validated text and were "
                          f"dropped - no caption may say something upstream "
                          f"did not")
+        if trimmed:
+            notes.append(f"{trimmed} caption(s) overran the line and were cut "
+                         f"back to their opening words rather than dropped")
         if too_long:
             notes.append(f"{too_long} caption(s) would not fit on one line "
                          f"of {b.max_chars} characters, or ran past their "

@@ -163,6 +163,90 @@ class JobSettings(BaseModel):
     # demonstrated on real footage rather than asserted.
     force_opening_clip: str | None = None
 
+    # ── what the person actually asked for ────────────────────────────
+    # The operator's request, in their own words: "a fast 30 second
+    # cinematic cut, keep the gear mechanism, energetic music". Agents read
+    # it as INTENT, never as data: nothing here can set a timestamp, name a
+    # file or reach ffmpeg. The closed fields below are what the engine can
+    # actually honour; anything else the person says stays as free text for
+    # the reasoning agents to interpret, and is ignored by the deterministic
+    # fallbacks, which say so.
+    instruction: str = ""
+
+    # Dictated rather than typed. Kept separate from `instruction` so the UI
+    # can show which words came from speech, and so a transcript is never
+    # silently presented as something the person wrote.
+    voice_transcript: str = ""
+
+    # Each of these maps onto something the renderer or an agent really does.
+    # "auto" everywhere means "no preference" - the agent decides, exactly as
+    # it did before this existed.
+    style: Literal["auto", "cinematic", "fast", "minimal", "social",
+                   "story"] = "auto"
+    pacing: Literal["auto", "relaxed", "balanced", "fast"] = "auto"
+    # the music values are extras.MOODS, asserted equal by a parity test
+    music: Literal["auto", "none", "lofi", "calm", "bright", "upbeat", "beat",
+                   "energetic", "cinematic"] = "auto"
+    captions: Literal["auto", "off", "key_moments"] = "auto"
+    # NOT text-to-speech. Nothing in this project synthesises a voice, so the
+    # only honest options are "no narration" and "write the narration text".
+    voiceover: Literal["none", "text"] = "none"
+
+    # How a clip whose own orientation differs from the output canvas is
+    # placed on it. The renderer has exactly two treatments:
+    #
+    #   fill  crop to the canvas, so every segment fills the frame and the
+    #         finished video looks like one piece. A vertical clip in a
+    #         landscape canvas loses its top and bottom.
+    #   fit   scale the whole clip in and fill the sides with a blurred,
+    #         dimmed copy of itself. Nothing is cropped, but a mixed set
+    #         cuts between full-frame shots and a small letterboxed strip,
+    #         which does not read as one video.
+    #
+    # `fill` is the default because the common case is a phone roll with a
+    # stray clip in the other orientation, and one consistent frame matters
+    # more there than the edges of that one clip.
+    framing: Literal["fill", "fit"] = "fill"
+
+    @property
+    def spoken(self) -> str:
+        """Everything the person asked for, typed and dictated, as one brief."""
+        parts = [self.instruction.strip(), self.voice_transcript.strip()]
+        return "\n".join(p for p in parts if p)
+
+    @property
+    def has_request(self) -> bool:
+        return bool(self.spoken)
+
+    def brief(self) -> str:
+        """The whole request as one brief, for the reasoning agents.
+
+        The closed preferences are rendered as words here rather than left
+        as enum values nobody reads. `music` is deliberately NOT included:
+        it is applied as a hard override on the Music agent, so repeating it
+        as a suggestion would invite the model to argue with a decision that
+        has already been made.
+        """
+        lines: list[str] = []
+        if self.spoken:
+            lines.append(self.spoken)
+        wants = []
+        if self.style != "auto":
+            wants.append(f"a {self.style.replace('_', ' ')} treatment")
+        if self.pacing != "auto":
+            wants.append(f"{self.pacing} pacing")
+        if self.target_seconds:
+            wants.append(f"about {int(self.target_seconds)} seconds long")
+        if self.captions == "off":
+            wants.append("no on-screen captions")
+        elif self.captions == "key_moments":
+            wants.append("captions on the key moments only")
+        if self.voiceover == "text":
+            wants.append("narration written for it")
+        if wants:
+            lines.append("They also chose: " + ", ".join(wants) + ".")
+        return "\n\n".join(lines)
+
 
 class JobState(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -1514,6 +1598,13 @@ class RenderSpec(BaseModel):
     fps: int = 30
     xfade_duration: float = 0.4
     xfade_list: list[str] = Field(default_factory=lambda: ["fade"])
+    # "fill" crops a mismatched clip to the canvas; "fit" blur-pads it.
+    # See JobSettings.framing for why fill is the default.
+    framing: Literal["fill", "fit"] = "fill"
+
+    @property
+    def canvas_orientation(self) -> str:
+        return "vertical" if self.canvas[1] > self.canvas[0] else "horizontal"
     segments: list[SegmentRenderSpec]
     title: str = "ALPHA_TITANS"
 
@@ -2087,8 +2178,15 @@ class Publishing(BaseModel):
 # no data, WHICH metrics are therefore unmeasured and what each would need,
 # and which pre-publication signals were set aside rather than passed off as
 # performance.
-PerformanceStatus = Literal["unavailable"]
-AnalyticsProvider = Literal["none"]
+# "measured" exists only because there is now a path to real numbers: the
+# operator records the YouTube id of the upload, and a CSV exported from
+# their warehouse carries the totals. Every other state remains what it
+# was - nothing is estimated, modelled or predicted into this field.
+PerformanceStatus = Literal["unavailable", "measured"]
+# `youtube_export` is deliberately not called `youtube`: these numbers
+# came from a file the operator exported, not from an API this project
+# called, and the difference decides how fresh they can be assumed to be.
+AnalyticsProvider = Literal["none", "youtube_export"]
 PerformanceGapReason = Literal["not_published", "no_publishing_plan",
                                "no_video_reference", "no_analytics_provider"]
 PerformanceMetric = Literal[
@@ -2124,6 +2222,21 @@ class ExcludedSignal(BaseModel):
     why: str
 
 
+class MeasuredMetric(BaseModel):
+    """A metric that WAS read, with where it was read from.
+
+    The counterpart of `UnmeasuredMetric`, which has no value field on
+    purpose. This one carries a number, so it also carries its source:
+    a figure whose origin cannot be named is indistinguishable from a
+    guess, and the whole point of this artifact is that it never guesses.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    metric: PerformanceMetric
+    value: float
+    source: str                         # the export file the row came from
+
+
 class PerformanceAnalysis(BaseModel):
     """How the delivered video performed - which, today, nobody can know.
 
@@ -2139,7 +2252,15 @@ class PerformanceAnalysis(BaseModel):
 
     status: PerformanceStatus = "unavailable"
     provider: AnalyticsProvider = "none"
-    published: Literal[False] = False
+    # No longer `Literal[False]`: a build CAN be published now, and the
+    # operator says so by recording the video it became.
+    published: bool = False
+    # Which video, and over how many days the export covers it. Both are
+    # needed downstream: Learning's `time_window` gate is a span, and
+    # without the id a number belongs to nobody.
+    video_id: str = ""
+    window_days: int = 0
+    measured: list[MeasuredMetric] = Field(default_factory=list)
     # the publishing PLAN's status, when there is one - context for what the
     # operator does next, never a measure of reception
     publishing_status: PublishStatus | None = None
@@ -2153,7 +2274,35 @@ class PerformanceAnalysis(BaseModel):
     limitations: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
+    def _measured_says_what_and_whose(self):
+        """A measured report must carry a number and the video it is of.
+
+        An empty "measured" would be the worst of both: it reads to every
+        caller as real performance and contains nothing, so Learning would
+        count it as a usable sample of nothing at all.
+        """
+        if self.status != "measured":
+            return self
+        if not self.measured:
+            raise ValueError("a measured report must carry a metric")
+        if not self.video_id:
+            raise ValueError("a measured report must name the video")
+        if not self.published:
+            raise ValueError("a measured report describes a published video")
+        return self
+
+    @model_validator(mode="after")
     def _unavailable_says_why(self):
+        if self.status != "unavailable":
+            return self
+        # An unavailable report holding a figure is the exact failure this
+        # artifact was shaped to make impossible: it would read as real
+        # performance everywhere downstream while resting on nothing.
+        # Recording the upload is allowed here - `published` and
+        # `video_id` may be set before any export exists - but a NUMBER
+        # may not.
+        if self.measured:
+            raise ValueError("an unavailable report cannot carry a figure")
         reasons = [g.reason for g in self.gaps]
         if not reasons:
             raise ValueError("an unavailable report must say why")
@@ -2253,6 +2402,15 @@ class LearningHistory(BaseModel):
     performance_reports: int = Field(ge=0)
     unavailable_reports: int = Field(ge=0)
     unreadable_reports: int = Field(ge=0)
+    # Measured, but every figure is zero. Its own count rather than
+    # "unreadable": the report was read perfectly well and says the video
+    # got nothing, which is a fact about the video, not a fault in the
+    # data - and the person reading the gate should be told which.
+    zero_reports: int = Field(default=0, ge=0)
+    # The widest span any export covers, for the `time_window` gate. A
+    # total with no dates carries none, which is why the export is asked
+    # for MIN(date) and MAX(date).
+    window_days: int = Field(default=0, ge=0)
     usable_samples: int = Field(ge=0)
     samples_needed: int = Field(ge=0)
 

@@ -54,6 +54,15 @@ def run_pipeline_stage(stage: str, build_dir: str, src_dir: str | None = None,
         cmd += ["--src", src_dir]
     cmd += list(extra_args or [])
 
+    # Windows gives a child python cp1252 stdout, which cannot ENCODE most of
+    # what a model writes. `stage_cut` prints each segment's caption, so one
+    # non-breaking hyphen (U+2011) in "Watch the four-blade propeller whirl"
+    # raised UnicodeEncodeError inside a print and killed the whole render -
+    # a finished cut lost to a log line. The stage is told to speak UTF-8;
+    # anything already set by the caller wins.
+    env_overrides = dict(env_overrides or {})
+    env_overrides.setdefault("PYTHONIOENCODING", "utf-8")
+
     if pool is not None:
         return pool.run_process(cmd, env=env_overrides, on_line=on_line,
                                 timeout_s=timeout_s, job_id=job_id,

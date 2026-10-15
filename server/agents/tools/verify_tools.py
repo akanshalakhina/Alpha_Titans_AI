@@ -25,6 +25,7 @@ from pathlib import Path
 from .pipeline_bridge import build_video, config_mod, extras_mod
 
 FFMPEG = config_mod.FFMPEG
+FFPROBE = config_mod.FFPROBE
 
 
 # --------------------------------------------------------------- probing
@@ -55,12 +56,38 @@ def probe_final(path: str | Path) -> dict:
 
 
 def frame_count(path: str | Path) -> int | None:
-    """Count DECODED frames - existing extras.frame_count, unmodified.
+    """Count DECODED frames. Tries `extras.frame_count` first, unmodified.
 
-    Counting decoded frames rather than trusting the container duration is the
-    existing system's strongest verification idea and it is kept exactly.
+    Counting decoded frames rather than trusting the container duration is
+    the existing system's strongest verification idea, and it is kept.
+
+    WHY THERE IS A SECOND ATTEMPT
+    -----------------------------
+    `extras.frame_count` parses `-of csv=p=0` with `out.isdigit()`. On a file
+    carrying a display-matrix side data - which is every VERTICAL render this
+    pipeline produces - ffprobe appends an empty trailing field, so the output
+    is `"240,"` and `isdigit()` is False. The count is then None, the critic
+    reads that as a blocking failure, and a perfectly good vertical video is
+    sent round the revision loop twice before escalating.
+
+    extras.py is a protected file, so the repair lives here: fall back to a
+    tolerant parse of the same ffprobe answer. Horizontal renders are
+    unaffected - they still take the original path and return the same value.
     """
-    return extras_mod.frame_count(Path(path))
+    n = extras_mod.frame_count(Path(path))
+    if n is not None:
+        return n
+    rc, out = extras_mod.run([
+        FFPROBE, "-v", "error", "-count_frames", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_read_frames", "-of",
+        "default=nokey=1:noprint_wrappers=1", str(path)])
+    if rc != 0:
+        return None
+    for line in (out or "").splitlines():
+        token = line.strip().rstrip(",").strip()
+        if token.isdigit():
+            return int(token)
+    return None
 
 
 def loudness(path: str | Path) -> float | None:

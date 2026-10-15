@@ -34,8 +34,18 @@ def _spawn(src: Path, root: Path) -> subprocess.Popen:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ROOT / "server") + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
-    env.pop("AT_LLM_API_KEY", None)
-    env.pop("AT_VISION_API_KEY", None)
+    # EMPTY, not popped. Popping does not work: `config._load_dotenv` runs
+    # `os.environ.setdefault` over the real .env, so a key removed here is
+    # put straight back in the child and the job makes live model calls.
+    # This test is about the checkpoint surviving a kill, not about
+    # reasoning, and a live run is at the mercy of the provider's rate
+    # limit - once a refused call started waiting as long as Groq asked
+    # for, the child could no longer reach `editing_director` inside the
+    # 180s below and the test failed for a reason it does not test.
+    # `setdefault` leaves an existing empty value alone, and `_env` reads
+    # "" as absent, so the child runs its deterministic fallbacks offline.
+    env["AT_LLM_API_KEY"] = ""
+    env["AT_VISION_API_KEY"] = ""
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     return subprocess.Popen(
         [sys.executable, "-m", "agents.runner", "run",

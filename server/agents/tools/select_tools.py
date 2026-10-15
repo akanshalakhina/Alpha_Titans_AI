@@ -73,7 +73,8 @@ def clamp_length(clip: ClipAnalysis, wanted: float) -> tuple[float, list[str]]:
 
 def resolve_window(clip: ClipAnalysis, wanted_length: float,
                    min_mean_ydif: float | None = None,
-                   search_within: tuple[float, float] | None = None
+                   search_within: tuple[float, float] | None = None,
+                   avoid: list[tuple[float, float]] | None = None
                    ) -> tuple[float, float, float, list[str]]:
     """Turn a requested LENGTH into exact in/out points.
 
@@ -94,7 +95,15 @@ def resolve_window(clip: ClipAnalysis, wanted_length: float,
                          f"{lo:.1f}-{hi:.1f}s by a revision constraint")
             return a, b, s, notes
 
-    a, b, s = best_window(clip, length)
+    if avoid:
+        got = best_window_avoiding(clip, length, avoid)
+        if got is None:
+            notes.append(f"{clip.clip_id}: no {length:.1f}s left that does "
+                         f"not repeat a moment already used")
+            return 0.0, 0.0, 0.0, notes          # caller drops this segment
+        a, b, s = got
+    else:
+        a, b, s = best_window(clip, length)
 
     if min_mean_ydif is not None:
         got = _mean_ydif_over(clip, a, b)
@@ -128,6 +137,38 @@ def _restricted_best(clip: ClipAnalysis, length: float, lo: float, hi: float):
         s = window_score(clip, t, t + length)
         if best is None or s > best[2]:
             best = (round(t, 2), round(t + length, 2), round(s, 3))
+        t += 0.2
+    return best
+
+
+def _overlaps(a: float, b: float, taken) -> bool:
+    return any(a < hi and lo < b for lo, hi in taken)
+
+
+def best_window_avoiding(clip: ClipAnalysis, length: float, taken):
+    """The best window of `length` that does not overlap one already used.
+
+    One clip used to yield exactly one segment, so two clips meant two
+    shots and a single cut however "punchy" the brief asked for. Letting a
+    clip appear more than once only helps if each appearance is a DIFFERENT
+    moment - calling `best_window` again returns the same answer every
+    time - so the ranges already spent are stepped over here.
+
+    Returns None when nothing of this length is left, which the caller
+    reports rather than papering over with a repeat of the same frames.
+    """
+    if not taken:
+        return best_window(clip, length)
+    dur = clip.technical.duration
+    if length > dur:
+        return None
+    best = None
+    t = 0.0
+    while t + length <= dur + 1e-6:
+        if not _overlaps(t, t + length, taken):
+            s = window_score(clip, t, t + length)
+            if best is None or s > best[2]:
+                best = (round(t, 2), round(t + length, 2), round(s, 3))
         t += 0.2
     return best
 
@@ -272,6 +313,97 @@ def total_with_crossfades(durations: list[float], xfade: float) -> float:
 
 
 # ------------------------------------------------------ deterministic plan
+
+# A shot long enough to read, short enough that the top-up looks edited
+# rather than like one clip left running.
+TOP_UP_SHOT = 6.0
+# Below this there is nothing worth cutting to.
+TOP_UP_MIN = 2.0
+
+
+def top_up_to_target(clip_set: ClipAnalysisSet, segments: list[Segment],
+                     target_seconds: float | None) -> tuple[list[Segment],
+                                                            list[str]]:
+    """Add more moments until the cut is as long as the person asked for.
+
+    THE BUG THIS FIXES
+    ------------------
+    `pipeline/build_video.py` gives each clip ONE window and caps it at
+    `MAX_SEG = 12.0`, so a two-clip job can never exceed 24 seconds
+    however long a video was asked for. Every degraded run of a 30-second
+    brief came out at 23.6s, and a 25-second brief came out at 23.6s too -
+    the same number, because the target was never what decided it.
+
+    The reasoned planner does not have this problem: it takes several
+    moments from one clip (30s asked, 28.0s delivered over six cuts). So
+    the shortfall is not a shortage of footage, it is the fallback asking
+    for one window per clip. This takes more windows from the same clips,
+    stepping over what is already spent, exactly as the reasoned path
+    does.
+
+    Deliberately NOT done by raising `MAX_SEG`: one 15-second shot is a
+    clip left running, not an edit, and the cap is in a protected file.
+
+    Returns the lengthened list and a note for each addition, so a
+    degraded plan still says exactly how it reached its length.
+    """
+    if not target_seconds or not segments:
+        return segments, []
+    have = sum(s.duration for s in segments)
+    short = target_seconds - have
+    if short < TOP_UP_MIN:
+        return segments, []
+
+    by_id = {c.clip_id: c for c in clip_set.clips}
+    taken: dict[str, list[tuple[float, float]]] = {}
+    for s in segments:
+        taken.setdefault(s.clip_id, []).append((s.start, s.end))
+
+    # richest footage first, so the added moments are the best left
+    order = sorted((c for c in clip_set.clips if c.clip_id in by_id),
+                   key=lambda c: -(c.motion.mean_ydif or 0.0))
+    added: list[Segment] = []
+    notes: list[str] = []
+    progress = True
+    while short >= TOP_UP_MIN and progress:
+        progress = False
+        for clip in order:
+            if short < TOP_UP_MIN:
+                break
+            length = round(min(TOP_UP_SHOT, short), 2)
+            spot = best_window_avoiding(clip, length,
+                                        taken.get(clip.clip_id, []))
+            if spot is None:
+                continue                  # this clip has nothing left
+            st, en, sc = spot
+            taken.setdefault(clip.clip_id, []).append((st, en))
+            added.append(Segment(
+                index=1,                  # renumbered below
+                clip_id=clip.clip_id, start=st, end=en,
+                duration=round(en - st, 2), score=sc,
+                orientation=clip_set.orientation, caption="",
+                reason=(f"added to reach the {target_seconds:g}s asked for; "
+                        f"best unused window in this clip")))
+            short = round(short - (en - st), 2)
+            progress = True
+
+    if not added:
+        return segments, [
+            f"{short:.1f}s short of the {target_seconds:g}s asked for, and "
+            f"no unused window of {TOP_UP_MIN:g}s or more is left in any clip"]
+
+    # Keep each clip where the planner put it, and each clip's own moments
+    # in the order they happen - a cut that jumps backwards inside one clip
+    # reads as a mistake.
+    first_seen = {s.clip_id: i for i, s in enumerate(reversed(segments))}
+    merged = sorted(segments + added,
+                    key=lambda s: (-first_seen.get(s.clip_id, 0), s.start))
+    notes.append(f"{len(added)} moment(s) added to reach "
+                 f"{sum(s.duration for s in merged):.1f}s of the "
+                 f"{target_seconds:g}s asked for")
+    return ([s.model_copy(update={"index": i + 1})
+             for i, s in enumerate(merged)], notes)
+
 
 def deterministic_plan(build_dir: str, clip_set: ClipAnalysisSet,
                        target_seconds: float | None = None,

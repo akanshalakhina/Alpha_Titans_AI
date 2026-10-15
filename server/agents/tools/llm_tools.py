@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -60,15 +62,108 @@ class LLMReply:
     usd: float = 0.0
     error: str | None = None
     meta: dict = field(default_factory=dict)
+    # Why the model stopped. "length" means the answer was CUT OFF at
+    # max_tokens, which reads downstream as malformed JSON - a very
+    # different problem from a model that answered badly, and one the
+    # caller can only diagnose if it is told.
+    stop_reason: str | None = None
 
     @property
     def ok(self) -> bool:
         return self.error is None and bool(self.text)
 
+    @property
+    def truncated(self) -> bool:
+        return self.stop_reason in ("length", "max_tokens")
+
 
 def _env(key: str, default=None):
     v = os.environ.get(key)
     return v if v not in (None, "") else default
+
+
+def _retries() -> int:
+    """How many times a refused call is asked again.
+
+    Three was enough while `clip_analysis` took ten minutes: the pause gave
+    a per-minute token window all the time it needed to drain. Caching the
+    measurement took that accidental protection away - the agents now fire
+    seconds apart, and a run that overlapped another one had
+    ContentStrategy, Story, Music, Animation, Transition, Caption and the
+    EditingDirector all refused 429 and fall back, which on the
+    EditingDirector means the one-segment-per-clip planner and a video with
+    a single cut in it.
+
+    Five fits comfortably: with the backoff below that is about 60 seconds
+    of waiting against each agent's 300-second deadline.
+    """
+    try:
+        return max(0, min(8, int(_env("AT_LLM_RETRIES", 5))))
+    except (TypeError, ValueError):
+        return 5
+
+
+_RETRIES = _retries()
+
+# A refused vision call loses a whole clip from the story, so it is worth
+# far more waiting than a text call: with the backoff below, six retries
+# spend about 90 seconds against the Vision agent's 900-second deadline.
+# Observed need: an eight-minute clip was refused 503 four times running
+# while the short clip beside it succeeded, and every beat in the finished
+# story then came from the short one.
+VISION_RETRIES = 6
+
+# The ceiling a truncated call may be retried up to. High enough that a
+# reasoning model can think and still answer, low enough that a model stuck
+# in a loop cannot run the bill up.
+_MAX_RETRY_TOKENS = 4000
+
+
+# The total a single call may spend WAITING, across all its retries.
+#
+# Capping each individual wait at 30s threw away the one number that is
+# actually known to be right. Groq answers a rate limit with `Retry-After`
+# saying how long its token window really needs - sometimes 60s or more
+# when two runs are competing - and clamping that to 30s meant every
+# retry asked again while the window was still shut, spent all five
+# attempts inside a minute, and degraded the agent for a limit that would
+# have cleared had we simply waited as long as we were told to.
+#
+# So the provider's number is honoured, and a budget bounds the total
+# instead. 150s against each agent's 300s deadline leaves room for the
+# call itself plus the deterministic fallback: being killed on the
+# deadline is worse than falling back, because a killed node writes
+# nothing at all.
+_RETRY_BUDGET_S = 150.0
+
+
+def _retry_after(exc, attempt: int) -> float:
+    """How long to wait before asking again.
+
+    Providers say so in `Retry-After` when they know; Groq does on a rate
+    limit, and that figure beats any guess of ours - it is measured from
+    the window that actually refused us. Without it, back off 2s, 4s, 8s -
+    long enough for a per-minute token window to free up, short enough to
+    stay inside an agent's deadline.
+    """
+    hdr = ""
+    try:
+        hdr = (exc.headers.get("Retry-After") or "").strip()
+    except Exception:                                   # noqa: BLE001
+        hdr = ""
+    if hdr:
+        try:
+            # Returned WHOLE, not clipped to the budget. A provider asking
+            # for an hour is telling us the quota is spent, not that it
+            # wants us back in 150 seconds; clipping it would spend the
+            # entire budget on one hopeless sleep and still fall back. The
+            # caller refuses any wait it cannot afford, so an impossible
+            # number gives up at once and leaves the deadline to the
+            # deterministic answer. Bounded only against a nonsense header.
+            return max(0.5, min(86_400.0, float(hdr)))
+        except ValueError:
+            pass
+    return min(30.0, 2.0 * (2 ** attempt))
 
 
 def api_key() -> str | None:
@@ -80,6 +175,53 @@ def provider() -> str:
     return p if p in DEFAULT_MODEL else "anthropic"
 
 
+# A provider's DAILY allowance is spent per MODEL, so a model that has run
+# out is replaced, never waited for. Comma-separated, tried in order after
+# `AT_LLM_MODEL`.
+def fallback_models() -> list[str]:
+    seen, out = {model()}, []
+    for m in (x.strip() for x in (_env("AT_LLM_FALLBACK_MODELS") or "").split(",")):
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+_SPENT = re.compile(
+    r"on (?:tokens|requests) per day \(([TR]PD)\): Limit (\d+), Used (\d+)")
+
+
+def _daily_quota_spent(exc) -> str | None:
+    """Whether this 429 is the DAY's allowance rather than the minute's.
+
+    The difference decides whether waiting can possibly work, and the
+    provider only says which in the BODY. On 14 Oct every reasoning agent
+    degraded on 429 while `x-ratelimit-remaining-tokens` read 7,923 of
+    8,000 and a small probe answered 200 - because that header describes
+    the per-minute bucket and says nothing about the day:
+
+        Rate limit reached for model `openai/gpt-oss-120b` ... on
+        tokens per day (TPD): Limit 200000, Used 199159, Requested 1577
+
+    Small calls still fitted in the last ~840 tokens, so Caption and
+    Voiceover finished while Story and the EditingDirector could not,
+    which is what made a hard daily stop look intermittent. Each agent
+    then spent its whole retry budget waiting for a window that does not
+    reopen until tomorrow.
+
+    Returns a short description to carry into the trace, or None when the
+    refusal is the ordinary per-minute kind that waiting does clear.
+    """
+    try:
+        body = exc.read().decode("utf-8", "replace")[:2000]
+    except Exception:                                   # noqa: BLE001
+        return None
+    m = _SPENT.search(body)
+    if m:
+        return f"{m.group(1)} spent ({m.group(3)}/{m.group(2)})"
+    return "daily quota spent" if "per day" in body.lower() else None
+
+
 def model() -> str:
     return _env("AT_LLM_MODEL") or _env("AT_VISION_MODEL") or DEFAULT_MODEL[provider()]
 
@@ -87,6 +229,33 @@ def model() -> str:
 def base_url() -> str:
     return (_env("AT_LLM_BASE_URL") or _env("AT_VISION_BASE_URL")
             or DEFAULT_BASE[provider()]).rstrip("/")
+
+
+def vision_profile() -> dict | None:
+    """The model to use for a call that carries IMAGES, when it differs.
+
+    The Vision agent calls this shared client like every other agent, so
+    without this it sent base64 frames to whatever `AT_LLM_MODEL` names. A
+    text-only model rejects them outright - Groq's gpt-oss answers
+    "messages[0].content must be a string" - so every clip failed, Vision
+    degraded to measurements, and the cascade took Story's beats with it:
+    Voiceover, Caption and Transition all fell back for want of a beat.
+    Meanwhile a perfectly good vision model sat configured in AT_VISION_*,
+    which only the legacy `server/vision.py` ever read.
+
+    Returns None when no separate vision model is configured, so a single
+    multimodal key keeps behaving exactly as it did.
+    """
+    key, mdl = _env("AT_VISION_API_KEY"), _env("AT_VISION_MODEL")
+    if not (key and mdl):
+        return None
+    prov = (_env("AT_VISION_PROVIDER") or "openai").lower()
+    if prov not in DEFAULT_MODEL:
+        prov = "openai"
+    base = (_env("AT_VISION_BASE_URL") or DEFAULT_BASE[prov]).rstrip("/")
+    if mdl == model() and base == base_url() and key == api_key():
+        return None                 # same model either way; nothing to switch
+    return {"key": key, "model": mdl, "provider": prov, "base_url": base}
 
 
 def timeout_s() -> float:
@@ -132,11 +301,17 @@ class LLMClient:
     # ------------------------------------------------------------- calls
 
     def complete(self, prompt: str, max_tokens: int = 1600,
-                 images: list[str] | None = None) -> LLMReply:
+                 images: list[str] | None = None,
+                 retries: int | None = None) -> LLMReply:
         """One call. `images` are base64 JPEGs, for the vision path.
 
         The injected transport is given the images too, so a test can assert
         what the model was actually shown without a key or a network.
+
+        `retries` lets a caller buy more patience than the default. A
+        refused VISION call costs a whole clip - nothing downstream can
+        ground a beat in footage nobody looked at - so the Vision agent
+        asks for more, and it has a 900s deadline to spend.
         """
         if self._transport is not None:
             try:
@@ -146,14 +321,74 @@ class LLMClient:
                 return self._transport(prompt, max_tokens)
         if not api_key():
             return LLMReply(text="", error="no API key configured")
-        try:
-            return self._http(prompt, max_tokens, images)
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError,
-                json.JSONDecodeError, TimeoutError, KeyError, ValueError) as exc:
-            return LLMReply(text="", error=f"{type(exc).__name__}: {exc}")
+        # 429 and 503 are TRANSIENT and routine on a free tier, not answers.
+        # Groq allows 8,000 tokens a minute; the agents fire back to back, so
+        # ContentStrategy + Story + Voiceover + Animation alone spent 8,880 in
+        # half a minute and Music, Transition, Caption and the EditingDirector
+        # were all refused - each one degrading a finished video for a limit
+        # that clears itself seconds later. Gemini answers 503 the same way
+        # when a model is busy. Waiting and asking again is the whole fix.
+        last = None
+        tries = _RETRIES if retries is None else max(0, min(8, int(retries)))
+        # The configured model, then its stand-ins. Images are excluded:
+        # they must go to the vision model `_http` picks, and a text model
+        # given base64 frames fails differently and for a different reason.
+        chain: list[str | None] = [None]
+        if not images:
+            chain += fallback_models()
+        spent: list[str] = []
+
+        for alt in chain:
+            waited = 0.0
+            for attempt in range(tries + 1):
+                try:
+                    reply = self._http(prompt, max_tokens, images, alt)
+                    if spent:
+                        # the trace must show that the answer came from a
+                        # stand-in, not from the model that was configured
+                        reply.meta = {**(reply.meta or {}),
+                                      "after_quota_spent": spent}
+                    return reply
+                except urllib.error.HTTPError as exc:
+                    last = exc
+                    note = (_daily_quota_spent(exc) if exc.code == 429
+                            else None)
+                    if note:
+                        # No pause inside one run reaches tomorrow. Move to
+                        # the next model instead of spending this agent's
+                        # whole budget learning that again.
+                        spent.append(f"{alt or model()}: {note}")
+                        break
+                    if exc.code not in (429, 503) or attempt == tries:
+                        return LLMReply(text="",
+                                        error=f"{type(exc).__name__}: {exc}")
+                    pause = _retry_after(exc, attempt)
+                    if waited + pause > _RETRY_BUDGET_S:
+                        # Stopping here is deliberate. Sleeping past the
+                        # budget would see the agent killed on its deadline
+                        # with nothing written; giving up now leaves time
+                        # for the deterministic fallback, and says how long
+                        # we waited so the trace shows a busy provider
+                        # rather than a broken one.
+                        return LLMReply(
+                            text="",
+                            error=f"{type(exc).__name__}: {exc} "
+                                  f"(gave up after {waited:.0f}s of waiting)")
+                    time.sleep(pause)
+                    waited += pause
+                except (urllib.error.URLError, OSError, json.JSONDecodeError,
+                        TimeoutError, KeyError, ValueError) as exc:
+                    return LLMReply(text="",
+                                    error=f"{type(exc).__name__}: {exc}")
+
+        err = f"{type(last).__name__}: {last}" if last else "no reply"
+        if spent:
+            err += " (" + "; ".join(spent) + ")"
+        return LLMReply(text="", error=err)
 
     def complete_json(self, prompt: str, max_tokens: int = 1600,
-                      images: list[str] | None = None) -> tuple[Any, LLMReply]:
+                      images: list[str] | None = None,
+                      retries: int | None = None) -> tuple[Any, LLMReply]:
         """Call, then pull a JSON value out of whatever came back.
 
         Reuses vision._json_from, which walks the reply for a balanced JSON
@@ -161,17 +396,70 @@ class LLMClient:
         Returns (parsed_or_None, reply) - a None here is a normal, expected
         outcome that the caller must handle by falling back.
         """
-        reply = self.complete(prompt, max_tokens, images)
+        reply = self.complete(prompt, max_tokens, images, retries)
+        parsed = _vision._json_from(reply.text) if reply.text else None
+
+        # This check sits BEFORE the `ok` gate on purpose. A reasoning model
+        # that runs out of budget mid-thought returns finish_reason "length"
+        # with an EMPTY `content` - the tokens all went to its hidden
+        # reasoning - so `ok` is False and an early return here would skip
+        # the diagnosis entirely. That is what happened: the Title agent
+        # asked for 700 tokens, used all 700, received "" and reported "not
+        # a JSON object", blaming the model's formatting for what was
+        # actually too small an output budget.
+        # Cut off with nothing to show for it: ask once more with room.
+        #
+        # A reasoning model spends a VARIABLE amount of the output budget
+        # thinking before it writes, so a fixed cap that fits one prompt
+        # starves another. Caption and Title both used exactly their 1400
+        # and returned an empty `content`, while Story used 1524 of 2000
+        # and was fine - the same cap, two different outcomes. Guessing a
+        # bigger number per agent would just move the cliff, so the budget
+        # is doubled once, here, when the reply was truncated before any
+        # JSON appeared. It costs a second call only on a reply that was
+        # going to be thrown away.
+        if parsed is None and reply.truncated and max_tokens < _MAX_RETRY_TOKENS:
+            wider = min(max_tokens * 2, _MAX_RETRY_TOKENS)
+            retried = self.complete(prompt, wider, images, retries)
+            if retried.text:
+                parsed = _vision._json_from(retried.text)
+            if parsed is not None:
+                retried.meta = {**(retried.meta or {}),
+                                "widened_from": max_tokens}
+                return parsed, retried
+            reply = retried
+            max_tokens = wider
+
+        if parsed is None and reply.truncated and not reply.error:
+            reply.error = (f"the reply was cut off at the {max_tokens}-token "
+                           f"output limit before any JSON was written")
         if not reply.ok:
             return None, reply
-        return _vision._json_from(reply.text), reply
+        return parsed, reply
 
     # ------------------------------------------------------------- http
 
     def _http(self, prompt: str, max_tokens: int,
-              images: list[str] | None = None) -> LLMReply:
+              images: list[str] | None = None,
+              model_override: str | None = None) -> LLMReply:
         key, prov = api_key(), provider()
-        headers = {"Content-Type": "application/json"}
+        use_model, use_base = model_override or model(), base_url()
+        # A call carrying images goes to the vision model when one is
+        # configured separately - see `vision_profile` for why.
+        vp = vision_profile() if images else None
+        if vp:
+            key, prov = vp["key"], vp["provider"]
+            use_model, use_base = vp["model"], vp["base_url"]
+        # A User-Agent is not optional in practice. urllib sends
+        # "Python-urllib/3.x" by default, and Cloudflare-fronted inference
+        # endpoints reject that signature outright: Groq's OpenAI-compatible
+        # endpoint answers 403 "error code: 1010" to the exact headers built
+        # below and 200 to the identical request with any UA set. The failure
+        # looks like a dead API key, so every agent fell back to its
+        # deterministic path and reported "no model configured" while a
+        # perfectly valid key sat in the environment.
+        headers = {"Content-Type": "application/json",
+                   "User-Agent": _env("AT_LLM_USER_AGENT", "alpha-titans/1.0")}
         if prov == "anthropic":
             headers["x-api-key"] = key
             headers["anthropic-version"] = _env("AT_VISION_API_VERSION",
@@ -186,7 +474,7 @@ class LLMClient:
                                        "media_type": "image/jpeg",
                                        "data": b}} for b in images]
                 content.append({"type": "text", "text": prompt})
-            body = {"model": model(), "max_tokens": max_tokens,
+            body = {"model": use_model, "max_tokens": max_tokens,
                     "messages": [{"role": "user", "content": content}]}
         else:
             headers["Authorization"] = f"Bearer {key}"
@@ -198,10 +486,10 @@ class LLMClient:
                                           f"data:image/jpeg;base64,{b}"}}
                            for b in images]
                 content.append({"type": "text", "text": prompt})
-            body = {"model": model(), "max_tokens": max_tokens,
+            body = {"model": use_model, "max_tokens": max_tokens,
                     "messages": [{"role": "user", "content": content}]}
 
-        req = urllib.request.Request(base_url() + path,
+        req = urllib.request.Request(use_base + path,
                                      data=json.dumps(body).encode(),
                                      headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=timeout_s()) as r:
@@ -214,16 +502,18 @@ class LLMClient:
             usage = data.get("usage") or {}
             tin = int(usage.get("input_tokens") or 0)
             tout = int(usage.get("output_tokens") or 0)
+            stop = data.get("stop_reason")
         else:
-            text = ((data.get("choices") or [{}])[0].get("message") or {}
-                    ).get("content", "")
+            choice = (data.get("choices") or [{}])[0]
+            text = (choice.get("message") or {}).get("content", "")
             usage = data.get("usage") or {}
             tin = int(usage.get("prompt_tokens") or 0)
             tout = int(usage.get("completion_tokens") or 0)
+            stop = choice.get("finish_reason")
 
         return LLMReply(text=text, tokens_in=tin, tokens_out=tout,
-                        usd=_price(tin, tout),
-                        meta={"provider": prov, "model": model()})
+                        usd=_price(tin, tout), stop_reason=stop,
+                        meta={"provider": prov, "model": use_model})
 
 
 __all__ = ["LLMClient", "LLMReply", "api_key", "provider", "model"]

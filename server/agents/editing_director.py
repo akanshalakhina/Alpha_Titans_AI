@@ -74,7 +74,16 @@ should be on screen. Open on whatever will hold a viewer.
 
 RULES
 - Use ONLY these exact clip ids: {names}
-- Use each clip at most once.
+- A clip MAY be used more than once, as separate moments from it.
+  Each use must be a different part of the clip showing something
+  new - never the same action twice. A long clip usually has two or
+  three distinct moments worth cutting to; a short one often has
+  only the one. Deterministic code picks the exact frames and will
+  not give you the same stretch twice, so ask only for as many as
+  the clip can genuinely carry.
+- Prefer more, shorter segments when the brief asks for pace: a cut
+  every few seconds is what makes a reel feel fast. With only one or
+  two uploads that means returning to the same clip.
 - target_seconds must be between {min_seg} and {max_seg}, and never longer
   than the clip itself.
 - You do NOT choose timestamps. A deterministic window search picks the exact
@@ -205,7 +214,14 @@ class EditingDirectorAgent(Agent):
                 ST.deterministic_plan, ctx.job.build_dir, clip_set,
                 clip_set.target_seconds, "hook", ctx.emit,
                 pool=ctx.pool, job_id=ctx.job.job_id)
-            notes = []
+            # That planner gives each clip one window, capped at 12s, so a
+            # two-clip job answered every request from 25s upward with the
+            # same 23.6s video. Take more moments from the same footage
+            # until the length asked for is met.
+            segments, notes = ST.top_up_to_target(
+                clip_set, segments, clip_set.target_seconds)
+            for line in notes:
+                ctx.emit(f"plan: {line}")
             decisions.append(Decision(
                 what="Editing strategy",
                 chose="deterministic planner (sqrt-weighted motion budget)",
@@ -742,8 +758,11 @@ class EditingDirectorAgent(Agent):
             if cid not in known:
                 return False, (f"segment {i + 1} names {cid!r}, which was "
                                f"never uploaded")
-            if cid in seen:
-                return False, f"{cid!r} appears more than once"
+            # A repeat is allowed now: it is the only way two uploads become
+            # more than one cut. `_segments_from_proposal` gives each use a
+            # DIFFERENT window and drops the use outright when the clip has
+            # no unused stretch of that length left, so a repeat can never
+            # put the same frames on screen twice.
             seen.add(cid)
 
             ts = s.get("target_seconds")
@@ -769,6 +788,13 @@ class EditingDirectorAgent(Agent):
         notes: list[str] = []
         min_open = constraints.get("opening_min_mean_ydif")
 
+        # Ranges already spent, per clip. A clip may now appear more than
+        # once - that is the only way two uploads become more than one cut -
+        # but each appearance has to be a DIFFERENT moment, and
+        # `best_window` returns the same answer every time it is asked. The
+        # spent ranges are handed back so the next one steps over them.
+        used: dict[str, list[tuple[float, float]]] = {}
+
         for i, s in enumerate(proposal["segments"]):
             clip = clip_set.by_id(s["clip_id"])
             if clip is None or not clip.usability.usable:
@@ -777,12 +803,20 @@ class EditingDirectorAgent(Agent):
                 continue
 
             want = float(s["target_seconds"])
+            taken = used.get(clip.clip_id) or []
             span.tool("select.best_window", clip=clip.clip_id,
-                      requested_length=round(want, 2))
+                      requested_length=round(want, 2),
+                      already_used=len(taken))
             start, end, score, wnotes = ST.resolve_window(
                 clip, want,
-                min_mean_ydif=min_open if i == 0 else None)
+                min_mean_ydif=min_open if i == 0 else None,
+                avoid=taken or None)
             notes.extend(wnotes)
+            if end <= start:
+                # nothing of that length left in the clip that is not a
+                # repeat; reported in `wnotes`, so just move on
+                continue
+            used.setdefault(clip.clip_id, []).append((start, end))
 
             segments.append(Segment(
                 index=len(segments) + 1, clip_id=clip.clip_id,

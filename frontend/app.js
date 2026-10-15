@@ -12,6 +12,34 @@
    step ever pairs this script with an older index.html, a missing #id must
    not crash the app: it gets a detached placeholder (so assignments are
    harmless), a warning is logged once, and the user is told to reload. */
+// versioned like the other assets: a cached copy of this module after
+// an update would leave the page running last release's studio
+import { initStudio } from './studio.js?v=24';
+
+/* The studio shell (overview, production workspace, agents, runs, health).
+   Lazy: it makes no requests until a studio view is first shown. The create
+   wizard below is unchanged - studio views and the wizard simply take turns
+   owning the screen. */
+let studio = null;
+
+function showStudio(view) {
+  const v = document.querySelector('#sxView');
+  const app = document.querySelector('.app');
+  if (!v || !studio) return;
+  app.hidden = true;
+  v.classList.add('on');
+  studio.show(view);
+}
+
+function showCreate() {
+  const v = document.querySelector('#sxView');
+  const app = document.querySelector('.app');
+  if (v) v.classList.remove('on');
+  if (app) app.hidden = false;
+  if (studio) studio.hide();
+  goto(state.step || 1);
+}
+
 const UI_VERSION = '5';
 const _missing = new Set();
 const $ = (s, r = document) => {
@@ -297,7 +325,11 @@ async function ensureJob() {
 }
 
 function wireChrome() {
-  $('#newBuild').onclick = () => newBuild();
+  studio = initStudio({ onCreateClick: () => { showCreate(); newBuild(); } });
+  // the wizard starts hidden behind the studio overview; the brand mark and
+  // every sidebar entry switch between them
+  if (studio) showStudio('create');
+  $('#newBuild').onclick = () => { showCreate(); newBuild(); };
   $('#brandBtn').onclick = openDrawer;
   $('#libraryBtn').onclick = openDrawer;
   $('#drawerClose').onclick = closeDrawer;

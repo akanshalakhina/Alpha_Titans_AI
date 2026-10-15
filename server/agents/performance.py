@@ -48,10 +48,12 @@ import time
 from pathlib import Path
 
 from .artifacts import (Artifact, Cost, CriticResult, Decision,
-                        ExcludedSignal, JobSettings, PerformanceAnalysis,
+                        ExcludedSignal, JobSettings, MeasuredMetric,
+                        PerformanceAnalysis,
                         PerformanceGap, PublishAsset, Publishing,
                         ResearchReport, Title, UnmeasuredMetric)
 from .base import Agent, AgentContext
+from .tools import analytics_store as AS
 from .publishing import _code
 from .trace import TraceSpan
 
@@ -89,6 +91,16 @@ NEEDS: dict[str, str] = {
     "revenue": ("the channel owner's analytics on a monetised channel, "
                 "with the owner's OAuth consent - nothing in this project "
                 "has channel access"),
+}
+
+
+# Which column of the warehouse export answers which metric. Only these
+# four: the daily table carries no impressions, no click-through rate, no
+# retention and no revenue, so those stay UNMEASURED even in a measured
+# report rather than being reported as zero.
+FROM_EXPORT: dict[str, str] = {
+    "views": "views", "watch_time": "watch_minutes",
+    "likes": "likes", "subscribers_gained": "subs_gained",
 }
 
 
@@ -226,13 +238,27 @@ class PerformanceAnalysisAgent(Agent):
                   status=publishing.status if publishing else None)
         excluded = _excluded(publishing, critic, research, title)
 
+        # The video the operator recorded, and the export that may carry
+        # it. Both go into the hash: a report must be recomputed when a
+        # fresher CSV is dropped in, or the person would keep being shown
+        # last month's numbers.
+        reference = AS.load_reference(ctx.job.build_dir)
+        export = AS.read_export(AS.export_dir()) if reference else AS.Export()
+        row = export.by_id(reference["video_id"]) if reference else None
+        span.tool("performance.read_analytics_export",
+                  recorded=bool(reference), files=len(export.files),
+                  matched=row is not None)
+
         inputs_hash = self.hash_inputs(
             ctx.job.job_id,
             (publishing.status, publishing.published,
              [c.check for c in publishing.checks if not c.passed])
             if publishing else None,
             scan, refs, [(e.artifact, e.signal) for e in excluded],
-            sorted(NEEDS))
+            sorted(NEEDS),
+            reference["video_id"] if reference else None,
+            (row.views, row.watch_minutes, row.likes, row.subs_gained,
+             row.first_day, row.last_day) if row else None)
         cached = ctx.store.get_by_inputs(ctx.job.job_id, "PerformanceAnalysis",
                                          inputs_hash, PerformanceAnalysis)
         if cached is not None:
@@ -242,6 +268,40 @@ class PerformanceAnalysisAgent(Agent):
                       "are unchanged")
             span.skipped("cache hit - upstream inputs identical")
             return cached
+
+        # ---- the measured path, when there is something to measure ----
+        if row is not None:
+            measured = [MeasuredMetric(metric=m, value=float(getattr(row, col)),
+                                       source=row.source_file)
+                        for m, col in FROM_EXPORT.items()]
+            payload = PerformanceAnalysis(
+                status="measured", provider="youtube_export", published=True,
+                video_id=row.video_id, window_days=row.window_days,
+                measured=measured,
+                publishing_status=publishing.status if publishing else None,
+                # everything the daily table does not carry stays named as
+                # absent, so a measured report is not read as complete
+                unmeasured=[UnmeasuredMetric(metric=m, needs=n)
+                            for m, n in NEEDS.items()
+                            if m not in FROM_EXPORT],
+                excluded_signals=excluded,
+                platform_capabilities=_capabilities(scan, refs),
+                next_steps=[],
+                limitations=[
+                    f"totals exported from the operator's warehouse "
+                    f"({row.source_file}), not read live from any API - "
+                    f"they are as fresh as that export",
+                    f"the export covers {row.window_days} day(s); a metric "
+                    f"is only mature some days after publication",
+                ])
+            ctx.emit(f"performance: measured from {row.source_file} - "
+                     f"{int(row.views)} view(s) on {row.video_id}")
+            return self.wrap(
+                ctx, payload, revision=revision, inputs_hash=inputs_hash,
+                span=span,
+                decisions=self._decisions(payload, publishing, "measured"),
+                confidence=1.0, degraded=False,
+                cost=Cost(wall_s=round(time.time() - started, 2)))
 
         gaps = self._gaps(publishing, scan, refs)
         payload = PerformanceAnalysis(

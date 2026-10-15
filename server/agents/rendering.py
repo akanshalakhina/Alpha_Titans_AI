@@ -70,7 +70,10 @@ class RenderingAgent(Agent):
             job_id=job.job_id, build_dir=job.build_dir, src_dir=job.src_dir,
             plan=plan, quality=job.settings.quality,
             xfade_duration=job.settings.transition_duration,
-            title=job.settings.title, music=music)
+            framing=job.settings.framing,
+            # the operator asking for no music beats any mood the agent chose
+            title=job.settings.title,
+            music=None if job.settings.music == "none" else music)
         inputs_hash = self.hash_inputs(spec.model_dump(mode="json"))
 
         # ---- projection: typed plan -> the interface ffmpeg reads ---------
@@ -120,8 +123,19 @@ class RenderingAgent(Agent):
                   music_source=spec.music_source, mood=spec.mood,
                   keep_audio=spec.keep_audio)
         with _outputs_root(job.build_dir):
-            audio = ctx.pool.run(RT.run_music, job.job_id, spec, ctx.emit)
+            # the whole Music artifact, not just its mood: the tempo, the
+            # energy arc and the section plan all choose engine settings
+            audio = ctx.pool.run(RT.run_music, job.job_id, spec, ctx.emit,
+                                 music)
         track = (audio or {}).get("track")
+        score_plan = (audio or {}).get("score_plan") or {}
+        if score_plan.get("bpm"):
+            span.tool("score.compose", style=score_plan["style"],
+                      bpm=score_plan["bpm"], root_midi=score_plan["root_midi"],
+                      seed=score_plan["seed"])
+        elif score_plan.get("error"):
+            span.note(f"the agent's score could not be rendered "
+                      f"({score_plan['error']}); the mood-only engine ran")
         decisions.append(Decision(
             what="Audio bed",
             chose=(f"{spec.music_source}"
@@ -160,11 +174,28 @@ class RenderingAgent(Agent):
 
         # ---- what was actually produced ----------------------------------
         probe = VT.probe_final(video_path)
+
+        # master_stage counts frames with extras.frame_count, which cannot
+        # read a rotated (vertical) render: ffprobe appends an empty CSV
+        # field and the count comes back None. extras.py is protected, so
+        # recount here with the tolerant reader rather than record a verified
+        # file as unverified. Horizontal renders already had a count and keep
+        # it untouched.
+        frames = meta.get("frames")
+        frames_ok = bool(meta.get("frames_ok"))
+        expected = meta.get("frames_expected")
+        if frames is None:
+            frames = VT.frame_count(video_path)
+            if frames is not None:
+                span.note(f"frame count recovered by re-reading the file "
+                          f"({frames}); the master stage could not parse it")
+                frames_ok = (expected is None) or (frames >= int(expected) * 0.98)
+
         technical = RenderTechnical(
             duration=probe["duration"],
-            frames=meta.get("frames"),
-            frames_expected=meta.get("frames_expected"),
-            frames_ok=bool(meta.get("frames_ok")),
+            frames=frames,
+            frames_expected=expected,
+            frames_ok=frames_ok,
             width=probe["width"], height=probe["height"], fps=probe["fps"],
             video_codec=probe["video_codec"], audio_codec=probe["audio_codec"],
             size=probe["size"], lufs=meta.get("lufs"),

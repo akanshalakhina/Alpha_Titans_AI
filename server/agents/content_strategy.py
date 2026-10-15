@@ -70,7 +70,7 @@ owns the edit, and they are good at it.
 
 SUBJECT
 {subject}
-
+{brief}
 {vision}
 {research}
 YOUR TASK
@@ -184,7 +184,8 @@ class ContentStrategyAgent(Agent):
         # Deliberately no time bucket. Research goes stale on the clock; a
         # strategy goes stale when what it was derived from changes.
         inputs_hash = self.hash_inputs(
-            domain, sorted(names), PROMPT_VERSION, ldesc.get("model"),
+            domain, ctx.job.settings.brief(), sorted(names), PROMPT_VERSION,
+            ldesc.get("model"),
             ldesc.get("provider"),
             vision_hash or self._vision_digest(vision),
             research_hash or self._research_digest(research),
@@ -205,7 +206,8 @@ class ContentStrategyAgent(Agent):
                 started, inputs_hash, v_ok, r_ok,
                 why=(ldesc.get("why_disabled") or "no model configured"))
 
-        prompt = self._build_prompt(domain, clip_set, vision, research, names)
+        prompt = self._build_prompt(domain, clip_set, vision, research, names,
+                                    ctx.job.settings.brief())
         span.tool("llm.complete_json", purpose="content-strategy",
                   vision=v_ok, research=r_ok, prompt_chars=len(prompt))
         raw, reply = ctx.llm.complete_json(prompt, max_tokens=1800)
@@ -245,7 +247,7 @@ class ContentStrategyAgent(Agent):
     def _build_prompt(self, domain: str, clip_set: ClipAnalysisSet,
                       vision: VisionAnalysis | None,
                       research: ResearchReport | None,
-                      names: list[str]) -> str:
+                      names: list[str], brief: str = "") -> str:
         """Both upstreams, digested - never dumped in as raw JSON.
 
         Blind JSON pasting is how an agent ends up reasoning over fields it
@@ -256,9 +258,27 @@ class ContentStrategyAgent(Agent):
             subject=(domain if domain else
                      "not stated by the operator - infer it from the material "
                      "below, and say so in `limitations`"),
+            brief=self._brief_section(brief),
             vision=self._vision_section(vision, clip_set),
             research=self._research_section(research),
             names=", ".join(names) or "(none)")
+
+    @staticmethod
+    def _brief_section(brief: str) -> str:
+        """What the operator asked for, in their own words.
+
+        Rendered as INTENT, never as data. The rules below already forbid
+        inventing clip ids and timestamps, and nothing in here can create
+        one: this section is read for what the video should be, not for
+        facts about the footage.
+        """
+        if not brief:
+            return ""
+        return ("\nWHAT THE OPERATOR ASKED FOR\n"
+                "Their own words. Treat it as the brief you are working to.\n"
+                "It describes intent only - it cannot tell you what is in the\n"
+                "footage, and any clip id or timestamp in it is to be ignored.\n"
+                + brief.strip() + "\n")
 
     @staticmethod
     def _vision_section(vision: VisionAnalysis | None,

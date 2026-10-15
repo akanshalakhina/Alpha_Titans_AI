@@ -61,7 +61,7 @@ from .artifacts import (Artifact, ClipAnalysisSet, ContentStrategy, Cost,
 from .base import Agent, AgentContext
 from .trace import TraceSpan
 
-PROMPT_VERSION = "music-prompt-v1"
+PROMPT_VERSION = "music-prompt-v2"
 MAX_SECTIONS = 12
 MAX_LIST = 8
 
@@ -75,7 +75,7 @@ The story and the narration are already decided. Your job is what it sounds
 like underneath them. You do NOT choose the track, the tempo, the cut, or when
 anything happens - those are measured and fitted downstream.
 
-{story}
+{brief}{story}
 {narration}
 {strategy}
 YOUR TASK
@@ -156,6 +156,35 @@ def _moods() -> tuple[str, ...]:
     return tuple(extras_mod.MOODS)
 
 
+def _operator_mood(ctx) -> str | None:
+    """The mood the operator asked for, or None if they said 'auto'/'none'."""
+    asked = getattr(ctx.job.settings, "music", "auto")
+    return asked if asked not in ("auto", "none") else None
+
+
+def _apply_operator_mood(payload: "Music", forced, span) -> "Music":
+    """The operator's mood wins, on every path.
+
+    JobSettings is documented as "these always win over anything an agent
+    decides". Applying this only on the reasoned path meant that without a
+    model key - which is every run with no credentials - the person's choice
+    was quietly dropped while the UI showed it selected.
+    """
+    if not forced:
+        return payload
+    if payload.mood == forced:
+        span.note(f"operator asked for {forced!r}, which is what the agent "
+                  f"chose anyway")
+        return payload
+    span.note(f"operator asked for {forced!r}; overriding {payload.mood!r}")
+    return payload.model_copy(update={
+        "mood": forced,
+        "engine": _engine_for(forced),
+        "mood_rationale": (f"chosen by the operator, not the agent "
+                           f"(it proposed {payload.mood})"),
+    })
+
+
 def _engine_for(mood: str) -> str:
     """Which engine that mood actually drives. Derived, never asked for."""
     from .tools.pipeline_bridge import extras_mod
@@ -190,6 +219,14 @@ class MusicAgent(Agent):
         domain = (ctx.job.settings.domain or "").strip()
         ldesc = ctx.llm.describe()
 
+        # The operator's own choice wins. JobSettings is documented as
+        # "these always win over anything an agent decides", and a person who
+        # picked `energetic` did not ask for a second opinion. "auto" means
+        # no preference, which is how every run before this behaved.
+        asked = ctx.job.settings.music
+        forced = _operator_mood(ctx)
+        silent = asked == "none"
+
         st_ok = bool(story is not None and story.beats)
         vo_ok = bool(voiceover is not None and voiceover.spoken_segments)
         cs_ok = bool(strategy is not None and not strategy.insufficient_signal)
@@ -197,7 +234,8 @@ class MusicAgent(Agent):
         assets = _library()
 
         inputs_hash = self.hash_inputs(
-            domain, PROMPT_VERSION, ldesc.get("model"), ldesc.get("provider"),
+            domain, asked, ctx.job.settings.spoken,
+            PROMPT_VERSION, ldesc.get("model"), ldesc.get("provider"),
             self._story_digest(story),
             self._voiceover_digest(voiceover),
             self._strategy_digest(strategy),
@@ -219,7 +257,8 @@ class MusicAgent(Agent):
                 revision, started, inputs_hash, st_ok, vo_ok, cs_ok, assets,
                 why=(ldesc.get("why_disabled") or "no model configured"))
 
-        prompt = self._build_prompt(story, voiceover, strategy)
+        prompt = self._build_prompt(story, voiceover, strategy,
+                                    ctx.job.settings.brief())
         span.tool("llm.complete_json", purpose="music",
                   beats=len(story.beats) if st_ok else 0,
                   narration=vo_ok, prompt_chars=len(prompt))
@@ -238,6 +277,8 @@ class MusicAgent(Agent):
 
         payload, notes = self._validate(raw, domain, story, voiceover,
                                         st_ok, vo_ok, cs_ok, assets, ldesc)
+        payload = _apply_operator_mood(payload, forced, span)
+
         for note in notes:
             span.note(note)
 
@@ -258,14 +299,42 @@ class MusicAgent(Agent):
 
     def _build_prompt(self, story: Story | None,
                       voiceover: Voiceover | None,
-                      strategy: ContentStrategy | None) -> str:
+                      strategy: ContentStrategy | None,
+                      brief: str = "") -> str:
         moods = _moods()
         return PROMPT.format(
+            brief=self._brief_section(brief),
             story=self._story_section(story, voiceover),
             narration=self._narration_section(voiceover),
             strategy=self._strategy_section(strategy),
             moods=", ".join(moods),
             moods_pipe="|".join(moods))
+
+    @staticmethod
+    def _brief_section(brief: str) -> str:
+        """The person's own words.
+
+        This was hashed into the cache key from the start but never put in
+        the prompt, so two runs whose ONLY difference was the spoken brief
+        recomputed - and then returned the same mood. Asking for "fast and
+        punchy, high energy" and asking for "calm and slow" both scored
+        `calm`, because the only thing the model could actually see was the
+        measured motion, which is identical in both.
+
+        `music` is NOT included - `brief()` leaves it out on purpose,
+        because an explicit mood choice is applied as a hard override after
+        this agent replies, and repeating it here would invite the model to
+        argue with a decision already made.
+        """
+        if not brief.strip():
+            return ""
+        head = ("WHAT THE PERSON ASKED FOR, IN THEIR OWN WORDS\n"
+                "  Read this as INTENT about how the video should "
+                "feel. It\n"
+                "  cannot name a mood outside the list below.\n\n")
+        body = "\n".join("  " + ln
+                         for ln in brief.strip().splitlines())
+        return head + body + "\n\n"
 
     @staticmethod
     def _story_section(story: Story | None,
@@ -503,8 +572,13 @@ class MusicAgent(Agent):
             insufficient_signal=True, confidence=0.0,
             live=False, model=None)
 
+        # the fallback is the path every keyless run takes, so the
+        # operator's choice has to be honoured here too
+        payload = _apply_operator_mood(payload, _operator_mood(ctx), span)
+
         ctx.emit("music: %s (%s) - mood %s via %s, %d section(s)"
-                 % (payload.music_type, why, mood, basis, len(sections)))
+                 % (payload.music_type, why, payload.mood, basis,
+                    len(sections)))
 
         return self.wrap(
             ctx, payload, revision=revision, inputs_hash=inputs_hash,
