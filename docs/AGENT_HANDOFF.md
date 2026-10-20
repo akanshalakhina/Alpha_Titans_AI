@@ -26,10 +26,9 @@ It runs two ways:
 
 ## 2. Rules the owner has set (do not break these)
 
-- **Work only on branch `dev-2`. Nothing is committed.** Commit or push only
-  when the owner asks. When she does, **attribution is Akansha only**: no AI
+- **`dev-2` is the only branch** (it replaced `main` on 20 Oct 2026). Commit
+  or push only when the owner asks. When she does, **attribution is Akansha only**: no AI
   co-author lines in commits or PR descriptions.
-- **Never alter `main`.** Read it with `git show main:<path>` if needed.
 - **`pipeline/build_video.py`, `pipeline/*.py` and `server/extras.py` are
   protected.** Change them only with the owner's explicit approval. (Two
   approved changes were made on 19 Oct; see section 8.)
@@ -196,7 +195,7 @@ node --test tests/frontend/                              # 39
 
 ---
 
-## 8. Recent changes (all uncommitted on `dev-2`)
+## 8. Recent changes (committed and pushed on `dev-2`)
 
 - Cloud orchestration end to end (queue, VM lifecycle, reconciler, worker,
   GCS, ID-token auth, `control_app`), deployed live.
