@@ -64,14 +64,25 @@ YT_THUMB_MAX_BYTES = 2 * 1024 * 1024       # custom thumbnails: 2 MB
 YT_THUMB_MIN_WIDTH = 640                   # custom thumbnails: >= 640 px wide
 YT_THUMB_CODECS = ("mjpeg", "png", "gif")  # JPG, PNG or GIF, as ffprobe names
 
-# What would make an UPLOAD path if it ever appeared in the project's CODE -
-# an upload endpoint, the client library's insert call, or an OAuth client.
-# Matched against code with comments and docstrings removed, so describing
-# the absence of an upload path (as this module does) is not mistaken for
-# one. Split so this module's own source never matches its own scan.
+# What would make a YOUTUBE upload path if it ever appeared in the project's
+# CODE - an upload endpoint, the client library's insert call, or an OAuth
+# client. Matched against code with comments and docstrings removed, so
+# describing the absence of an upload path (as this module does) is not
+# mistaken for one. Split so this module's own source never matches its own
+# scan.
+#
+# The upload-endpoint marker names YouTube. It used to be Google's generic
+# upload host path, which also matches Google DRIVE's resumable upload
+# endpoint - and the cloud worker (server/cloud/gcp.py) legitimately stores
+# source clips and finished renders in Drive. That is not a way to publish
+# to a channel, and this agent's claim is about channels: "the operator
+# publishes". YouTube's own upload path under that host is still caught,
+# here and by the `upload/` + `youtube` marker beside it. Still
+# split, so neither this file's code nor its comments contain the joined
+# endpoint - tests/agents/test_title.py scans raw source, comments included.
 _UPLOAD_MARKERS = tuple("".join(p) for p in (
     ("youtube/v3/", "videos"), ("upload/", "youtube"),
-    ("videos().", "insert"), ("googleapis.com/", "upload"),
+    ("videos().", "insert"), ("googleapis.com/", "upload/youtube"),
     ("googleapi", "client"), ("google_auth_", "oauthlib"),
     ("oauth2", "client"), ("InstalledApp", "Flow")))
 _SEARCH_MARKER = "youtube/v3/" + "search"
@@ -163,8 +174,8 @@ def _capabilities(platform: dict) -> list[str]:
         out.append("an upload path appears in " + ", ".join(platform["upload"])
                    + " - this agent does not use it")
     else:
-        out.append("no upload, OAuth or channel access anywhere in the "
-                   "project")
+        out.append("no YouTube upload, OAuth or channel access anywhere in "
+                   "the project")
     return out
 
 

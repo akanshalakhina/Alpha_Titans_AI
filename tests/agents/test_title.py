@@ -152,10 +152,20 @@ def test_the_app_shows_settings_title_and_nothing_else():
 
 
 def test_nothing_in_the_project_publishes_anywhere():
+    """No path that would put a title anywhere but the app's own slot.
+
+    The upload check names YouTube's video upload endpoint. It used to be
+    any Google upload URL, which also forbade Google DRIVE's - and the
+    cloud worker (server/cloud/gcp.py) stores clips and renders in Drive.
+    Storing a render is not publishing a title; uploading to a channel is,
+    and that is still refused here and by the publishing agent's own scan.
+    """
+    youtube_upload = "googleapis.com/" + "upload/youtube"
     for py in list((ROOT / "server").rglob("*.py")) + \
             list((ROOT / "pipeline").rglob("*.py")):
         src = py.read_text(encoding="utf-8", errors="ignore")
-        assert "googleapis.com/upload" not in src, py
+        assert youtube_upload not in src, py
+        assert "youtube/v3/" + "videos" not in src, py
         assert '"-metadata"' not in src, py
 
 

@@ -338,6 +338,39 @@ def freeze_runs(path, duration):
     return runs
 
 
+def measure_once(src, rate, stats, duration):
+    """Motion series AND freeze runs from ONE decode of the clip.
+
+    The two used to be separate ffmpeg runs, so every frame of every clip
+    was decoded twice - for a 35-minute iPhone HEVC clip that was most of a
+    seven-minute measuring step (job b5e72b2c68a4, 19 Oct 2026). One decode
+    feeds both filters through `split`. Returns the freeze runs, or None if
+    the combined run failed, in which case the caller measures the old way.
+    """
+    graph = ("[0:v]split=2[m][f];"
+             "[m]scale=160:-2,fps=%g,signalstats,metadata=print:file=%s[mo];"
+             "[f]scale=320:-2,fps=6,freezedetect=n=-38dB:d=0.4[fo]"
+             % (rate, esc_path(stats)))
+    rc, o = sh(["ffmpeg", "-nostdin", "-v", "info", "-i", src,
+                "-filter_complex", graph,
+                "-map", "[mo]", "-f", "null", "-",
+                "-map", "[fo]", "-f", "null", "-"], check=False)
+    if rc != 0 or not os.path.exists(stats):
+        return None
+    runs, start = [], None
+    for line in o.splitlines():
+        mm = re.search(r"freeze_start:\s*([0-9.]+)", line)
+        if mm:
+            start = float(mm.group(1))
+        mm = re.search(r"freeze_end:\s*([0-9.]+)", line)
+        if mm and start is not None:
+            runs.append([start, float(mm.group(1))])
+            start = None
+    if start is not None and duration > start:
+        runs.append([start, duration])
+    return runs
+
+
 def stage_measure(args):
     m = load(args.out)
     vdir = os.path.join(args.out, "measure")
@@ -355,12 +388,16 @@ def stage_measure(args):
         stats = os.path.join(vdir, c["name"] + ".ydif.txt")
         if os.path.exists(stats):
             os.remove(stats)
-        sh(["ffmpeg", "-nostdin", "-v", "error", "-i", src,
-            "-vf", "scale=160:-2,fps=%g,signalstats,metadata=print:file=%s"
-                   % (rate, esc_path(stats)), "-f", "null", "-"])
+        runs = measure_once(src, rate, stats, c["duration"])
+        if runs is None:                       # the two-pass way, as before
+            if os.path.exists(stats):
+                os.remove(stats)
+            sh(["ffmpeg", "-nostdin", "-v", "error", "-i", src,
+                "-vf", "scale=160:-2,fps=%g,signalstats,metadata=print:file=%s"
+                       % (rate, esc_path(stats)), "-f", "null", "-"])
+            runs = freeze_runs(src, c["duration"])
         series = parse_meta(stats, "signalstats.YDIF")
         vals = [series[i] for i in sorted(series)]
-        runs = freeze_runs(src, c["duration"])
         frozen = sum(b - a for a, b in runs)
 
         c["sample_fps"] = rate
@@ -858,9 +895,18 @@ def stage_cut(args):
           % (len(pending), len(m["segments"]) - len(pending)))
     for s, dest in pending:
         src = os.path.join(m["src"], s["clip"])
-        fc, out_label, extra = fit_filter(s, m["canvas"], s.get("crop"),
+        # Seek BEFORE opening the clip. `trim` alone decodes from second 0
+        # up to the in-point, so a shot at 19 minutes decoded 19 minutes
+        # of video first - about nine minutes of cutting for six shots of
+        # long footage (job b5e72b2c68a4). Input seeking jumps to the
+        # nearest keyframe and decodes only from there; the trim then
+        # works relative to that point, one second before the shot.
+        lead = max(0.0, s["start"] - 1.0)
+        rel = dict(s, start=s["start"] - lead, end=s["end"] - lead)
+        fc, out_label, extra = fit_filter(rel, m["canvas"], s.get("crop"),
                                           overlays.get(s["index"]))
-        sh(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src] + extra +
+        sh(["ffmpeg", "-nostdin", "-v", "error", "-y",
+            "-ss", "%.3f" % lead, "-i", src] + extra +
            ["-filter_complex", fc, "-map", out_label, "-an",
             "-c:v", "libx264", "-preset", PRESET, "-crf", CRF,
             "-profile:v", "high", "-pix_fmt", "yuv420p", dest])

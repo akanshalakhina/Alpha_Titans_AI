@@ -74,6 +74,20 @@ _OVERLAY_SHAPE = """,
                   "anchor": "top-left|top-center|top-right|middle-left|\
 center|middle-right|bottom-left|bottom-center|bottom-right",
                   "scale_pct": <2-60>, "hold": "full|open|close"}"""
+# How many beats may carry a graphic, as a share of the cut.
+#
+# The prompt asks for restraint - "most do not, and a sticker on every
+# shot is noise" - and the first real run put one on all six segments
+# anyway, held for their full length. Asking is not enforcing, and a
+# model has no way to see the finished screen.
+#
+# So the model still chooses WHICH beats deserve one; this decides HOW
+# MANY can, the same division of labour as everywhere else here. A third
+# of the beats, at least one, never more than three: enough for a cut to
+# have punctuation, not enough for it to have wallpaper.
+OVERLAY_SHARE = 3
+OVERLAY_CEILING = 3
+
 OVERLAY_ANCHORS = typing.get_args(OverlayAnchor)
 OVERLAY_HOLDS = typing.get_args(OverlayHold)
 MAX_DIRECTIONS = 12
@@ -248,7 +262,8 @@ class AnimationAgent(Agent):
         # assets folder. Defaults are generated once so a fresh install
         # can use overlays without the operator going to find artwork;
         # a file the operator put there themselves is never replaced.
-        made = _AL.ensure_defaults(ctx.job.build_dir)
+        made = (_AL.ensure_defaults(ctx.job.build_dir)
+                if _AL.stock_enabled() else [])
         assets = _AL.available(ctx.job.build_dir)
         if made:
             span.tool("assets.generate_defaults", created=len(made))
@@ -311,6 +326,25 @@ class AnimationAgent(Agent):
             emphases_pipe="|".join(EMPHASES),
             captions=", ".join(CAPTION_INTENTS),
             captions_pipe="|".join(CAPTION_INTENTS))
+
+    @staticmethod
+    def _thin_overlays(directions):
+        """Keep a few graphics, drop the rest. Returns (directions, dropped).
+
+        Which beats keep theirs is the model's judgement, taken in the
+        order it gave them - the first it chose to decorate is the one it
+        thought mattered most. Nothing is re-ranked here; only the number
+        is decided, because the number is a property of the finished
+        screen and the model cannot see one.
+        """
+        carrying = [i for i, d in enumerate(directions) if d.overlay]
+        allowed = max(1, min(OVERLAY_CEILING,
+                             len(directions) // OVERLAY_SHARE))
+        if len(carrying) <= allowed:
+            return directions, 0
+        strip = set(carrying[allowed:])
+        return ([d.model_copy(update={"overlay": None}) if i in strip else d
+                 for i, d in enumerate(directions)], len(strip))
 
     @staticmethod
     def _overlay_for(item: dict, allowed: set, dropped: list):
@@ -520,6 +554,15 @@ class AnimationAgent(Agent):
         if bad_beat:
             notes.append(f"{bad_beat} direction(s) referenced a beat that "
                          f"does not exist and were dropped")
+        # Thin the graphics out before they are reported, so the artifact
+        # says what the video will actually show. Letting it claim six
+        # and render two would be the quiet kind of wrong.
+        out, spare = self._thin_overlays(out)
+        if spare:
+            notes.append(f"{spare} overlay(s) dropped to keep the cut from "
+                         f"carrying a graphic on every shot; at most "
+                         f"{max(1, min(OVERLAY_CEILING, len(out) // OVERLAY_SHARE))} "
+                         f"of {len(out)} beat(s) keep one")
         if dropped:
             notes.append(f"{len(dropped)} overlay(s) named a graphic this "
                          f"job does not have and were dropped: "

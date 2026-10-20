@@ -1,0 +1,40 @@
+# Alpha Titans - control plane. Install on the ALWAYS-ON e2-micro.
+#
+#   sudo cp alpha-titans-control.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now alpha-titans-control
+#
+# Serves the app, owns the job queue (SQLite, sole writer), starts the worker
+# VM and runs the reconciler thread. `Restart=always` is what recovers the
+# reconciler itself: it lives in this process.
+#
+# Listens on 0.0.0.0:8000 for TWO callers only:
+#   * the worker VM, over the VPC's internal network (firewall: tcp:8000
+#     from the worker's network tag only - never 0.0.0.0/0);
+#   * cloudflared on this host, which publishes ONLY the cloud paths behind
+#     an authenticating proxy (see cloudflared.yml).
+# It runs `cloud.control_app`, which serves ONLY the cloud page and routes:
+# the studio's older routes have no authentication and render video, and
+# are simply not part of this app.
+
+[Unit]
+Description=Alpha Titans control plane (API, queue, VM manager, reconciler)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=alpha
+Group=alpha
+WorkingDirectory=/opt/alpha_titans
+EnvironmentFile=/etc/alpha-titans/control.env
+ExecStart=/opt/alpha_titans/.venv/bin/python -m uvicorn cloud.control_app:app --app-dir server --host 0.0.0.0 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/opt/alpha_titans/outputs /opt/alpha_titans/uploads
+
+[Install]
+WantedBy=multi-user.target

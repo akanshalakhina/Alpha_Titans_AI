@@ -205,7 +205,8 @@ class EditingDirectorAgent(Agent):
         # ---- 2. build segments, falling back when the model is unusable ---
         if proposal is not None:
             segments, notes = self._segments_from_proposal(
-                span, clip_set, proposal, constraints)
+                span, clip_set, proposal, constraints,
+                screen=self._shot_screen(ctx, span, clip_set, story))
             decisions.append(Decision(
                 what="Editing strategy",
                 chose=proposal.get("strategy", "")[:200] or "(none given)",
@@ -227,14 +228,7 @@ class EditingDirectorAgent(Agent):
                 ST.deterministic_plan, ctx.job.build_dir, clip_set,
                 clip_set.target_seconds, "hook", ctx.emit,
                 pool=ctx.pool, job_id=ctx.job.job_id)
-            # That planner gives each clip one window, capped at 12s, so a
-            # two-clip job answered every request from 25s upward with the
-            # same 23.6s video. Take more moments from the same footage
-            # until the length asked for is met.
-            segments, notes = ST.top_up_to_target(
-                clip_set, segments, clip_set.target_seconds)
-            for line in notes:
-                ctx.emit(f"plan: {line}")
+            notes = []
             decisions.append(Decision(
                 what="Editing strategy",
                 chose="deterministic planner (sqrt-weighted motion budget)",
@@ -244,6 +238,28 @@ class EditingDirectorAgent(Agent):
                      f"artifact is marked degraded so it is not mistaken "
                      f"for a reasoned edit"),
                 decided_by="fallback", confidence=0.5))
+
+        # ---- the length that was actually asked for -----------------------
+        #
+        # This guards BOTH paths, and it used to guard only the fallback.
+        #
+        # `pipeline/build_video.py` gives each clip one window capped at
+        # 12s, so a degraded two-clip job answered every brief from 25s
+        # upward with the same 23.6s video. That was the reason it was
+        # written - and putting it on that branch alone missed the case
+        # that turned up the first time the director reasoned well: it
+        # chose three five-second moments, 14.2s against a 30s target,
+        # and nothing said otherwise.
+        #
+        # The model still decides WHICH moments are worth having. How
+        # long the finished cut runs is the operator's setting, and
+        # making it so is arithmetic over measured windows - the same
+        # division of labour as every timestamp in this file.
+        segments, length_notes = ST.top_up_to_target(
+            clip_set, segments, clip_set.target_seconds)
+        notes = list(notes) + length_notes
+        for line in length_notes:
+            ctx.emit(f"plan: {line}")
 
         # ---- 3. apply revision constraints deterministically --------------
         if constraints:
@@ -473,7 +489,26 @@ class EditingDirectorAgent(Agent):
                   model=ctx.llm.describe().get("model"),
                   prompt_chars=len(prompt))
 
-        raw, reply = ctx.llm.complete_json(prompt, max_tokens=1600)
+        # 1600 was a guess, and it sat INSIDE this agent's output
+        # distribution. Measured on the real prompt for job 96912f55fc9a
+        # (9,806 chars), openai/gpt-oss-20b, same key, same day:
+        #
+        #     cap 1600:  1240 1314 1530 1576 1594 1600   1 of 6 cut off
+        #     cap 2600:  1396 1672 1769 1889             0 of 4 cut off
+        #
+        # So the ceiling was amputating real answers - the cut sample
+        # came back with three segments where the same prompt otherwise
+        # produced six. Output is billed on what is written, not on the
+        # cap, so the wider budget costs nothing on a call that finishes
+        # early and saves an entire discarded call plus its retry on one
+        # that would not have. Expected spend per call goes DOWN:
+        # ~2030 tokens at 1600 (including the 1-in-6 retry) against
+        # ~1682 at 2600.
+        #
+        # The reasoning budget is deliberately left at the model's
+        # default here. This is the agent the whole cut rests on; the
+        # five nodes that ask for the cheap setting are the small ones.
+        raw, reply = ctx.llm.complete_json(prompt, max_tokens=2600)
         if not reply.ok:
             return None, f"the model call failed ({reply.error})", reply
         if raw is None:
@@ -796,10 +831,30 @@ class EditingDirectorAgent(Agent):
 
     # ------------------------------------------------------------ segments
 
+    @staticmethod
+    def _shot_screen(ctx, span, clip_set, story):
+        """Look at the candidate shots before choosing one (see
+        `tools/shot_check.py`), or None to keep the motion-only choice."""
+        from .tools import shot_check as SC
+        if not SC.enabled() or not ctx.llm.available():
+            return None
+        about = story.logline if story is not None else ""
+
+        def screen(clip, wanted, taken, purpose):
+            return SC.choose(ctx.llm, span, clip, wanted, taken, purpose,
+                             tuple(clip_set.canvas),
+                             ctx.job.settings.framing, about)
+        return screen
+
     def _segments_from_proposal(self, span: TraceSpan,
                                 clip_set: ClipAnalysisSet, proposal: dict,
-                                constraints: dict) -> tuple[list[Segment], list[str]]:
-        """Turn validated intentions into exact frames, deterministically."""
+                                constraints: dict, screen=None
+                                ) -> tuple[list[Segment], list[str]]:
+        """Turn validated intentions into exact frames, deterministically.
+
+        With `screen`, the best few windows are looked at and the one that
+        shows the subject is used; without it, or when it cannot decide,
+        the busiest window is, as it always was."""
         segments: list[Segment] = []
         notes: list[str] = []
         min_open = constraints.get("opening_min_mean_ydif")
@@ -823,10 +878,17 @@ class EditingDirectorAgent(Agent):
             span.tool("select.best_window", clip=clip.clip_id,
                       requested_length=round(want, 2),
                       already_used=len(taken))
-            start, end, score, wnotes = ST.resolve_window(
-                clip, want,
-                min_mean_ydif=min_open if i == 0 else None,
-                avoid=taken or None)
+            picked = None
+            if screen is not None and not (i == 0 and min_open is not None):
+                picked = screen(clip, want, taken,
+                                str(s.get("reason", "")))
+            if picked is not None:
+                start, end, score, wnotes = picked
+            else:
+                start, end, score, wnotes = ST.resolve_window(
+                    clip, want,
+                    min_mean_ydif=min_open if i == 0 else None,
+                    avoid=taken or None)
             notes.extend(wnotes)
             if end <= start:
                 # nothing of that length left in the clip that is not a

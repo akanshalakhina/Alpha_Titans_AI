@@ -1,0 +1,19 @@
+# cloudflared named-tunnel config for the CONTROL PLANE (e2-micro).
+# Publishes ONLY the cloud page and its API; everything else - including the
+# app's older, unauthenticated routes - answers 404 from the edge.
+#
+# Put Cloudflare Access (an identity login) in front of HOSTNAME as well:
+# AT_CLOUD_API_TOKEN is a second lock, not the only one.
+
+tunnel: REPLACE_TUNNEL_ID
+credentials-file: /etc/cloudflared/REPLACE_TUNNEL_ID.json
+
+ingress:
+  - hostname: REPLACE.example.com
+    path: ^/(cloud|static/(cloud\.js|styles\.css|studio\.css))$
+    service: http://127.0.0.1:8000
+  - hostname: REPLACE.example.com
+    path: ^/api/cloud/(config|uploads|jobs)(/.*)?$
+    service: http://127.0.0.1:8000
+  # worker and reconcile routes are VPC-only: never through the tunnel
+  - service: http_status:404

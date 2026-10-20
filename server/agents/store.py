@@ -141,6 +141,25 @@ def resolve_job_db(job_id: str, root: Path | None = None,
     return shared, "shared"
 
 
+# Markers of a failure that belonged to a MOMENT, not to this job.
+#
+# Deliberately narrow and deliberately about the transport: an HTTP status
+# or a socket giving up. "the model reply was unusable" is not here - a
+# model that answers badly on these inputs will answer badly again, and
+# re-asking would spend tokens to be disappointed twice.
+_TRANSIENT = ("HTTPError", "URLError", "TimeoutError", "timed out",
+              "Too Many Requests", "Bad Gateway", "Service Unavailable",
+              "Connection", "gave up after")
+
+
+def is_transient(fallback_used: str | None) -> bool:
+    """Whether a degradation was the provider's fault rather than this
+    job's. Used to decide whether the result is worth caching."""
+    if not fallback_used:
+        return False
+    return any(m in fallback_used for m in _TRANSIENT)
+
+
 class ArtifactStore:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
@@ -236,14 +255,39 @@ class ArtifactStore:
         return out
 
     def get_by_inputs(self, job_id: str, kind: str, inputs_hash: str,
-                      payload_type: Type[T]) -> Artifact[T] | None:
-        """Cache lookup: has this agent already run on exactly these inputs?"""
+                      payload_type: Type[T],
+                      reuse_transient: bool = False) -> Artifact[T] | None:
+        """Cache lookup: has this agent already run on exactly these inputs?
+
+        A degraded artifact is normally a perfectly good cache entry. Most
+        degradations are STRUCTURAL - no domain was given, so Research has
+        nothing to research; nothing was published, so there is no
+        performance to read - and asking again would spend tokens to be
+        told the same thing.
+
+        A degradation caused by the PROVIDER is different. A 400, a 429 or
+        a timeout says nothing about this job; it says something about that
+        minute. Caching it means one bad minute permanently fixes a job's
+        story as the deterministic fallback, and no amount of re-running
+        can shake it loose - which is exactly what happened: a transient
+        400 on the Story agent was then served from cache on the next run,
+        and the cut kept its two beats instead of the six it should have
+        had.
+
+        So those are not reused. `reuse_transient=True` is for callers that
+        want the row whatever its provenance.
+        """
         with self._connect() as con:
             row = con.execute(
                 "SELECT * FROM artifacts WHERE job_id = ? AND kind = ?"
                 " AND inputs_hash = ? ORDER BY revision DESC LIMIT 1",
                 (job_id, kind, inputs_hash)).fetchone()
-        return self._hydrate(row, payload_type) if row else None
+        if row is None:
+            return None
+        art = self._hydrate(row, payload_type)
+        if not reuse_transient and is_transient(art.fallback_used):
+            return None
+        return art
 
     def all_revisions(self, job_id: str, kind: str,
                       payload_type: Type[T]) -> list[Artifact[T]]:

@@ -172,6 +172,18 @@ def assets_dir(build_dir) -> pathlib.Path | None:
     return pathlib.Path(build_dir) / "assets"
 
 
+def stock_enabled() -> bool:
+    """Whether the four stock shapes are offered at all. OFF by default
+    since 19 Oct 2026: they are placed at a fixed spot on the frame, not on
+    the thing they point at, because no agent knows where anything is in
+    the picture - so a sparkle floats over an empty wall and corner
+    brackets frame nothing in particular (jobs 8915e4a5b6c1, b5e72b2c68a4).
+    An operator's own artwork in the assets folder is still offered.
+    `AT_STOCK_GRAPHICS=1` brings the stock set back."""
+    import os
+    return os.environ.get("AT_STOCK_GRAPHICS", "0") == "1"
+
+
 def ensure_defaults(build_dir) -> list[str]:
     """Write any missing default graphic. Returns what it created.
 

@@ -859,3 +859,161 @@ def _clip_set():
                               ydif_series=[1.0] * 100),
             usability=ClipUsability(usable=True))],
         orientation="horizontal", canvas=(1920, 1080), target_seconds=30.0)
+
+
+# ============ 11. a default is not a decision, and must not be a cohort
+#
+# Cohorts are built from `ContentStrategy.pacing`. When that agent
+# degrades, its deterministic fallback writes `pacing: "moderate"`
+# because the field needs a value - not because anything chose moderate.
+#
+# Counting those builds a "moderate cohort" out of the agent's absence
+# and then compares real choices against it. The comparison would look
+# perfectly healthy and measure nothing. Of the first four real runs on
+# this footage, two had a degraded strategy.
+
+def _strategy(ctx, job, pacing, degraded=False):
+    ctx.store.put(Artifact[ContentStrategy](
+        job_id=job, kind="ContentStrategy", produced_by="content_strategy",
+        inputs_hash=f"s-{job}", degraded=degraded,
+        fallback_used="deterministic strategy" if degraded else None,
+        payload=ContentStrategy(
+            strategy_type="degraded" if degraded else "reasoned",
+            pacing=pacing)))
+
+
+def _outcome(ctx, job, views=1000.0):
+    from agents.artifacts import MeasuredMetric
+    ctx.store.put(Artifact[PerformanceAnalysis](
+        job_id=job, kind="PerformanceAnalysis",
+        produced_by="performance_analysis", inputs_hash=f"p-{job}",
+        payload=PerformanceAnalysis(
+            status="measured", provider="youtube_export", published=True,
+            video_id=f"vid{job[:8]}"[:11], window_days=30,
+            measured=[MeasuredMetric(metric="views", value=views,
+                                     source="x.csv")])))
+
+
+def test_a_reasoned_strategy_becomes_a_sample(learn_ctx):
+    from agents.learning import _samples
+    _strategy(learn_ctx, "real01", "fast")
+    _outcome(learn_ctx, "real01")
+    got = _samples(learn_ctx.store, learn_ctx.job.job_id)
+    assert [s.pacing for s in got] == ["fast"]
+
+
+def test_a_degraded_strategy_is_not_a_sample(learn_ctx):
+    """`moderate` here is the field's default, not an agent's judgement."""
+    from agents.learning import _samples
+    _strategy(learn_ctx, "deg01", "moderate", degraded=True)
+    _outcome(learn_ctx, "deg01")
+    assert _samples(learn_ctx.store, learn_ctx.job.job_id) == []
+
+
+def test_the_defaults_cannot_quietly_form_a_cohort(learn_ctx):
+    """Twelve absences must not become a comparison arm."""
+    from agents.learning import _samples, compare
+    for i in range(12):
+        _strategy(learn_ctx, f"deg{i:02d}", "moderate", degraded=True)
+        _outcome(learn_ctx, f"deg{i:02d}", views=5000.0)
+    for i in range(12):
+        _strategy(learn_ctx, f"fast{i:02d}", "fast")
+        _outcome(learn_ctx, f"fast{i:02d}", views=9000.0)
+
+    got = _samples(learn_ctx.store, learn_ctx.job.job_id)
+    assert {s.pacing for s in got} == {"fast"}, "only real choices"
+    assert compare(got) is None, "one arm is not a comparison"
+
+
+def test_a_job_with_an_outcome_but_no_strategy_is_not_a_sample(learn_ctx):
+    from agents.learning import _samples
+    _outcome(learn_ctx, "orphan01")
+    assert _samples(learn_ctx.store, learn_ctx.job.job_id) == []
+
+
+# ====================== seeded numbers must never become a real finding
+#
+# `scripts/seed_synthetic_analytics.py` exists because the learning loop
+# could not be exercised at all without thirty measured videos, and
+# waiting for thirty real ones would have meant shipping the gates
+# untested. It writes into its own `data/_synthetic/state.db`, prefixes
+# every job with `synthetic-`, and stamps every report SYNTHETIC.
+#
+# That isolation is a promise about where a file is written, and a
+# promise is the wrong kind of guarantee for this. One `--db` pointed
+# somewhere else, one copied row, and the agent would announce a real
+# finding built out of numbers nobody measured - with every gate
+# genuinely passed, because the gates are about statistics and these
+# would be statistically fine.
+#
+# So the refusal is structural and lives next to the samples: a report
+# that declares itself seeded is not evidence, wherever it is stored.
+
+def _seeded(ctx, job, views=5000.0):
+    from agents.artifacts import MeasuredMetric
+    ctx.store.put(Artifact[PerformanceAnalysis](
+        job_id=job, kind="PerformanceAnalysis",
+        produced_by="performance_analysis", inputs_hash=f"p-{job}",
+        payload=PerformanceAnalysis(
+            status="measured", provider="youtube_export", published=True,
+            video_id=f"vid{job[:8]}"[:11], window_days=30,
+            measured=[MeasuredMetric(metric="views", value=views,
+                                     source="_synthetic_export.csv")],
+            limitations=["SYNTHETIC - seeded for cohort testing"])))
+
+
+def test_a_seeded_outcome_is_not_a_sample(learn_ctx):
+    from agents.learning import _samples
+    _strategy(learn_ctx, "syn01", "fast")
+    _seeded(learn_ctx, "syn01")
+    assert _samples(learn_ctx.store, learn_ctx.job.job_id) == [], (
+        "a report that says SYNTHETIC is not evidence of anything")
+
+
+def test_a_synthetic_job_id_is_not_a_sample(learn_ctx):
+    """The second marker, independent of the first: either disqualifies,
+    so losing one in a refactor does not lose the guarantee."""
+    from agents.learning import _samples
+    _strategy(learn_ctx, "synthetic-0001", "slow")
+    _outcome(learn_ctx, "synthetic-0001")
+    assert _samples(learn_ctx.store, learn_ctx.job.job_id) == []
+
+
+def test_thirty_seeded_videos_still_leave_the_agent_with_nothing(learn_ctx):
+    """The whole point, stated as the thing that must not happen."""
+    from agents.learning import _samples
+    for i in range(30):
+        job = "syn%03d" % i
+        _strategy(learn_ctx, job, "fast" if i % 2 else "slow")
+        _seeded(learn_ctx, job, views=9000.0 if i % 2 else 1000.0)
+
+    assert _samples(learn_ctx.store, learn_ctx.job.job_id) == []
+
+
+def test_a_real_outcome_beside_seeded_ones_is_still_counted(learn_ctx):
+    """The guard must reject the seeded rows, not the whole store."""
+    from agents.learning import _samples
+    _strategy(learn_ctx, "syn01", "fast")
+    _seeded(learn_ctx, "syn01")
+    _strategy(learn_ctx, "real01", "slow")
+    _outcome(learn_ctx, "real01")
+
+    got = _samples(learn_ctx.store, learn_ctx.job.job_id)
+    assert [s.pacing for s in got] == ["slow"]
+
+
+def test_nothing_in_the_server_asks_to_see_seeded_rows():
+    """The escape hatch is for `scripts/`, and must stay there. A grep
+    is the right test: this is a fact about who calls what, and it
+    holds whether or not the call is reached at runtime."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2] / "server"
+    offenders = [p.relative_to(root).as_posix()
+                 for p in root.rglob("*.py")
+                 if "include_seeded" in p.read_text(encoding="utf-8")
+                 and p.name != "learning.py"]
+    assert offenders == [], offenders
+
+    src = (root / "agents" / "learning.py").read_text(encoding="utf-8")
+    assert "include_seeded=True" not in src, (
+        "learning.py may DEFINE the flag; it must never pass it")

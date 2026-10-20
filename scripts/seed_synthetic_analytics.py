@@ -214,7 +214,9 @@ def verify(approve_it: bool = False) -> int:
           f"{h.performance_reports} report(s), widest window "
           f"{h.window_days}d (gate wants {MIN_WINDOW_DAYS}d)")
 
-    samples = _samples(store, job)
+    # The one caller allowed to look at seeded rows - that is what
+    # this script is for. See `learning._seeded`.
+    samples = _samples(store, job, include_seeded=True)
     finding = compare(samples) if h.usable_samples >= MIN_HISTORY else None
     print(f"samples with BOTH an outcome and a pacing: {len(samples)}")
     if finding:

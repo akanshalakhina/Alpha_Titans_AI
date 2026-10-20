@@ -13,7 +13,8 @@ import pytest
 
 from agents.artifacts import EditPlan, RevisionRequest
 from agents.editing_director import EditingDirectorAgent
-from conftest import llm_failing, llm_returning, llm_returning_plan
+from conftest import (llm_always_cut_off, llm_cut_off_then,
+                      llm_failing, llm_returning, llm_returning_plan)
 
 
 def run(ctx, clip_set, tracer_span, revision=0, request=None):
@@ -318,3 +319,83 @@ def test_plan_is_schema_valid_and_indices_are_contiguous(director_ctx,
     assert isinstance(art.payload, EditPlan)
     assert [s.index for s in art.payload.segments] == [1, 2]
     assert art.payload.total_duration > 0
+
+
+# ============================== a reply that ran out of room, not of sense
+#
+# Run 96912f55fc9a, 16 Oct. The director degraded with:
+#
+#     deterministic_planner (the model reply was rejected
+#                            (no segments in the reply))
+#
+# and the critic scored the result 69.9 instead of 100. That reason is
+# what a model sending a wrong answer looks like, so that is what was
+# investigated. The trace said otherwise:
+#
+#     tokens_out: 1600      against    max_tokens=1600
+#
+# The model had not sent a wrong answer. It had been cut off at the
+# ceiling, mid-array, and the repair layer recovered the last complete
+# segment object from inside the envelope it could no longer close. A
+# single segment, no `segments` key, valid JSON - and indistinguishable,
+# by inspection, from a model that meant to send exactly that.
+#
+# The fix is in `llm_tools.complete_json`: a cut-off reply is asked again
+# with twice the room before anything is concluded about its content.
+# These tests hold the director's end of that - the reasoning must
+# survive, and when it cannot the reason given must be the true one.
+
+def test_a_cut_off_plan_is_asked_again_and_the_reasoning_survives(
+        director_ctx, tracer_span):
+    ctx, clip_set = director_ctx
+    ctx.llm = llm_cut_off_then(
+        [{"clip_id": "02_lively.mp4", "target_seconds": 5.0, "reason": "a"},
+         {"clip_id": "01_calm.mp4", "target_seconds": 4.0, "reason": "b"}])
+
+    art = run(ctx, clip_set, tracer_span)
+
+    assert art.degraded is False, "a budget that ran out is not a bad answer"
+    assert art.fallback_used is None
+    assert [s.clip_id for s in art.payload.segments] == ["02_lively.mp4",
+                                                         "01_calm.mp4"]
+    assert any(d.decided_by == "llm" for d in art.decisions)
+    assert ctx.llm.budgets == [2600, 4000], "asked again with more room"
+
+
+def test_the_wider_retry_is_charged_for(director_ctx, tracer_span):
+    """Both calls were made and both cost tokens; the artifact must say
+    so, or the per-run token figures quietly understate themselves."""
+    ctx, clip_set = director_ctx
+    ctx.llm = llm_cut_off_then(
+        [{"clip_id": "02_lively.mp4", "target_seconds": 5.0, "reason": "a"}])
+    art = run(ctx, clip_set, tracer_span)
+    assert art.cost.tokens_out >= 2600 + 4000, art.cost.tokens_out
+
+
+def test_a_reply_that_never_finishes_says_it_was_cut_off(director_ctx,
+                                                          tracer_span):
+    """The honesty requirement. The fallback is correct here - what must
+    not happen again is blaming the model's judgement for the ceiling."""
+    ctx, clip_set = director_ctx
+    ctx.llm = llm_always_cut_off(
+        [{"clip_id": "02_lively.mp4", "target_seconds": 5.0, "reason": "a"}])
+
+    art = run(ctx, clip_set, tracer_span)
+
+    assert art.degraded is True
+    assert art.payload.segments, "the fallback must still produce a plan"
+    assert "cut off" in art.fallback_used, art.fallback_used
+    assert "no segments in the reply" not in art.fallback_used
+
+
+def test_a_salvaged_fragment_is_never_planned_from(director_ctx, tracer_span):
+    """One segment recovered from a cut-off reply must not become the
+    whole video. Three clips were offered; the fragment names one."""
+    ctx, clip_set = director_ctx
+    ctx.llm = llm_always_cut_off(
+        [{"clip_id": "02_lively.mp4", "target_seconds": 5.0, "reason": "a"},
+         {"clip_id": "01_calm.mp4", "target_seconds": 4.0, "reason": "b"}])
+
+    art = run(ctx, clip_set, tracer_span)
+    assert art.degraded is True, (
+        "planning from a fragment would look like a reasoned one-clip cut")

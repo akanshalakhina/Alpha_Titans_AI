@@ -25,6 +25,12 @@ _TMP = Path(tempfile.mkdtemp(prefix="at_agents_"))
 os.environ["AT_UPLOADS_DIR"] = str(_TMP / "uploads")
 os.environ["AT_OUTPUTS_DIR"] = str(_TMP / "outputs")
 os.environ["AT_MUSIC_DIR"] = str(_TMP / "music")
+# The suite was written before shots were checked by looking at them and
+# before the stock graphics became opt-in; its fake models answer every
+# call alike, so it runs with the earlier behaviour. test_shot_check.py
+# and test_overlays.py cover the new defaults explicitly.
+os.environ["AT_SHOT_CHECK"] = "0"
+os.environ["AT_STOCK_GRAPHICS"] = "1"
 os.environ.pop("AT_VISION_API_KEY", None)
 os.environ.pop("AT_LLM_API_KEY", None)
 
@@ -205,6 +211,49 @@ def llm_returning_plan(segments, strategy="test strategy",
         "strategy": strategy, "opening_rationale": rationale,
         "segments": segments, "rejected": [],
     }))
+
+
+def llm_cut_off_then(segments, strategy="recovered strategy") -> LLMClient:
+    """First answer is cut off at the output ceiling part-way through
+    `segments`; the second, asked with a wider budget, arrives whole.
+
+    This is the shape of the real failure: the reply stops mid-array, so
+    the outer object never closes and the repair layer salvages the last
+    complete segment inside it - valid JSON that is not the answer.
+    """
+    whole = json.dumps({"strategy": strategy, "opening_rationale": "r",
+                        "segments": segments, "rejected": []})
+    cut = whole[:whole.index('"segments"') + 60]
+    calls: list[int] = []
+
+    def transport(prompt: str, max_tokens: int) -> LLMReply:
+        calls.append(max_tokens)
+        first = len(calls) == 1
+        return LLMReply(text=cut if first else whole,
+                        tokens_in=120, tokens_out=max_tokens,
+                        stop_reason="length" if first else "stop",
+                        usd=0.001, meta={"provider": "injected"})
+
+    client = LLMClient(transport=transport)
+    client.budgets = calls          # what each call was allowed to write
+    return client
+
+
+def llm_always_cut_off(segments) -> LLMClient:
+    """Cut off at every budget, however wide - the reply never finishes."""
+    whole = json.dumps({"strategy": "s", "segments": segments})
+    cut = whole[:whole.index('"segments"') + 60]
+    calls: list[int] = []
+
+    def transport(prompt: str, max_tokens: int) -> LLMReply:
+        calls.append(max_tokens)
+        return LLMReply(text=cut, tokens_in=120, tokens_out=max_tokens,
+                        stop_reason="length", usd=0.001,
+                        meta={"provider": "injected"})
+
+    client = LLMClient(transport=transport)
+    client.budgets = calls
+    return client
 
 
 def llm_failing(error="ConnectionError: refused") -> LLMClient:

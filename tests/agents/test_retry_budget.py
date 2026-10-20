@@ -63,7 +63,7 @@ class _Client(LT.LLMClient):
         self._exc, self.calls, self.slept = exc, 0, []
 
     def _http(self, prompt, max_tokens, images=None, model_override=None,
-              effort=None):
+              effort=None, json_mode=True):
         self.calls += 1
         raise self._exc
 
@@ -167,7 +167,7 @@ class _Chain(LT.LLMClient):
         self.out, self.tried = set(out_of_quota), []
 
     def _http(self, prompt, max_tokens, images=None, model_override=None,
-              effort=None):
+              effort=None, json_mode=True):
         used = model_override or LT.model()
         self.tried.append(used)
         if used in self.out:
@@ -240,3 +240,142 @@ def test_a_fallback_list_never_repeats_the_configured_model(monkeypatch):
     vals = {"AT_LLM_MODEL": "m-a", "AT_LLM_FALLBACK_MODELS": "m-a, m-b,, m-b"}
     monkeypatch.setattr(LT, "_env", lambda k, d=None: vals.get(k, d))
     assert LT.fallback_models() == ["m-b"]
+
+
+# ================== the budget has to cover the WHOLE call, not a slice
+#
+# 16 Oct. Two clips uploaded through the studio; the UI sat on step 1 and
+# never moved. The trace showed `vision` finishing in 268s and the next
+# node, `content_strategy`, never writing a span at all. It had started
+# and was still going when the server was shut down.
+#
+# Nothing could have stopped it. `POLICIES[...].timeout_s` is enforced by
+# the SCHEDULER, which bounds work sent to the media pool - an in-process
+# HTTP call is not pool work and no deadline reaches it. That left the
+# retry budget below as the only bound, and it bounded the wrong thing
+# twice over:
+#
+#   * `waited` is reset at the top of `for alt in chain`, so each model
+#     in AT_LLM_FALLBACK_MODELS gets its own fresh 150s;
+#   * only `time.sleep` is counted. A request that hangs for its full
+#     90s timeout and then fails costs the budget nothing.
+#
+# With the configured chain - gpt-oss-20b plus three stand-ins - that is
+#
+#     4 models x (6 attempts x 90s in flight + 150s waiting) = 46 minutes
+#
+# for ONE agent, with no deadline able to interrupt it. The node's own
+# 300s is not a bound; it is a label on a trace note.
+#
+# The budget is therefore a deadline for the call: it starts when
+# `complete` is entered and covers every model, every attempt and the
+# time spent inside them.
+
+class _SlowClient(LT.LLMClient):
+    """Refused every time, and each attempt burns `cost` seconds of the
+    fake clock before failing - like a request that times out."""
+
+    def __init__(self, exc, cost=0.0, clock=None):
+        self._transport = None
+        self._exc, self.calls, self._cost = exc, 0, cost
+        self._clock = clock
+
+    def _http(self, prompt, max_tokens, images=None, model_override=None,
+              effort=None, json_mode=True):
+        self.calls += 1
+        if self._clock is not None:
+            self._clock[0] += self._cost
+        raise self._exc
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """A clock that only moves when something spends time on it."""
+    now = [1000.0]
+    monkeypatch.setattr(LT.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(LT.time, "sleep",
+                        lambda s: now.__setitem__(0, now[0] + s))
+    monkeypatch.setattr(LT, "_env", lambda k, d=None:
+                        "k" if k.endswith("API_KEY") else
+                        ("m" if k.endswith("MODEL") else d))
+    return now
+
+
+@pytest.fixture
+def four_models(monkeypatch):
+    monkeypatch.setattr(LT, "fallback_models",
+                        lambda: ["alt-1", "alt-2", "alt-3"])
+
+
+def test_time_spent_in_flight_counts_against_the_budget(fake_clock):
+    """A request that hangs for 90s and fails has cost 90 seconds. The
+    agent has no more of them for having been busy rather than idle."""
+    started = fake_clock[0]
+    c = _SlowClient(_err(503, None), cost=90.0, clock=fake_clock)
+    reply = c.complete("hi", 100)
+
+    spent = fake_clock[0] - started
+    assert spent <= LT._RETRY_BUDGET_S + 90.0, (
+        f"one call occupied {spent:.0f}s of an agent that has 300")
+    assert not reply.ok
+
+
+def test_the_budget_is_not_handed_out_again_per_model(fake_clock,
+                                                      four_models):
+    """Four models must share one budget, not take one each."""
+    started = fake_clock[0]
+    c = _SlowClient(_err(429, "40"), cost=10.0, clock=fake_clock)
+    c.complete("hi", 100)
+
+    spent = fake_clock[0] - started
+    assert spent <= LT._RETRY_BUDGET_S + 90.0, (
+        f"the chain spent {spent:.0f}s; the budget is "
+        f"{LT._RETRY_BUDGET_S:.0f}")
+
+
+def test_one_agent_cannot_occupy_the_graph_for_most_of_an_hour(fake_clock,
+                                                               four_models):
+    """The measured worst case, stated as the thing that must not
+    happen. 46 minutes was the configured number on 16 Oct."""
+    started = fake_clock[0]
+    c = _SlowClient(_err(503, None), cost=90.0, clock=fake_clock)
+    c.complete("hi", 100)
+
+    spent = fake_clock[0] - started
+    assert spent < 300, f"{spent:.0f}s does not fit in a 300s node"
+
+
+def test_a_call_that_is_refused_instantly_still_uses_its_retries(fake_clock):
+    """The budget must not become a retry cap. A provider that refuses
+    in milliseconds should be asked again the full number of times."""
+    c = _SlowClient(_err(429, "5"), cost=0.0, clock=fake_clock)
+    c.complete("hi", 100)
+    assert c.calls == LT._RETRIES + 1
+
+
+def test_a_spent_quota_still_moves_to_the_stand_in_at_once(fake_clock,
+                                                           four_models):
+    """The budget must not strand the chain. A daily quota breaks out of
+    the retry loop without sleeping, and that path costs nothing."""
+    import io
+
+    body = b'{"error":{"message":"tokens per day (TPD) exceeded"}}'
+
+    class _Daily(LT.LLMClient):
+        """A fresh response body each time, as a real provider sends."""
+
+        def __init__(self):
+            self._transport, self.calls = None, 0
+
+        def _http(self, prompt, max_tokens, images=None,
+                  model_override=None, effort=None, json_mode=True):
+            self.calls += 1
+            raise urllib.error.HTTPError("http://x", 429, "busy", {},
+                                         io.BytesIO(body))
+
+    c = _Daily()
+    reply = c.complete("hi", 100)
+
+    assert c.calls == 4, "one attempt on each of the four models"
+    assert fake_clock[0] == 1000.0, "a spent day is not waited out"
+    assert not reply.ok

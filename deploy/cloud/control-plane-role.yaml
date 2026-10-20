@@ -1,0 +1,22 @@
+# Custom role for the CONTROL PLANE's service account. Bind it on the ONE
+# worker instance (instance-level IAM), never at project level:
+#
+#   gcloud iam roles create atWorkerOperator --project=PROJECT \
+#       --file=control-plane-role.yaml
+#   gcloud compute instances add-iam-policy-binding WORKER_INSTANCE \
+#       --zone=WORKER_ZONE \
+#       --member=serviceAccount:CONTROL_SA_EMAIL \
+#       --role=projects/PROJECT/roles/atWorkerOperator
+#
+# The worker's own service account gets NO Compute permission at all: it
+# powers itself off from inside the guest.
+#
+# Verified on the live project (17 Oct 2026): these three permissions are
+# enough to start the worker; iam.serviceAccounts.actAs was not needed.
+title: Alpha Titans worker VM operator
+description: Read, start and stop the one Alpha Titans worker VM.
+stage: GA
+includedPermissions:
+- compute.instances.get
+- compute.instances.start
+- compute.instances.stop

@@ -156,13 +156,38 @@ def _metric(payload, name: str) -> float:
     return 0.0
 
 
-def _samples(store, job_id: str) -> list[_Sample]:
+# A report that says it was seeded, and a job id that says the same.
+#
+# `scripts/seed_synthetic_analytics.py` keeps its rows in their own
+# database, which is isolation by filing cabinet - correct today and one
+# `--db` away from not being. Two independent markers are checked here
+# instead, either of which disqualifies a row, so the guarantee survives
+# a copied database, a merged store, or one of the markers being lost in
+# a refactor. Neither can be produced by a real YouTube export.
+_SEEDED_MARK = "SYNTHETIC"
+_SEEDED_JOB = "synthetic-"
+
+
+def _seeded(job_id: str, payload) -> bool:
+    return (job_id.startswith(_SEEDED_JOB)
+            or any(_SEEDED_MARK in (lim or "")
+                   for lim in (payload.limitations or [])))
+
+
+def _samples(store, job_id: str,
+             include_seeded: bool = False) -> list[_Sample]:
     """Every job that has BOTH a measured outcome and a recorded pacing.
 
     A job missing either is not a sample. That is stricter than counting
     performance reports, and deliberately so: a video whose pacing is
     unknown cannot be put on either side of a comparison about pacing,
     and guessing which side would be inventing the finding.
+
+    `include_seeded` exists for one caller: the seeder's own `--verify`,
+    which has to run these gates over seeded rows to show they close.
+    It defaults to refusing, so every production path refuses without
+    having to remember to. Nothing in `server/` passes it, and a test
+    holds that.
     """
     out = []
     for jid in sorted(set(store.jobs()) | {job_id}):
@@ -175,6 +200,24 @@ def _samples(store, job_id: str) -> list[_Sample]:
             continue
         p = perf.payload
         if p.status != "measured" or not any(m.value > 0 for m in p.measured):
+            continue
+        # Numbers nobody measured are not evidence, however well they
+        # would pass the gates - and they WOULD pass: the seeder builds
+        # a clean two-arm split with a real effect in it, because that
+        # is what made the gates testable in the first place.
+        if not include_seeded and _seeded(jid, p):
+            continue
+        # A DEGRADED strategy is not a decision about pacing.
+        #
+        # Its deterministic fallback writes `pacing: "moderate"` because
+        # the field needs a value, not because anybody chose moderate.
+        # Counting those would build a "moderate cohort" out of the
+        # agent's absence and then compare real choices against it - and
+        # the comparison would look perfectly healthy while measuring
+        # nothing. Of the first four real runs, two had a degraded
+        # strategy; at that rate a third of any thirty would be noise
+        # wearing a label.
+        if strat.degraded:
             continue
         pacing = (strat.payload.pacing or "").strip()
         if not pacing:

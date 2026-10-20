@@ -133,17 +133,30 @@ class RenderingAgent(Agent):
                                  music)
         track = (audio or {}).get("track")
         score_plan = (audio or {}).get("score_plan") or {}
-        if score_plan.get("bpm"):
+        composer = None
+        if score_plan.get("provider") == "lyria" and not score_plan.get("error"):
+            composer = score_plan.get("model") or "lyria"
+            span.tool("music.lyria", model=composer, bpm=score_plan.get("bpm"),
+                      key=score_plan.get("key"),
+                      plain_prompt=score_plan.get("plain_prompt"),
+                      cached=bool(score_plan.get("cached")))
+        elif score_plan.get("bpm"):
+            composer = "code (bgm_stdlib)"
             span.tool("score.compose", style=score_plan["style"],
                       bpm=score_plan["bpm"], root_midi=score_plan["root_midi"],
                       seed=score_plan["seed"])
         elif score_plan.get("error"):
             span.note(f"the agent's score could not be rendered "
                       f"({score_plan['error']}); the mood-only engine ran")
+        if (score_plan.get("ai_attempt") or {}).get("error"):
+            span.note("the AI-composed track was not used ("
+                      f"{score_plan['ai_attempt']['error']}); the "
+                      "code-composed score ran instead")
         decisions.append(Decision(
             what="Audio bed",
             chose=(f"{spec.music_source}"
                    + (f" / {spec.mood}" if spec.mood else "")
+                   + (f", composed by {composer}" if composer else "")
                    + f", keep_audio={spec.keep_audio}"),
             why=("compiled from the Music artifact, whose mood is the same "
                  "closed vocabulary extras.MOODS implements; keep_audio is "

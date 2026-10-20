@@ -90,6 +90,19 @@ jobs:
       - name: Backend suite
         run: python -m pytest tests/backend -q --tb=short -rf
 
+      # The cloud path: queue, VM lifecycle, Drive protocol, ID tokens,
+      # the worker end to end. Compute and Drive are in-memory fakes, so
+      # this needs no Google credentials and never touches a real VM.
+      - name: Cloud suite
+        run: python -m pytest tests/cloud -q --tb=short -rf
+
+      # tests/e2e is NOT run here. It drives a real browser through
+      # Playwright, which is neither installed nor in requirements.txt,
+      # and adding it would mean a new dependency plus a browser
+      # download on every run. Left out deliberately rather than
+      # forgotten: `pip install playwright && playwright install
+      # chromium` runs it locally.
+
   frontend:
     runs-on: ubuntu-latest
     timeout-minutes: 10

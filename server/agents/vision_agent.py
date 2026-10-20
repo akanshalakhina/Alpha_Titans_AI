@@ -42,6 +42,7 @@ implied.
 from __future__ import annotations
 
 import math
+import re
 import os
 import time
 from pathlib import Path
@@ -51,6 +52,7 @@ from .artifacts import (Artifact, CandidateWindow, ClipAnalysis,
                         ClipAnalysisSet, Cost, Decision, InterestingMoment,
                         VisionAnalysis, VisionClip)
 from .base import Agent, AgentContext
+from .store import is_transient
 from .tools import select_tools as ST
 from .tools.pipeline_bridge import SERVER_DIR  # noqa: F401  (sys.path)
 from .trace import TraceSpan
@@ -154,6 +156,38 @@ def _str_list(raw, limit: int = 8, each: int = 60) -> list[str]:
     return [str(x)[:each] for x in raw[:limit] if isinstance(x, (str, int, float))]
 
 
+# `HTTP Error 503: Service Unavailable`, as urllib words it.
+_STATUS = re.compile(r"HTTP Error \d{3}: [A-Za-z ]+")
+
+
+def _why_nothing(failures: list[str]) -> str:
+    """Why there are no semantics: the provider, or the model.
+
+    Run 2cf39b516a5f: Gemini answered every call with HTTP 503, "this
+    model is currently experiencing high demand", through all six
+    retries. The artifact recorded "the model produced nothing usable",
+    which is the sentence for a model that answers badly - and
+    `store.is_transient` reads exactly these strings to decide what may
+    be cached. So a passing outage was filed as a settled fact about
+    this job, and every later run would have been handed the
+    vision-less analysis from cache long after the provider recovered.
+
+    The reasons are already in `failures`, one per clip. When they are
+    ALL the transport's, the transport is the answer and the provider's
+    own status goes in the message. One clip failing for its own
+    reasons is not an outage, so that keeps the original wording.
+    """
+    if failures and all(is_transient(f) for f in failures):
+        # The provider's own status line, verbatim. Paraphrasing it
+        # would lose the words `is_transient` matches on, which is the
+        # whole point of saying it here rather than in a note.
+        m = _STATUS.search(failures[0])
+        said = m.group(0) if m else failures[0][:80]
+        return (f"the provider refused every call ({said}) - a busy "
+                f"service, not an answer about this footage")
+    return "the model produced nothing usable"
+
+
 class VisionAgent(Agent):
     id = "vision"
     produces = "VisionAnalysis"
@@ -207,7 +241,30 @@ class VisionAgent(Agent):
         tok_in = tok_out = 0
         usd = 0.0
 
+        # A provider that refused one clip through every retry is down for
+        # the next one too. Run 2cf39b516a5f spent ~154s of a 268s vision
+        # span learning that twice - the same six retries and 63s of backoff
+        # per clip - while the studio sat on "Analyzing your footage". The
+        # first clip pays full price for the finding; the rest are told.
+        #
+        # Only a TRANSPORT refusal trips this (the same test the cache uses,
+        # `store.is_transient`). A model that cannot describe a dark clip may
+        # describe a bright one perfectly and is asked again. And the skipped
+        # clip's reason carries the provider's own status line, so the
+        # degradation is still recognised as transient and not cached.
+        provider_down: str | None = None
         for c in usable:
+            if provider_down is not None:
+                got = VisionClip(
+                    clip_id=c.clip_id, analysed=False,
+                    candidate_windows=[CandidateWindow(**w)
+                                       for w in windows[c.clip_id]],
+                    failure=f"not asked: the provider refused the previous "
+                            f"clip ({provider_down})")
+                span.note(f"{c.clip_id}: skipped, provider down")
+                clips[c.clip_id] = got
+                failures.append(f"{c.clip_id}: {got.failure}")
+                continue
             got, cost = self._analyse_clip(ctx, span, c, windows[c.clip_id],
                                            domain)
             tok_in += cost[0]
@@ -216,13 +273,16 @@ class VisionAgent(Agent):
             clips[c.clip_id] = got
             if got.failure:
                 failures.append(f"{c.clip_id}: {got.failure}")
+                if is_transient(got.failure):
+                    m = _STATUS.search(got.failure)
+                    provider_down = m.group(0) if m else got.failure[:120]
 
         analysed = [c for c in clips.values() if c.analysed]
         if not analysed:
             span.note("every clip failed - falling back to measurements only")
             return self._fallback(ctx, span, clip_set, usable, windows,
                                   inputs_hash, revision, started,
-                                  "the model produced nothing usable",
+                                  _why_nothing(failures),
                                   partial=clips, failures=failures,
                                   cost=(tok_in, tok_out, usd))
 

@@ -81,22 +81,49 @@ def _balanced(text: str, start: int) -> str | None:
 
 
 def _candidates(text: str):
-    """Every plausible JSON payload in the reply, best first.
+    """Every plausible JSON payload in the reply, best first, each with
+    the index it starts at.
 
     Fenced blocks come first because a model that fences its answer means
     the fence; then every `{` or `[` in document order, so a chatty
     preamble containing an example object does not stop the real one from
     being found.
+
+    The index is what tells an answer apart from a leftover - see
+    `_lost_envelope`.
     """
     for m in _FENCE.finditer(text):
-        body = m.group(1).strip()
+        raw = m.group(1)
+        body = raw.strip()
         if body:
-            yield body
+            yield body, m.start(1) + (len(raw) - len(raw.lstrip()))
     for i, ch in enumerate(text):
         if ch in "{[":
             got = _balanced(text, i)
             if got:
-                yield got
+                yield got, i
+
+
+def _lost_envelope(text: str, start: int) -> bool:
+    """True when the value at `start` was only reachable because the
+    reply's OUTERMOST value never closed.
+
+    A model whose answer is cut off at the output ceiling leaves the
+    envelope open, and the scan above then walks past it and returns the
+    last complete thing inside it - a single segment, one beat, one
+    caption. That object is valid JSON and is not the answer, and
+    nothing downstream can tell the difference by looking at it.
+
+    Position can. The real answer starts at the reply's first JSON
+    character; what is left after a cut starts later. Only the FIRST
+    opener is examined: a `{` that appears inside a string literal
+    earlier in the reply would never balance either, and treating that
+    as loss would buy a second call for a reply that was always whole.
+    """
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            return i < start and _balanced(text, i) is None
+    return False
 
 
 def parse(text: str) -> tuple[Any | None, str]:
@@ -125,7 +152,7 @@ def parse(text: str) -> tuple[Any | None, str]:
     #    is the same answer on every well-formed reply and the right one
     #    on the malformed ones.
     first_clean = None
-    for cand in _candidates(text):
+    for cand, at in _candidates(text):
         try:
             value = json.loads(cand)
         except json.JSONDecodeError:
@@ -136,14 +163,15 @@ def parse(text: str) -> tuple[Any | None, str]:
                 return json.loads(repaired), "trailing-comma"
             except json.JSONDecodeError:
                 continue
+        how = ("clean" if cand.strip() == text.strip()
+               else "fragment" if _lost_envelope(text, at)
+               else "extracted")
         # a mapping is what every caller wants; keep a bare list in case
         # nothing better turns up rather than returning it over an object
         if isinstance(value, dict):
-            return value, "clean" if cand.strip() == text.strip() \
-                else "extracted"
+            return value, how
         if first_clean is None:
-            first_clean = (value, "clean" if cand.strip() == text.strip()
-                           else "extracted")
+            first_clean = (value, how)
 
     # 2. what every other caller already does, as a safety net
     got = _vision._json_from(text)

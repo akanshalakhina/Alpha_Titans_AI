@@ -1,0 +1,34 @@
+# Public HTTPS for the control plane, with no inbound firewall rule: a
+# cloudflared "quick tunnel" makes an OUTBOUND connection to Cloudflare and
+# serves https://<random>.trycloudflare.com -> 127.0.0.1:8000.
+#
+#   sudo cp cloudflared-quick.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cloudflared-quick
+#   journalctl -u cloudflared-quick | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com'
+#
+# What it exposes is cloud.control_app: the /cloud page and /api/cloud/*,
+# behind AT_CLOUD_API_TOKEN, and nothing else.
+#
+# A quick tunnel's address CHANGES every time this service restarts, and
+# Cloudflare offers quick tunnels for testing, without an uptime guarantee.
+# For a fixed address, use a named tunnel (cloudflared.yml.example) with
+# Cloudflare Access in front.
+
+[Unit]
+Description=Alpha Titans public HTTPS (cloudflared quick tunnel)
+Wants=network-online.target
+After=network-online.target alpha-titans-control.service
+
+[Service]
+Type=simple
+User=alpha
+Group=alpha
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

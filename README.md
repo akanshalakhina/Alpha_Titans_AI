@@ -759,6 +759,15 @@ that validation has not been done.
 
 ## 10 · Deployment
 
+### Cloud: an on-demand worker VM (not yet deployed)
+
+`server/cloud/` adds a durable job queue and an on-demand worker VM. Footage
+goes to Google Drive, a worker is started only while there is work, runs this
+same pipeline unchanged, saves the result to Drive and powers itself off. It
+is off unless `AT_CLOUD_ENABLED=1`, and the local app is unchanged either
+way. Design, deployment, costs and what has not yet been verified against
+real Google Cloud: [`docs/cloud/`](docs/cloud/README.md).
+
 ### Docker (recommended — ffmpeg comes with it)
 
 ```bash

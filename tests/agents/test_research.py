@@ -10,6 +10,7 @@ dropped, and "we don't know" is a valid, expected answer.
 import json
 import time
 
+import urllib.error
 import pytest
 
 from agents.artifacts import (ContentOpportunity, EvidenceItem, ResearchReport,
@@ -554,3 +555,76 @@ def test_a_research_failure_does_not_stop_the_graph(monkeypatch):
     assert out["research_id"] is None
     assert "research exploded" in out["research_failed"]
     assert FakeRT.log
+
+
+# ================================ the credential: sent right, never shown
+#
+# No key exists on this machine, so none of this can be proved against
+# the live service. What it CAN hold is the two things that would bite
+# silently the first time a key is added: the wrong auth form, and a key
+# that escapes into somewhere it is kept.
+
+from agents.tools import search_tools as ST                   # noqa: E402
+
+KEY = "tvly-test-not-a-real-key"
+
+
+@pytest.fixture
+def keyed_search(monkeypatch):
+    monkeypatch.setenv("AT_SEARCH_API_KEY", KEY)
+    monkeypatch.delenv("AT_SEARCH_PROVIDER", raising=False)
+
+
+def _captured(monkeypatch):
+    seen = {}
+
+    def fake(self, url, headers, data=None):
+        seen.update(url=url, headers=headers, data=data)
+        return {"results": [{"title": "t", "url": "https://e.test/a",
+                             "content": "c" * 60, "score": 0.9}]}
+
+    monkeypatch.setattr(ST.SearchClient, "_get_json", fake)
+    return seen
+
+
+def test_a_key_with_no_provider_named_means_tavily(keyed_search):
+    assert ST.provider() == "tavily" and ST.SearchClient().available()
+
+
+def test_the_key_is_sent_the_way_the_current_api_documents(keyed_search,
+                                                            monkeypatch):
+    seen = _captured(monkeypatch)
+    out = ST.SearchClient().search("lego trends", 3)
+
+    assert out.hits and not out.error
+    assert seen["headers"].get("Authorization") == f"Bearer {KEY}"
+
+
+def test_the_older_body_form_is_sent_too(keyed_search, monkeypatch):
+    """Belt and braces until someone can test against a live account."""
+    seen = _captured(monkeypatch)
+    ST.SearchClient().search("lego trends", 3)
+    assert json.loads(seen["data"])["api_key"] == KEY
+
+
+def test_the_key_never_goes_into_a_url(keyed_search, monkeypatch):
+    """A URL reaches logs, traces and error strings. A header does not."""
+    seen = _captured(monkeypatch)
+    ST.SearchClient().search("lego trends", 3)
+    assert KEY not in seen["url"]
+
+
+def test_a_rejected_key_degrades_and_says_nothing_about_the_key(keyed_search,
+                                                                 monkeypatch):
+    """A 401 must reach the artifact as a failure, with the credential
+    itself nowhere in the message."""
+    def refuse(self, url, headers, data=None):
+        raise urllib.error.HTTPError(
+            "https://api.tavily.com/search", 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(ST.SearchClient, "_get_json", refuse)
+    out = ST.SearchClient().search("lego trends", 3)
+
+    assert out.error and "401" in out.error
+    assert not out.hits, "a refused call must never look like no news"
+    assert KEY not in out.error

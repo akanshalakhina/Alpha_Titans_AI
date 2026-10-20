@@ -541,3 +541,192 @@ def test_an_exception_inside_vision_is_caught_by_the_graph_node(monkeypatch):
     assert out["vision_id"] is None
     assert "vision exploded" in out["vision_failed"]
     assert FakeRT.log, "the failure was not logged"
+
+
+# ============================ a busy provider is not an unusable model
+#
+# Run 2cf39b516a5f, 16 Oct. Gemini answered every vision call with
+#
+#     HTTP 503 - "This model is currently experiencing high demand.
+#                 Spikes in demand are usually temporary."
+#
+# six times per clip, through every retry. Correct behaviour from here
+# on: no semantics, measurements kept, artifact degraded. The whole run
+# cascaded off it - ContentStrategy had no footage to judge, Story wrote
+# no beats, and the cut was assembled from motion alone.
+#
+# What was wrong was the WORDING. `fallback_used` said
+#
+#     measurements only (the model produced nothing usable)
+#
+# while the true cause sat one field away in `failures`. That phrasing
+# describes a model that answered badly, and `store.is_transient` reads
+# these strings to decide what may be cached - so a temporary outage was
+# filed as a permanent fact about this job, and every later run of it
+# would have been served the vision-less analysis from cache long after
+# the provider recovered.
+#
+# "Spikes in demand are usually temporary" is the provider telling us to
+# ask again. The artifact has to carry that sentence, not bury it.
+
+from agents.store import is_transient                          # noqa: E402
+
+
+def _refusing(status: int, reason: str, body: str = "") -> LLMClient:
+    import urllib.error
+
+    def transport(prompt, max_tokens, images=None):
+        exc = urllib.error.HTTPError("https://v/x", status, reason, {}, None)
+        return LLMReply(text="", error=f"HTTPError: {exc}{body}")
+
+    return LLMClient(transport=transport)
+
+
+def test_a_503_is_reported_as_a_busy_provider(director_ctx, tracer_span):
+    ctx, clip_set = director_ctx
+    ctx.llm = _refusing(503, "Service Unavailable")
+
+    art = run(ctx, clip_set, tracer_span)
+
+    assert art.degraded is True
+    assert art.payload.live is False
+    assert "503" in art.fallback_used, art.fallback_used
+    for c in art.payload.clips.values():
+        assert c.candidate_windows, "the measured half must survive"
+
+
+def test_a_busy_provider_is_not_cached_as_this_jobs_answer(director_ctx,
+                                                            tracer_span):
+    """The consequence that made the wording matter."""
+    ctx, clip_set = director_ctx
+    ctx.llm = _refusing(503, "Service Unavailable")
+    art = run(ctx, clip_set, tracer_span)
+
+    assert is_transient(art.fallback_used), (
+        f"{art.fallback_used!r} must be re-asked once the provider "
+        f"recovers, not served from cache for ever")
+
+
+def test_a_rate_limit_is_treated_the_same_way(director_ctx, tracer_span):
+    ctx, clip_set = director_ctx
+    ctx.llm = _refusing(429, "Too Many Requests")
+    art = run(ctx, clip_set, tracer_span)
+    assert is_transient(art.fallback_used), art.fallback_used
+
+
+def test_a_model_that_answers_badly_is_still_this_jobs_answer(director_ctx,
+                                                               tracer_span):
+    """The distinction has to cut both ways, or everything becomes
+    transient and nothing is ever cached. A model that returns prose on
+    these frames will return prose on them again."""
+    ctx, clip_set = director_ctx
+    ctx.llm = vision_llm("I'm afraid I can't see the images.")
+
+    art = run(ctx, clip_set, tracer_span)
+
+    assert art.degraded is True
+    assert not is_transient(art.fallback_used or ""), art.fallback_used
+
+
+def test_no_llm_at_all_is_not_transient_either(director_ctx, tracer_span):
+    ctx, clip_set = director_ctx
+    ctx.llm = LLMClient()
+    art = run(ctx, clip_set, tracer_span)
+    assert not is_transient(art.fallback_used or ""), art.fallback_used
+
+
+# ====================== learning the provider is down, once per run
+#
+# The same run, 2cf39b516a5f. The vision span took 268 SECONDS on two
+# clips while the studio showed "Analyzing your footage" and nothing
+# else, and the person shut the server down believing it had hung.
+#
+# Roughly 154s of that was futile. Gemini refused every call; the agent
+# spent its six retries and 63s of backoff on the first clip learning
+# that, then spent the same six retries and the same 63s on the second
+# clip learning it again. The patience is deliberate and right - a clip
+# refused here is a clip nothing downstream can ground a beat in - but
+# it is patience with THIS CLIP. Nothing about the second clip was going
+# to change a provider that is down.
+#
+# The daily-quota path already works this way: a model whose day is
+# spent is not asked again, it is replaced. This is the same rule for
+# the same reason, scoped to one run: the first clip pays full price for
+# the finding, the rest are told.
+#
+# Deliberately narrow:
+#   * only a TRANSPORT refusal trips it - a model that returns prose on
+#     one clip may well describe the next one perfectly;
+#   * the measured half of every clip still lands, as before;
+#   * nothing is cached beyond this run.
+
+def test_a_dead_provider_is_learned_once_not_once_per_clip(director_ctx,
+                                                            tracer_span):
+    ctx, clip_set = director_ctx
+    ctx.llm = _refusing(503, "Service Unavailable")
+    calls = []
+    inner = ctx.llm._transport
+
+    def counting(prompt, max_tokens, images=None):
+        calls.append(1)
+        return inner(prompt, max_tokens, images)
+
+    ctx.llm._transport = counting
+    n_clips = len(clip_set.usable_clips)
+    assert n_clips >= 2, "this test needs more than one clip to say anything"
+
+    run(ctx, clip_set, tracer_span)
+
+    assert len(calls) < n_clips, (
+        f"{len(calls)} call(s) for {n_clips} clips - the second clip paid "
+        f"full price for a fact the first had already established")
+
+
+def test_the_skipped_clips_still_carry_their_measurements(director_ctx,
+                                                           tracer_span):
+    """Giving up on semantics must not give up on the useful half."""
+    ctx, clip_set = director_ctx
+    ctx.llm = _refusing(503, "Service Unavailable")
+    art = run(ctx, clip_set, tracer_span)
+
+    assert len(art.payload.clips) == len(clip_set.usable_clips)
+    for c in art.payload.clips.values():
+        assert c.candidate_windows, f"{c.clip_id} lost its measured windows"
+
+
+def test_a_skipped_clip_says_why_it_was_skipped(director_ctx, tracer_span):
+    """Not "the model produced nothing" - it was never asked, and the
+    reason it was never asked has to be in the artifact."""
+    ctx, clip_set = director_ctx
+    ctx.llm = _refusing(503, "Service Unavailable")
+    art = run(ctx, clip_set, tracer_span)
+
+    said = " ".join(f or "" for f in
+                    (c.failure for c in art.payload.clips.values()))
+    assert "503" in said or "provider" in said.lower(), said
+
+
+def test_a_bad_answer_on_one_clip_does_not_skip_the_others(director_ctx,
+                                                            tracer_span):
+    """The sharp edge. A model that cannot describe a dark clip may
+    describe a bright one perfectly, and must be given the chance."""
+    ctx, clip_set = director_ctx
+    calls = []
+    good = json.dumps({"summary": "a motor turning", "subjects": ["motor"],
+                       "actions": ["turning"], "hook_score": 70,
+                       "visual_quality": 70, "confidence": 80,
+                       "best_window": 1, "interesting_moments": []})
+
+    def transport(prompt, max_tokens, images=None):
+        calls.append(1)
+        return LLMReply(text="I cannot tell what this is."
+                        if len(calls) == 1 else good,
+                        tokens_in=10, tokens_out=10)
+
+    ctx.llm = LLMClient(transport=transport)
+    n_clips = len(clip_set.usable_clips)
+
+    run(ctx, clip_set, tracer_span)
+
+    assert len(calls) >= n_clips, (
+        "a model that answered badly once is still worth asking again")

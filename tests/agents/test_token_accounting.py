@@ -42,7 +42,7 @@ class _Scripted(LT.LLMClient):
         self._replies, self.calls = list(replies), []
 
     def _http(self, prompt, max_tokens, images=None, model_override=None,
-              effort=None):
+              effort=None, json_mode=True):
         self.calls.append(max_tokens)
         text, stop, tin, tout = self._replies[
             min(len(self.calls) - 1, len(self._replies) - 1)]
@@ -156,7 +156,7 @@ class _Seen(LT.LLMClient):
         self.bodies = []
 
     def _http(self, prompt, max_tokens, images=None, model_override=None,
-              effort=None):
+              effort=None, json_mode=True):
         self.bodies.append({"model": model_override or LT.model(),
                             "effort": effort, "images": bool(images)})
         return LT.LLMReply(text=GOOD, meta={"model": "m"})

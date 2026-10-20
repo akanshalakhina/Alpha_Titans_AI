@@ -1,0 +1,48 @@
+# Alpha Titans - cloud worker. Install on the WORKER VM (the L4, or a CPU VM).
+#
+#   sudo cp alpha-titans-worker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable alpha-titans-worker
+#
+# Starts at boot, drains the job queue, then exits 75 when the control plane
+# says there is nothing left - and THAT exit, and only that one, powers the
+# machine off. A crash restarts it; a crash loop powers it off rather than
+# leaving a GPU billing; `systemctl stop` just stops it.
+#
+# Before maintenance on the VM, `systemctl disable --now alpha-titans-worker`
+# first, or the control plane may stop the VM under you once it sees a
+# running VM with no worker talking to it.
+
+[Unit]
+Description=Alpha Titans cloud worker (drain the queue, then power off)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=5
+StartLimitAction=poweroff
+
+[Service]
+Type=simple
+User=alpha
+Group=alpha
+WorkingDirectory=/opt/alpha_titans/server
+EnvironmentFile=/etc/alpha-titans/worker.env
+ExecStart=/opt/alpha_titans/.venv/bin/python -m cloud.worker
+Restart=on-failure
+RestartSec=30
+# 75 = nothing left to do: a success, never restarted
+SuccessExitStatus=75
+RestartPreventExitStatus=75
+# "+" runs this one command with full privileges, so the service itself
+# needs none. It powers off ONLY on a clean exit with status 75.
+ExecStopPost=+/bin/sh -c 'if [ "$$EXIT_CODE" = "exited" ] && [ "$$EXIT_STATUS" = "75" ]; then /usr/bin/systemctl poweroff; fi'
+# room to report an interrupted job back before the process is killed
+TimeoutStopSec=120
+KillMode=mixed
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/opt/alpha_titans/uploads /opt/alpha_titans/outputs
+
+[Install]
+WantedBy=multi-user.target

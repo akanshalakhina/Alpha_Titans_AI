@@ -132,11 +132,31 @@ def _overlays_by_segment(plan: EditPlan,
     wanted = [d for d in (animation.directions or []) if d.overlay]
     if not wanted:
         return {}
+    # ONE graphic per shot.
+    #
+    # The Animation agent caps how many BEATS may carry one, but a beat
+    # becomes every segment cut from its clip - so two capped directions
+    # over a clip used twice produced four placements, two of them
+    # stacked on the same shot. Observed as `overlays on [1, 1, 2, 2]`:
+    # a chevron and a step badge sharing one frame, neither readable.
+    #
+    # And ONE shot per graphic. It used to go on every segment cut from the
+    # beat's clip, so a video cut from a single clip carried the same
+    # graphic on every shot, start to finish, at the same spot (observed:
+    # corner brackets over all six shots of job 8915e4a5b6c1). A segment
+    # does not record its beat, so graphics for one clip are dealt out in
+    # story order: the first goes on that clip's first shot, the second on
+    # its second, and a graphic with no shot left goes nowhere.
     out: dict[int, list] = {}
-    for d in wanted:
-        for s in plan.segments:
-            if s.clip_id == d.clip_id:
-                out.setdefault(s.index, []).append(d.overlay)
+    taken: dict[str, int] = {}
+    for d in sorted(wanted, key=lambda d: (d.beat_index, d.index)):
+        shots = [s.index for s in plan.segments if s.clip_id == d.clip_id]
+        n = taken.get(d.clip_id, 0)
+        while n < len(shots) and shots[n] in out:
+            n += 1
+        if n < len(shots):
+            out[shots[n]] = [d.overlay]
+        taken[d.clip_id] = n + 1
     return out
 
 
@@ -304,6 +324,32 @@ def _cut_shape(spec: RenderSpec) -> tuple[float, list[float]]:
     return max(0.1, round(total, 3)), marks
 
 
+def _cut_frames(spec: RenderSpec, most: int = 3) -> list[bytes]:
+    """A frame from the first, middle and last shots of the cut, as the
+    viewer will see them, so the music can be written to what the video
+    shows. Empty when anything is missing; the music is then written from
+    words alone."""
+    from . import shot_check as _sc
+    try:
+        src = Path(read_manifest(str(spec.build_dir)).get("src") or "")
+    except Exception:                                       # noqa: BLE001
+        return []
+    segs = list(spec.segments)
+    if not segs or not str(src) or not src.is_dir():
+        return []
+    canvas = tuple(spec.canvas)
+    out = []
+    for i in sorted({0, len(segs) // 2, len(segs) - 1})[:most]:
+        sg = segs[i]
+        fill = (spec.framing == "fill"
+                and (sg.orientation == "vertical") != (canvas[1] > canvas[0]))
+        f = _sc.frame_jpeg(src / sg.clip_id, (sg.start + sg.end) / 2,
+                           canvas, fill)
+        if f:
+            out.append(f)
+    return out
+
+
 def run_music(job_id: str, spec: RenderSpec, on_line=None,
               music: "Music | None" = None) -> dict:
     """Stage 7, via the EXISTING extras.music_stage. No second audio engine.
@@ -344,12 +390,26 @@ def run_music(job_id: str, spec: RenderSpec, on_line=None,
     if music is not None and settings.get("music_source") == "generate":
         from . import score_tools as _score
         duration, marks = _cut_shape(spec)
-        wav, plan = _score.compose(music, job_id,
-                                   Path(spec.build_dir) / "_agent_score.wav",
-                                   duration, marks, on_line=emit)
-        if wav is not None:
+        track = None
+        # An AI-composed track first, when one is configured (Lyria 3 on
+        # Google Cloud, see ai_music.py); the code-composed score is the
+        # fallback, so a refusal or an outage still leaves the cut scored.
+        from . import ai_music as _ai
+        if _ai.enabled():
+            track, ai_plan = _ai.compose(music, job_id, spec.build_dir,
+                                         duration, marks, on_line=emit,
+                                         images=_cut_frames(spec))
+            plan = ai_plan
+        if track is None:
+            track, code_plan = _score.compose(
+                music, job_id, Path(spec.build_dir) / "_agent_score.wav",
+                duration, marks, on_line=emit)
+            if plan.get("provider"):
+                code_plan["ai_attempt"] = plan    # why the AI track is absent
+            plan = code_plan
+        if track is not None:
             settings["music_source"] = "upload"
-            settings["music_file"] = str(wav)
+            settings["music_file"] = str(track)
 
     out = extras_mod.music_stage(job_id, settings, emit)
     if plan:

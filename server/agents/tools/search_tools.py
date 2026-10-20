@@ -238,12 +238,22 @@ class SearchClient:
             return json.loads(r.read())
 
     def _tavily(self, query: str, limit: int) -> list[SearchHit]:
+        # Two forms of the same credential, deliberately.
+        #
+        # Tavily's current API reference authenticates with
+        # `Authorization: Bearer tvly-...` and shows no key in the body;
+        # the body `api_key` field is the older documented form, which
+        # this was written against and which some accounts still accept.
+        # Nobody here has a key to test with, so sending only one form
+        # would be a coin toss settled by a 401 at the worst moment -
+        # the first real research run. Both cost nothing and agree.
         body = json.dumps({"api_key": api_key(), "query": query,
                            "max_results": limit,
                            "search_depth": "basic",
                            "include_answer": False}).encode()
         data = self._get_json("https://api.tavily.com/search",
-                              {"Content-Type": "application/json"}, body)
+                              {"Content-Type": "application/json",
+                               "Authorization": f"Bearer {api_key()}"}, body)
         out = []
         for r in (data.get("results") or [])[:limit]:
             h = _hit(r.get("title"), r.get("url"), r.get("content"),

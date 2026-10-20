@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alpha Titans Cloud Studio</title>
+<meta name="description" content="Upload LEGO clips and let AI turn them into a finished, share-ready video.">
+<meta name="theme-color" content="#0a0a0d">
+<meta name="at-ui" content="5">
+<!-- inline so the app needs no extra request and no network at all -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23FFD23F'/%3E%3Cstop offset='.55' stop-color='%23FF8A1F'/%3E%3Cstop offset='1' stop-color='%23EF3B3B'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='2' y='9' width='28' height='20' rx='5' fill='url(%23g)'/%3E%3Crect x='6' y='4' width='8' height='7' rx='2.5' fill='url(%23g)'/%3E%3Crect x='18' y='4' width='8' height='7' rx='2.5' fill='url(%23g)'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/styles.css?v=5">
+<link rel="stylesheet" href="/static/studio.css?v=25">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFD23F"/>
+      <stop offset=".55" stop-color="#FF8A1F"/>
+      <stop offset="1" stop-color="#EF3B3B"/>
+    </linearGradient>
+    <symbol id="i-brick" viewBox="0 0 48 40">
+      <rect x="2" y="12" width="44" height="26" rx="6" fill="url(#brandGrad)"/>
+      <rect x="7" y="4" width="12" height="11" rx="4" fill="url(#brandGrad)"/>
+      <rect x="29" y="4" width="12" height="11" rx="4" fill="url(#brandGrad)"/>
+      <rect x="7" y="4" width="12" height="4" rx="2" fill="#fff" opacity=".28"/>
+      <rect x="29" y="4" width="12" height="4" rx="2" fill="#fff" opacity=".28"/>
+      <rect x="2" y="12" width="44" height="6" rx="3" fill="#fff" opacity=".16"/>
+    </symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4m0 0-4.5 4.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3zm6.5 11l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6z" fill="currentColor"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5L8 5.5z" fill="currentColor"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.2 4.2L19 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 20h14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="M19 12a7 7 0 1 1-2.05-4.95M19 4v4h-4" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zm-6 9a6 6 0 0 0 12 0M12 18v3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-doc" viewBox="0 0 24 24"><path d="M7 3h7l5 5v13H7zM14 3v5h5M10 13h6M10 17h6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-nodes" viewBox="0 0 24 24"><path d="M5 6h3M16 6h3M5 12h14M5 18h3M16 18h3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="12" cy="6" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="18" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  </defs>
+</svg>
+
+<div class="sx-shell">
+  <aside id="sxSide" class="sx-side" aria-label="Workspace"></aside>
+  <div class="sx-body">
+    <main id="sxView" class="sx-view on" aria-label="Cloud studio"></main>
+  </div><!-- /.sx-body -->
+</div><!-- /.sx-shell -->
+
+<style>
+  /* Only what the studio's stylesheet has no class for: upload progress on
+     a clip card, the sign-in field, and the upload sheet preview. Built
+     from the studio's own tokens. */
+  .cl-bar { height: 6px; margin-top: 8px; border-radius: 99px;
+            background: var(--line, #2a2a33); overflow: hidden; }
+  .cl-bar > i { display: block; height: 100%; width: 0;
+                background: var(--grad, #FF8A1F); transition: width .25s; }
+  /* the studio's clip card holds a server-made poster <img>; here it holds
+     the clip itself, which must be sized the same way or it draws at its
+     full 1920x1080 and stretches the card */
+  .cx-clip { overflow: hidden; }
+  .cx-clip-th { overflow: hidden; }
+  .cx-clip-th video { width: 100%; height: 100%; object-fit: cover;
+                      display: block; }
+  /* the studio's player is 16:9; a vertical video in it is a narrow strip
+     between black bars, so it gets a 9:16 frame of its own, centred */
+  .sx-player.is-vertical { width: min(100%, calc(78vh * 9 / 16));
+                          margin: 0 auto; }
+  .sx-player.is-vertical video { aspect-ratio: 9 / 16; }
+  /* the upload's progress under the drop zone, and the production's
+     percentage and time left on the working screen */
+  .cl-bar-lg { height: 10px; }
+  .cl-up { margin-top: 16px; }
+  .cl-up-line { margin: 0 0 8px; font-size: 14px; color: var(--ink); }
+  .cl-up.is-done .cl-up-line { color: var(--green); }
+  .cl-up.is-error .cl-up-line { color: var(--bad); }
+  .cl-up .cx-ex { margin-top: 10px; }
+  .cl-progress { margin: 22px 0 6px; max-width: 520px; }
+  .cl-progress-top { display: flex; justify-content: space-between;
+                     align-items: baseline; margin-bottom: 8px; }
+  .cl-progress-top b { font-size: 22px; color: var(--ink); }
+  .cl-progress-top span { color: var(--ink-2); font-size: 14px; }
+  .cl-token { width: 100%; box-sizing: border-box; }
+  .cl-sheet { white-space: pre-wrap; font-size: .85rem; max-height: 320px;
+              overflow: auto; margin: 0; }
+  .cl-files { list-style: none; padding: 0; margin: 8px 0 0; }
+  .cl-files li { display: flex; justify-content: space-between; gap: 12px;
+                 padding: 8px 0; border-bottom: 1px solid var(--line, #2a2a33);
+                 font-size: var(--t-meta, 13px); }
+  .cl-files a { display: inline-flex; align-items: center; gap: 8px;
+                color: var(--ink); text-decoration: none; font-weight: 500; }
+  .cl-files a:hover { color: var(--accent); }
+  .cl-files a svg { width: 16px; height: 16px; flex: none; }
+  .sx-pack .cx-cta { margin-top: 0; }
+  .cl-yt { margin-top: 28px; }
+</style>
+<script type="module" src="/static/cloud.js?v=11"></script>
+</body>
+</html>

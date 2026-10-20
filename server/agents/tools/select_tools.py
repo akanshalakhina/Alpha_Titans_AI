@@ -173,6 +173,44 @@ def best_window_avoiding(clip: ClipAnalysis, length: float, taken):
     return best
 
 
+def top_windows(clip: ClipAnalysis, length: float, taken=None, k: int = 4,
+                step: float = 0.5, spread: float = 0.0
+                ) -> list[tuple[float, float, float]]:
+    """The `k` best windows of `length` by the pipeline's own score, none
+    overlapping another or a range already used - the CANDIDATES a shot can
+    be chosen from by looking at it (`shot_check`). The motion score alone
+    favours a hand waving in front of the lens; this keeps the next few
+    contenders so something can choose between them.
+
+    The planner dict is built once: `window_score` builds it per call,
+    which over an 80-minute clip is thousands of copies of its series.
+    """
+    dur = clip.technical.duration
+    if length > dur or length <= 0:
+        return []
+    d = clip.to_planner_dict()
+    scored = []
+    t = 0.0
+    while t + length <= dur + 1e-6:
+        if not taken or not _overlaps(t, t + length, taken):
+            scored.append((float(build_video.window_score(d, t, t + length)),
+                           round(t, 2)))
+        t += step
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    # `spread`: candidates at least this far apart. The busiest windows
+    # cluster where the hands are busiest; a steadier moment elsewhere in
+    # the clip is often the better shot, so it has to be among the choices.
+    gap = max(length, spread)
+    out: list[tuple[float, float, float]] = []
+    for score, a in scored:
+        b = round(a + length, 2)
+        if all(abs(a - x) >= gap for x, _, _ in out):
+            out.append((a, b, round(score, 3)))
+            if len(out) == k:
+                break
+    return out
+
+
 def _highest_motion_window(clip: ClipAnalysis, length: float):
     """The window with the highest RAW mean motion, ignoring freeze penalty.
 
@@ -354,13 +392,23 @@ def top_up_to_target(clip_set: ClipAnalysisSet, segments: list[Segment],
     if short < TOP_UP_MIN:
         return segments, []
 
-    by_id = {c.clip_id: c for c in clip_set.clips}
     taken: dict[str, list[tuple[float, float]]] = {}
     for s in segments:
         taken.setdefault(s.clip_id, []).append((s.start, s.end))
 
-    # richest footage first, so the added moments are the best left
-    order = sorted((c for c in clip_set.clips if c.clip_id in by_id),
+    # ONLY the clips already in the plan.
+    #
+    # A director that used one clip and left the other out made a
+    # judgement - the footage was weak, or off the point, or wrong for
+    # the story. Reaching into it to pad the length would overrule that
+    # silently, and the person would get a longer video made partly of
+    # material the agent had deliberately rejected.
+    #
+    # So the extra moments come from the footage already chosen. When
+    # that cannot fill the target, the shortfall is reported instead,
+    # which is a true thing to say about two clips and a long brief.
+    chosen = {s.clip_id for s in segments}
+    order = sorted((c for c in clip_set.clips if c.clip_id in chosen),
                    key=lambda c: -(c.motion.mean_ydif or 0.0))
     added: list[Segment] = []
     notes: list[str] = []

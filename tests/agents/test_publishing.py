@@ -160,6 +160,31 @@ def test_the_scan_reads_code_not_prose():
         {m for m in _UPLOAD_MARKERS if m in _code(code)}
 
 
+def test_a_drive_upload_is_not_mistaken_for_a_youtube_one(tmp_path):
+    """The cloud worker stores clips and renders in Google Drive through
+    `googleapis.com/upload/drive/v3/files`. That is not a way to publish
+    to a channel, which is the only thing this guard is about."""
+    (tmp_path / "server").mkdir()
+    (tmp_path / "server" / "storage.py").write_text(
+        "URL = 'https://www.googleapis.com/upload/drive/v3/files'\n")
+    found = _scan(str(tmp_path), (("server/storage.py", 1),))
+    assert found[1] == ()
+
+
+def test_narrowing_the_marker_still_catches_youtube(tmp_path):
+    """Every spelling of a YouTube upload path the guard was written for
+    is still found after the Drive endpoint was let through."""
+    (tmp_path / "server").mkdir()
+    for i, line in enumerate((
+            "U = 'https://www.googleapis.com/upload/youtube/v3/videos'",
+            "r = youtube.videos().insert(part='snippet', body=b)",
+            "from google_auth_oauthlib.flow import InstalledAppFlow")):
+        (tmp_path / "server" / f"u{i}.py").write_text(line + "\n")
+    found = _scan(str(tmp_path), tuple((f"server/u{i}.py", 1)
+                                       for i in range(3)))
+    assert len(found[1]) == 3
+
+
 def test_the_scan_would_catch_a_real_upload_path(tmp_path):
     (tmp_path / "server").mkdir()
     (tmp_path / "server" / "uploader.py").write_text(
@@ -493,7 +518,7 @@ def test_the_platform_capabilities_are_stated(pub_ctx, tracer_span, sound):
     p = run(pub_ctx, tracer_span, render, thumb).payload
     caps = " ".join(p.platform_capabilities)
     assert "read-only" in caps and "search_tools.py" in caps
-    assert "no upload, OAuth or channel access" in caps
+    assert "no YouTube upload, OAuth or channel access" in caps
 
 
 # ------------------------------------------ 7. reported through the app

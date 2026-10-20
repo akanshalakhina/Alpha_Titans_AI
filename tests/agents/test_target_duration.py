@@ -151,3 +151,70 @@ def test_footage_that_cannot_reach_the_target_says_so(two_clips):
         for a, b in spans.setdefault(s.clip_id, []):
             assert s.end <= a + 1e-6 or s.start >= b - 1e-6, "padded with a repeat"
         spans[s.clip_id].append((s.start, s.end))
+
+
+# ====================== the reasoned path needs the same guard
+#
+# `top_up_to_target` was written for the fallback planner, which gives
+# each clip one window capped at 12s. Putting it on that branch alone
+# missed the case that appeared the first time the director reasoned
+# well on real footage: it chose three five-second moments - 14.2s
+# against a 30-second target - and nothing said otherwise.
+#
+# Which moments are worth having is the model's judgement. How long the
+# finished cut runs is the operator's setting.
+
+def test_a_reasoned_plan_that_falls_short_is_topped_up(two_clips):
+    """Three good moments are still not thirty seconds."""
+    plan = [_seg(1, "long.mov", 10.0, 15.0), _seg(2, "long.mov", 40.0, 45.0),
+            _seg(3, "short.mov", 0.0, 5.0)]
+    out, notes = ST.top_up_to_target(two_clips, plan, 30.0)
+
+    assert sum(s.duration for s in out) >= 30.0 - ST.TOP_UP_MIN
+    assert len(out) > 3 and notes
+
+
+def test_the_moments_the_model_chose_are_all_kept(two_clips):
+    """Topping up adds; it never replaces the model's judgement."""
+    plan = [_seg(1, "long.mov", 10.0, 15.0), _seg(2, "short.mov", 0.0, 5.0)]
+    chosen = {(s.clip_id, s.start, s.end) for s in plan}
+    out, _ = ST.top_up_to_target(two_clips, plan, 30.0)
+    assert chosen <= {(s.clip_id, s.start, s.end) for s in out}
+
+
+def test_the_director_tops_up_on_both_paths():
+    """Pinning that the call sits after the branch, not inside one of
+    them - the shape of the bug, not just its symptom."""
+    import inspect
+    from agents.editing_director import EditingDirectorAgent
+    src = inspect.getsource(EditingDirectorAgent.execute)
+    assert src.count("top_up_to_target") == 1, \
+        "one call, covering the reasoned and fallback paths alike"
+    after_branch = src.split("top_up_to_target")[0]
+    assert after_branch.count("else:") >= 1, \
+        "it must come after the if/else, not inside it"
+
+
+def test_a_clip_the_director_left_out_stays_out(two_clips):
+    """Excluding a clip is a judgement - weak footage, off the point,
+    wrong for the story. Padding the length from it would overrule that
+    silently, and hand back a longer video made partly of material the
+    agent had rejected."""
+    plan = [_seg(1, "long.mov", 0.0, 6.0)]
+    out, _ = ST.top_up_to_target(two_clips, plan, 30.0)
+    assert {s.clip_id for s in out} == {"long.mov"}, \
+        "short.mov was not chosen and must not be reached for"
+
+
+def test_a_shortfall_is_reported_rather_than_filled_from_rejected_footage():
+    from agents.artifacts import ClipAnalysisSet
+    cs = ClipAnalysisSet(
+        clips=[_clip("short.mov", 8.0), _clip("unused.mov", 600.0)],
+        orientation="horizontal", canvas=(1920, 1080), target_seconds=60.0)
+    plan = [_seg(1, "short.mov", 0.0, 6.0)]
+    out, notes = ST.top_up_to_target(cs, plan, 60.0)
+
+    assert {s.clip_id for s in out} == {"short.mov"}
+    assert sum(s.duration for s in out) < 60.0
+    assert notes and "short of" in notes[0], \
+        "saying so beats quietly using footage that was left out"

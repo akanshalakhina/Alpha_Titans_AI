@@ -96,12 +96,18 @@ def test_every_video_id_is_distinct_and_the_right_shape(seeder):
 # ========================================================= seeding for real
 
 def _seeded(seeder):
-    """Seed, then run the agent's own history and comparison over it."""
+    """Seed, then run the agent's own history and comparison over it.
+
+    `include_seeded=True` is the same opt-in `--verify` uses, and the
+    reason it has to be asked for: without it the agent refuses these
+    rows outright, which is the behaviour the production path wants and
+    the one thing that would make this file untestable.
+    """
     from agents.learning import _samples, compare
     store = ArtifactStore(seeder.DB)
     job = "synthetic-001"
     h = _history(store, job)
-    return h, compare(_samples(store, job))
+    return h, compare(_samples(store, job, include_seeded=True))
 
 
 def test_seeding_opens_every_gate_except_approval(seeder, capsys):

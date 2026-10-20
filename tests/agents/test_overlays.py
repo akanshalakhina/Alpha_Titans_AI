@@ -246,14 +246,45 @@ def _animation(*directions):
     return Animation(animation_type="reasoned", directions=list(directions))
 
 
-def test_a_beats_graphic_reaches_every_segment_cut_from_that_clip():
-    """A clip used twice is two moments of one beat."""
+def test_a_beats_graphic_lands_on_one_shot_from_that_clip():
+    """A clip used twice is two moments; the graphic belongs on one."""
     plan = _plan("a.mp4", "b.mp4", "a.mp4")
     anim = _animation(AnimationDirection(
         index=1, beat_index=1, clip_id="a.mp4",
         overlay=OverlayPlacement(asset="s.png")))
     got = RT._overlays_by_segment(plan, anim)
-    assert sorted(got) == [1, 3], "both cuts from a.mp4, not b.mp4"
+    assert sorted(got) == [1], "the first cut from a.mp4 only, not b.mp4"
+
+
+def test_a_single_clip_video_does_not_carry_one_graphic_throughout():
+    """Job 8915e4a5b6c1: one source clip, six shots, the same corner
+    brackets on every one of them for the whole video."""
+    plan = _plan(*["a.mp4"] * 6)
+    anim = _animation(AnimationDirection(
+        index=1, beat_index=1, clip_id="a.mp4",
+        overlay=OverlayPlacement(asset="frame.png")))
+    assert sorted(RT._overlays_by_segment(plan, anim)) == [1]
+
+
+def test_graphics_for_one_clip_are_dealt_out_in_story_order():
+    plan = _plan(*["a.mp4"] * 4)
+    anim = _animation(
+        AnimationDirection(index=1, beat_index=3, clip_id="a.mp4",
+                           overlay=OverlayPlacement(asset="late.png")),
+        AnimationDirection(index=2, beat_index=1, clip_id="a.mp4",
+                           overlay=OverlayPlacement(asset="early.png")))
+    got = RT._overlays_by_segment(plan, anim)
+    assert sorted(got) == [1, 2]
+    assert got[1][0].asset == "early.png" and got[2][0].asset == "late.png"
+
+
+def test_more_graphics_than_shots_leaves_the_extra_out():
+    plan = _plan("a.mp4")
+    anim = _animation(*[AnimationDirection(
+        index=i, beat_index=i, clip_id="a.mp4",
+        overlay=OverlayPlacement(asset=f"g{i}.png")) for i in (1, 2)])
+    got = RT._overlays_by_segment(plan, anim)
+    assert sorted(got) == [1] and got[1][0].asset == "g1.png"
 
 
 def test_no_animation_means_no_overlays():
@@ -423,3 +454,96 @@ def test_an_unknown_anchor_falls_back_rather_than_failing():
     item["overlay"]["anchor"] = "somewhere-nice"
     got = _agent()._overlay_for(item, {"sparkle.png"}, [])
     assert got.anchor == "top-right"
+
+
+# ============================ 9. a graphic on every shot is not a design
+#
+# The prompt asks for restraint in words - "most do not, and a sticker
+# on every shot is noise" - and the first real run put one on all six
+# segments anyway, each held for its full length. Asking is not
+# enforcing, and a model has no way to see the finished screen.
+#
+# So the model still chooses WHICH beats deserve one; how many MAY is
+# decided here, which is the same division of labour as the timestamps.
+
+def _dirs(n, with_overlay):
+    from agents.artifacts import AnimationDirection
+    return [AnimationDirection(
+        index=i + 1, beat_index=i + 1, clip_id="a.mp4",
+        overlay=OverlayPlacement(asset="s.png") if i in with_overlay else None)
+        for i in range(n)]
+
+
+def _thin(directions):
+    from agents.animation import AnimationAgent
+    return AnimationAgent()._thin_overlays(directions)
+
+
+def test_a_graphic_on_every_shot_is_thinned(_=None):
+    kept, dropped = _thin(_dirs(6, set(range(6))))
+    assert dropped == 4
+    assert sum(1 for d in kept if d.overlay) == 2, "6 // 3"
+
+
+def test_the_ones_the_model_chose_first_are_the_ones_kept():
+    """Nothing is re-ranked here. The first beat it chose to decorate is
+    the one it thought mattered most."""
+    kept, _ = _thin(_dirs(9, {1, 4, 7}))
+    assert [i for i, d in enumerate(kept) if d.overlay] == [1, 4, 7]
+
+
+def test_a_restrained_choice_is_left_exactly_alone():
+    before = _dirs(6, {2})
+    kept, dropped = _thin(before)
+    assert dropped == 0 and kept == before
+
+
+def test_a_short_cut_still_gets_one():
+    """Two beats // 3 is zero, and a cut that may carry no graphic at
+    all would make the whole feature unreachable on short videos."""
+    kept, dropped = _thin(_dirs(2, {0, 1}))
+    assert sum(1 for d in kept if d.overlay) == 1 and dropped == 1
+
+
+def test_a_long_cut_does_not_get_a_dozen():
+    kept, _ = _thin(_dirs(30, set(range(30))))
+    from agents.animation import OVERLAY_CEILING
+    assert sum(1 for d in kept if d.overlay) == OVERLAY_CEILING
+
+
+def test_thinning_changes_nothing_else_about_a_direction():
+    kept, _ = _thin(_dirs(6, set(range(6))))
+    assert [d.beat_index for d in kept] == list(range(1, 7))
+    assert all(d.clip_id == "a.mp4" for d in kept)
+
+
+def test_no_overlays_at_all_is_untouched():
+    before = _dirs(4, set())
+    assert _thin(before) == (before, 0)
+
+
+def test_a_shot_never_carries_two_graphics():
+    """The Animation cap counts BEATS. A beat becomes every segment cut
+    from its clip, so two capped directions over a clip used twice
+    produced four placements with two stacked on one shot - observed as
+    `overlays on [1, 1, 2, 2]`, a chevron and a badge sharing a frame."""
+    plan = _plan("a.mp4", "a.mp4", "b.mp4")
+    anim = _animation(
+        AnimationDirection(index=1, beat_index=1, clip_id="a.mp4",
+                           overlay=OverlayPlacement(asset="sparkle.png")),
+        AnimationDirection(index=2, beat_index=2, clip_id="a.mp4",
+                           overlay=OverlayPlacement(asset="badge_step.png")))
+    got = RT._overlays_by_segment(plan, anim)
+    assert all(len(v) == 1 for v in got.values()), got
+    assert sorted(got) == [1, 2]
+
+
+def test_the_first_direction_wins_the_shot():
+    plan = _plan("a.mp4")
+    anim = _animation(
+        AnimationDirection(index=1, beat_index=1, clip_id="a.mp4",
+                           overlay=OverlayPlacement(asset="first.png")),
+        AnimationDirection(index=2, beat_index=2, clip_id="a.mp4",
+                           overlay=OverlayPlacement(asset="second.png")))
+    got = RT._overlays_by_segment(plan, anim)
+    assert got[1][0].asset == "first.png"

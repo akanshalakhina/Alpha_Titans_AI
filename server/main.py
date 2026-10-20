@@ -549,12 +549,45 @@ def build_file(job_id: str, name: str):
 
 @app.get("/api/jobs/{job_id}/download")
 def download(job_id: str):
+    """The finished video.
+
+    `output["path"]` is absolute, written when the render finished. That
+    is a fact about one machine at one moment, and this project has
+    already outlived such a moment: it moved from
+    `C:\\Users\\...\\Downloads\\alpha_titans` to `E:\\alpha_titans` on
+    14 Oct, and every build from before that still names a `C:` path in
+    its `job.json`. Four of the five builds in the studio answered 404
+    here while their videos sat in `outputs/<job>/` under exactly the
+    name the record already knew.
+
+    So the recorded path is tried first - it is right, and cheapest,
+    whenever nothing has moved - and the build directory is the
+    authority when it is not. `safe_name` reduces the record to a bare
+    filename, so no stored path, however stale or strange, can point
+    outside this job's own folder.
+
+    A build whose video is genuinely gone still 404s. Looking in the
+    right place is not the same as guessing.
+    """
     job = need(job_id)
     if not job.output:
         raise HTTPException(409, "this build has no finished output yet")
     path = Path(job.output["path"])
-    if not path.exists():
-        raise HTTPException(404, "output file is missing from disk")
+    try:
+        there = path.is_file()
+    except OSError:
+        # A stale path can be worse than absent. On Windows, stat-ing
+        # `C:\...\System32\config\SAM` raises PermissionError and a
+        # path on a drive that is no longer mounted raises OSError -
+        # both of which crashed this endpoint with a 500 instead of
+        # looking in the obvious place. Unreadable and missing are the
+        # same answer here: not usable, look in the build directory.
+        there = False
+    if not there:
+        here = adapter.build_dir(job_id) / safe_name(path.name)
+        if not here.is_file():
+            raise HTTPException(404, "output file is missing from disk")
+        path = here
     return FileResponse(path, media_type="video/mp4", filename=path.name)
 
 
@@ -641,6 +674,21 @@ try:
     app.include_router(_agent_router)
 except Exception:                       # noqa: BLE001 - optional component
     pass
+
+
+# Cloud orchestration (server/cloud/, docs/cloud/). Inert unless
+# AT_CLOUD_ENABLED=1: with it off this mounts no route, starts no thread and
+# opens no database, and every route above behaves exactly as before. A
+# failure to mount is logged and the local app carries on.
+try:
+    from cloud.app import mount as _mount_cloud
+    _mount_cloud(app, host=config.HOST, web_dir=WEB)
+except Exception as _exc:               # noqa: BLE001 - optional component
+    import logging as _logging
+    from cloud.sanitize import redact as _redact
+    _logging.getLogger("alpha.cloud").error(
+        "cloud routes not mounted: %s", _redact(f"{type(_exc).__name__}: "
+                                                f"{_exc}"))
 
 
 if WEB.exists():

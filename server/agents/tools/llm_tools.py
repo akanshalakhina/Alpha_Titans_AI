@@ -121,7 +121,24 @@ VISION_RETRIES = 6
 _MAX_RETRY_TOKENS = 4000
 
 
-# The total a single call may spend WAITING, across all its retries.
+# The total a single `complete()` may spend before it gives up - across
+# every retry AND every stand-in model, counting the time inside each
+# attempt as well as the pauses between them.
+#
+# It used to count only the pauses, and to start again for each model in
+# the chain. Neither was enough. On 16 Oct a studio upload sat on step 1
+# and never moved: `content_strategy` began and nothing could stop it,
+# because `POLICIES[...].timeout_s` is enforced by the SCHEDULER over
+# media-pool work and an in-process HTTP call is not pool work. With the
+# configured chain that came to
+#
+#     4 models x (6 attempts x 90s in flight + 150s waiting) = 46 minutes
+#
+# of one agent, inside a node labelled 300s. A request that hangs for its
+# full timeout has spent the agent's time just as surely as a sleep has,
+# so both are counted and the total is shared by the whole chain.
+#
+# The original reason for the budget is unchanged:
 #
 # Capping each individual wait at 30s threw away the one number that is
 # actually known to be right. Groq answers a rate limit with `Retry-After`
@@ -137,6 +154,24 @@ _MAX_RETRY_TOKENS = 4000
 # deadline is worse than falling back, because a killed node writes
 # nothing at all.
 _RETRY_BUDGET_S = 150.0
+
+
+def _gave_up(waited: float, in_flight: float) -> str:
+    """How the budget went, in the words that fit what happened.
+
+    Waiting and hanging are both the agent's time, and they want
+    different fixes: one says the provider is rate-limiting us, the
+    other says it is unwell. The message has to tell them apart, or the
+    next person reads "gave up after 0s of waiting" on a call that
+    occupied four minutes and concludes nothing was tried.
+    """
+    if in_flight < 1.0:
+        return f"gave up after {waited:.0f}s of waiting"
+    if waited < 1.0:
+        return (f"gave up after {in_flight:.0f}s of calls that did not "
+                f"come back")
+    return (f"gave up after {waited + in_flight:.0f}s "
+            f"({waited:.0f}s waiting, {in_flight:.0f}s in calls)")
 
 
 # Which models take `reasoning_effort`, and are helped by it.
@@ -161,6 +196,71 @@ EFFORTS = ("low", "medium", "high")
 
 def _takes_effort(model_name: str) -> bool:
     return any(model_name.startswith(p) for p in _LOW_EFFORT_MODELS)
+
+
+# What Groq answers when `response_format=json_object` is set and the
+# model cannot satisfy it. The reply is NOT returned - the call fails -
+# so there is nothing for the repair layer to work on.
+# It says this two ways, and matching only the first is how the Story
+# agent kept failing after the other three were fixed:
+#
+#     Failed to generate JSON. Please adjust your prompt.
+#     Failed to validate JSON. Please adjust your prompt.
+#
+# One is the model producing nothing usable, the other its output not
+# fitting the schema. Both are the same thing here - the flag refused a
+# reply we would rather have had and tried to repair.
+_JSON_MODE_REFUSED = re.compile(r"failed to (?:generate|validate) json",
+                                re.I)
+
+
+def _body_of(exc) -> str:
+    """The response body, read once and remembered.
+
+    `HTTPError.read()` empties the stream, and two different callers now
+    want the same body - the classifier and the message. Caching it on
+    the exception means neither can take it from the other.
+    """
+    cached = getattr(exc, "_at_body", None)
+    if cached is not None:
+        return cached
+    try:
+        body = exc.read().decode("utf-8", "replace").strip()
+    except Exception:                                   # noqa: BLE001
+        body = ""
+    try:
+        exc._at_body = body
+    except Exception:                                   # noqa: BLE001
+        pass
+    return body
+
+
+def _json_mode_refused(body: str) -> bool:
+    return bool(_JSON_MODE_REFUSED.search(body or ""))
+
+
+def _http_error(exc) -> str:
+    """The provider's own words, not just the status line.
+
+    `HTTPError: HTTP Error 400: Bad Request` says nothing a person can
+    act on, and that is exactly what the Story agent reported when a
+    change to the request body started being rejected - the reason was
+    sitting in the response the whole time and nobody read it.
+
+    A 429's body is already parsed by `_daily_quota_spent`, which
+    consumes it; this is for every other code, where the body is the
+    only explanation there is.
+    """
+    base = f"{type(exc).__name__}: {exc}"
+    body = _body_of(exc)
+    if not body:
+        return base
+    try:
+        parsed = json.loads(body)
+        msg = (parsed.get("error") or {}).get("message") or body
+    except (ValueError, AttributeError):
+        msg = body
+    return f"{base} - {' '.join(str(msg).split())[:400]}"
 
 
 def _carry_cost(kept: LLMReply, discarded: LLMReply) -> None:
@@ -353,7 +453,8 @@ class LLMClient:
     def complete(self, prompt: str, max_tokens: int = 1600,
                  images: list[str] | None = None,
                  retries: int | None = None,
-                 effort: str | None = None) -> LLMReply:
+                 effort: str | None = None,
+                 json_mode: bool = True) -> LLMReply:
         """One call. `images` are base64 JPEGs, for the vision path.
 
         The injected transport is given the images too, so a test can assert
@@ -388,13 +489,21 @@ class LLMClient:
         if not images:
             chain += fallback_models()
         spent: list[str] = []
+        # One budget for the whole call, outside the chain loop and
+        # covering the time spent INSIDE each attempt as well as between
+        # them. Both of those were missing and together they let a
+        # single agent hold the graph for most of an hour - see
+        # `_RETRY_BUDGET_S`.
+        waited = in_flight = 0.0
 
         for alt in chain:
-            waited = 0.0
             for attempt in range(tries + 1):
+                if waited + in_flight >= _RETRY_BUDGET_S:
+                    break
+                began = time.monotonic()
                 try:
                     reply = self._http(prompt, max_tokens, images, alt,
-                                       effort)
+                                       effort, json_mode)
                     if spent:
                         # the trace must show that the answer came from a
                         # stand-in, not from the model that was configured
@@ -402,6 +511,7 @@ class LLMClient:
                                       "after_quota_spent": spent}
                     return reply
                 except urllib.error.HTTPError as exc:
+                    in_flight += time.monotonic() - began
                     last = exc
                     note = (_daily_quota_spent(exc) if exc.code == 429
                             else None)
@@ -411,11 +521,27 @@ class LLMClient:
                         # whole budget learning that again.
                         spent.append(f"{alt or model()}: {note}")
                         break
+                    if (exc.code == 400 and json_mode
+                            and _json_mode_refused(_body_of(exc))):
+                        # `response_format` makes the provider REFUSE a
+                        # reply it cannot make valid JSON of, rather than
+                        # return the malformed one - so the repair layer
+                        # and the corrective retry, which exist for
+                        # exactly that reply, never see it.
+                        #
+                        # Measured on real footage: with it on, the four
+                        # agents with the largest schemas - strategy,
+                        # story, music and the editing director - all
+                        # took a 400 and fell back, and the cut lost its
+                        # narrative. Asking again without it gives those
+                        # defences something to work with.
+                        return self.complete(prompt, max_tokens, images,
+                                             retries, effort,
+                                             json_mode=False)
                     if exc.code not in (429, 503) or attempt == tries:
-                        return LLMReply(text="",
-                                        error=f"{type(exc).__name__}: {exc}")
+                        return LLMReply(text="", error=_http_error(exc))
                     pause = _retry_after(exc, attempt)
-                    if waited + pause > _RETRY_BUDGET_S:
+                    if waited + in_flight + pause > _RETRY_BUDGET_S:
                         # Stopping here is deliberate. Sleeping past the
                         # budget would see the agent killed on its deadline
                         # with nothing written; giving up now leaves time
@@ -423,13 +549,13 @@ class LLMClient:
                         # we waited so the trace shows a busy provider
                         # rather than a broken one.
                         return LLMReply(
-                            text="",
-                            error=f"{type(exc).__name__}: {exc} "
-                                  f"(gave up after {waited:.0f}s of waiting)")
+                            text="", error=f"{type(exc).__name__}: {exc} "
+                                           f"({_gave_up(waited, in_flight)})")
                     time.sleep(pause)
                     waited += pause
                 except (urllib.error.URLError, OSError, json.JSONDecodeError,
                         TimeoutError, KeyError, ValueError) as exc:
+                    in_flight += time.monotonic() - began
                     return LLMReply(text="",
                                     error=f"{type(exc).__name__}: {exc}")
 
@@ -475,19 +601,39 @@ class LLMClient:
         # is doubled once, here, when the reply was truncated before any
         # JSON appeared. It costs a second call only on a reply that was
         # going to be thrown away.
-        if parsed is None and reply.truncated and max_tokens < _MAX_RETRY_TOKENS:
+        #
+        # A cut-off reply that the repair layer SALVAGED is the same
+        # problem wearing a disguise, and it cost a day to see. The
+        # EditingDirector asked for 1600 and spent exactly 1600; the
+        # reply stopped part-way through its `segments` array; the
+        # repair scan walked past the envelope that never closed and
+        # returned the last complete segment object inside it. Valid
+        # JSON, `parsed is not None`, so this widening never fired - and
+        # the director rejected it with "no segments in the reply",
+        # which reads as a model that answered badly rather than a
+        # budget that ran out. `fragment` is that case named, so the
+        # same second call covers it.
+        if (reply.truncated and (parsed is None or how == "fragment")
+                and max_tokens < _MAX_RETRY_TOKENS):
             wider = min(max_tokens * 2, _MAX_RETRY_TOKENS)
             retried = self.complete(prompt, wider, images, retries, effort)
             _carry_cost(retried, reply)
             parsed, how = _repair.parse(retried.text)
             if how not in ("clean", "empty"):
                 retried.meta = {**(retried.meta or {}), "json_repair": how}
-            if parsed is not None:
+            if parsed is not None and how != "fragment":
                 retried.meta = {**(retried.meta or {}),
                                 "widened_from": max_tokens}
                 return parsed, retried
             reply = retried
             max_tokens = wider
+
+        # What survived a cut is not an answer. Returning it would hand
+        # the caller one segment of a plan, one beat of a story, and no
+        # way of telling that from a model that meant to send exactly
+        # that.
+        if how == "fragment":
+            parsed = None
 
         # A reply that arrived WHOLE and still is not JSON is a formatting
         # slip, not a budget problem, and the model can fix it if it is
@@ -516,7 +662,7 @@ class LLMClient:
 
         if parsed is None and reply.truncated and not reply.error:
             reply.error = (f"the reply was cut off at the {max_tokens}-token "
-                           f"output limit before any JSON was written")
+                           f"output limit before the JSON was finished")
         if not reply.ok:
             return None, reply
         return parsed, reply
@@ -526,7 +672,8 @@ class LLMClient:
     def _http(self, prompt: str, max_tokens: int,
               images: list[str] | None = None,
               model_override: str | None = None,
-              effort: str | None = None) -> LLMReply:
+              effort: str | None = None,
+              json_mode: bool = True) -> LLMReply:
         key, prov = api_key(), provider()
         use_model, use_base = model_override or model(), base_url()
         # A call carrying images goes to the vision model when one is
@@ -583,7 +730,8 @@ class LLMClient:
             # all; a 400 there would lose a clip's analysis to a flag that
             # was only ever meant to tidy up formatting. Opt out with
             # AT_LLM_JSON_MODE=0 if a future model rejects it.
-            if not images and _env("AT_LLM_JSON_MODE", "1") != "0":
+            if (json_mode and not images
+                    and _env("AT_LLM_JSON_MODE", "1") != "0"):
                 body["response_format"] = {"type": "json_object"}
             # Only where it was measured to help - see `_LOW_EFFORT_MODELS`.
             # A model that is not on that list runs exactly as before,
