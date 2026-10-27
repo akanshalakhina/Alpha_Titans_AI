@@ -33,7 +33,7 @@ import time
 
 from .artifacts import (Artifact, ClipAnalysisSet, Cost, CreativeCheck,
                         CriticResult, Decision, EditPlan, RenderResult,
-                        RevisionRequest, TechnicalCheck)
+                        RevisionRequest, TechnicalCheck, VisualReview)
 from .base import Agent, AgentContext
 from .tools import verify_tools as VT
 from .trace import TraceSpan
@@ -67,14 +67,21 @@ class CriticAgent(Agent):
                 previously_tried: list[dict] | None = None,
                 pass_threshold: float = DEFAULT_PASS_THRESHOLD,
                 revision: int = 0,
-                render_id: str = "") -> tuple[Artifact[CriticResult],
-                                              RevisionRequest | None]:
+                render_id: str = "",
+                visual: VisualReview | None = None
+                ) -> tuple[Artifact[CriticResult], RevisionRequest | None]:
         started = time.time()
         path = render.video_path
-        inputs_hash = self.hash_inputs(path, attempt, pass_threshold)
+        inputs_hash = self.hash_inputs(
+            path, attempt, pass_threshold,
+            visual.model_dump(mode="json") if visual else None)
 
         technical = self._technical(ctx, span, path, plan, render)
         creative, profile = self._creative(ctx, span, path)
+        shots = self._shots(visual)
+        if shots is not None:
+            creative.append(shots)
+        weak = self._weak_windows(visual)
 
         blocking = [t for t in technical
                     if not t.passed and t.severity == "blocking"]
@@ -87,18 +94,27 @@ class CriticAgent(Agent):
                        else "ESCALATE")
             summary = ("blocking technical failure: "
                        + "; ".join(t.check for t in blocking))
+        elif (overall >= pass_threshold and weak
+              and revision_count < max_revisions):
+            verdict, summary = "REVISE", (
+                "the score is %.1f, but the visual review found %d weak "
+                "shot(s) that do not show the subject; they are re-cut from "
+                "other moments" % (overall, len(weak)))
         elif overall >= pass_threshold:
             verdict, summary = "PASS", (
-                "technical checks passed and the hook scores %.1f against a "
-                "%.0f threshold" % (overall, pass_threshold))
+                "technical checks passed and the score is %.1f against a "
+                "%.0f threshold" % (overall, pass_threshold)
+                + ("; %d weak shot(s) remain after %d revision(s) - the "
+                   "footage has nothing clearer" % (len(weak), revision_count)
+                   if weak else ""))
         elif revision_count >= max_revisions:
             verdict, summary = "ESCALATE", (
-                "the hook still scores %.1f after %d revision(s); the maximum "
+                "the score is still %.1f after %d revision(s); the maximum "
                 "is %d, so this goes to a human rather than looping"
                 % (overall, revision_count, max_revisions))
         else:
             verdict, summary = "REVISE", (
-                "the hook scores %.1f against a %.0f threshold"
+                "the score is %.1f against a %.0f threshold"
                 % (overall, pass_threshold))
 
         compared = None
@@ -118,9 +134,12 @@ class CriticAgent(Agent):
 
         request = None
         if verdict == "REVISE":
-            request = self._revision_request(
-                attempt, creative, plan, clip_set, profile,
-                previously_tried or [])
+            if blocking or overall < pass_threshold:
+                request = self._revision_request(
+                    attempt, creative, plan, clip_set, profile,
+                    previously_tried or [])
+            request = self._with_replacements(
+                request, attempt, weak, visual, previously_tried or [])
 
         decisions = [
             Decision(
@@ -135,14 +154,27 @@ class CriticAgent(Agent):
                 decided_by="measurement", confidence=1.0),
             Decision(
                 what="Creative coverage",
-                chose="1 of 10 dimensions measured",
-                why=("Phase 1 measures the first-3-second hook only. Pacing, "
-                     "dead sections, visual variety, transition quality, "
-                     "animation, captions, music sync, story coherence and "
-                     "payoff are not implemented and are reported as "
-                     "unreviewed rather than scored"),
+                chose=("2 of 10 dimensions measured" if shots is not None
+                       else "1 of 10 dimensions measured"),
+                why=("the first-3-second hook is measured"
+                     + (", and the Visual Reviewer scored every shot for "
+                        "showing the subject" if shots is not None else
+                        " only")
+                     + ". Pacing, dead sections, visual variety, transition "
+                       "quality, animation, music sync, story coherence and "
+                       "payoff are not implemented and are reported as "
+                       "unreviewed rather than scored"),
                 decided_by="policy", confidence=1.0),
         ]
+        if weak:
+            decisions.append(Decision(
+                what="Weak shots",
+                chose=", ".join(f"#{w['index']} {w['clip_id']} "
+                                f"{w['start']:.1f}-{w['end']:.1f}s"
+                                for w in weak),
+                why=("the Visual Reviewer scored them below %.0f/10 for "
+                     "showing the subject" % visual.weak_below),
+                decided_by="llm", confidence=0.7))
 
         ctx.emit("critic: %s  score %.1f/%.0f  %s"
                  % (verdict, overall, pass_threshold, summary))
@@ -289,6 +321,70 @@ class CriticAgent(Agent):
             confidence=confidence, severity="high",
             routes_to="editing_director",
             measured=bool(profile.get("measured")))], profile
+
+    @staticmethod
+    def _shots(visual: VisualReview | None) -> CreativeCheck | None:
+        """The Visual Reviewer's scores as a creative dimension, or None
+        when nobody looked - never a made-up number."""
+        if visual is None or not visual.reviewed or not visual.shots:
+            return None
+        score = round((visual.mean_score or 0.0) * 10, 1)
+        return CreativeCheck(
+            dimension="shots_show_subject", score=score,
+            evidence=visual.summary, confidence=0.7, severity="high",
+            routes_to="editing_director", measured=True)
+
+    @staticmethod
+    def _weak_windows(visual: VisualReview | None) -> list[dict]:
+        if visual is None or not visual.reviewed:
+            return []
+        weak = set(visual.weak)
+        return [{"index": x.index, "clip_id": x.clip_id,
+                 "start": round(x.start, 2), "end": round(x.end, 2),
+                 "score": x.score}
+                for x in visual.shots if x.index in weak]
+
+    @staticmethod
+    def _with_replacements(request: RevisionRequest | None, attempt: int,
+                           weak: list[dict], visual: VisualReview | None,
+                           previously_tried: list[dict]
+                           ) -> RevisionRequest | None:
+        """Add "do not use these moments again" to the revision.
+
+        Windows rejected on EARLIER attempts are carried too, so a third
+        cut cannot drift back to a shot the reviewer turned down in the
+        first one."""
+        if not weak:
+            return request
+        rejected = []
+        for t in previously_tried:
+            rejected += (t.get("constraints") or {}).get("replace_windows", [])
+        rejected += [{k: w[k] for k in ("clip_id", "start", "end")}
+                     for w in weak]
+        seen, unique = set(), []
+        for w in rejected:
+            key = (w["clip_id"], round(float(w["start"]), 2),
+                   round(float(w["end"]), 2))
+            if key not in seen:
+                seen.add(key)
+                unique.append({"clip_id": key[0], "start": key[1],
+                               "end": key[2]})
+        issue = ("the visual review scored %s below %.0f/10: the subject is "
+                 "not clearly visible" % (
+                     ", ".join(f"shot {w['index']}" for w in weak),
+                     visual.weak_below if visual else 4.0))
+        if request is None:
+            return RevisionRequest(
+                from_attempt=attempt, target_agent="editing_director",
+                issue=issue, severity="high",
+                constraints={"replace_windows": unique},
+                rationale=("re-cut those shots from other moments of the same "
+                           "footage; never the rejected windows"),
+                previously_tried=list(previously_tried))
+        return request.model_copy(update={
+            "issue": request.issue + "; " + issue,
+            "constraints": dict(request.constraints,
+                                replace_windows=unique)})
 
     @staticmethod
     def _overall(creative: list[CreativeCheck]) -> float:

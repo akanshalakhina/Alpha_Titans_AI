@@ -86,7 +86,7 @@ from .artifacts import (ClipAnalysisSet, ContentStrategy, CriticResult,
                         EditPlan, JobState, RenderResult, ResearchReport,
                         Animation, Caption, Music, RevisionRequest, Story,
                         PerformanceAnalysis, Publishing, Thumbnail, Title,
-                        Transition, VisionAnalysis, Voiceover)
+                        Transition, VisionAnalysis, VisualReview, Voiceover)
 from .base import AgentContext
 from .caption import CaptionAgent
 from .clip_analysis import ClipAnalysisAgent
@@ -109,6 +109,7 @@ from .voiceover import VoiceoverAgent
 from .rendering import RenderingAgent
 from .research_agent import ResearchAgent
 from .vision_agent import VisionAgent
+from .visual_review import VisualReviewAgent
 from .store import ArtifactStore
 from .tools.llm_tools import LLMClient
 from .trace import TraceRecorder
@@ -152,6 +153,8 @@ class GraphState(TypedDict, total=False):
     learning_failed: str | None
     edit_plan_id: str
     render_id: str
+    visual_review_id: str | None
+    visual_review_failed: str | None
     critic_id: str
 
     attempt: int                      # render attempts, 1-based
@@ -244,6 +247,7 @@ POLICIES = {
     "caption": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "editing_director": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "render": NodePolicy(attempts=2, backoff_s=3.0, timeout_s=3600),
+    "visual_review": NodePolicy(attempts=1, timeout_s=300),
     "critic": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=900),
     "thumbnail": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
     "title": NodePolicy(attempts=2, backoff_s=1.0, timeout_s=300),
@@ -959,6 +963,45 @@ async def node_render(state: GraphState) -> dict:
     return {"render_id": art.artifact_id}
 
 
+def node_visual_review(state: GraphState) -> dict:
+    """The Quality team's look at the finished video, shot by shot.
+
+    Inside the revise cycle: it runs after EVERY render, so a re-cut is
+    looked at again. Never blocking - a review that fails leaves the Critic
+    judging exactly as it did before this node existed.
+    """
+    job_id = state["job_id"]
+    rt = runtime_for(job_id)
+    attempt = state.get("attempt", 1)
+    render_art = rt.store.get(job_id, "RenderResult", RenderResult)
+    plan_art = rt.store.get(job_id, "EditPlan", EditPlan)
+    if render_art is None or plan_art is None:          # pragma: no cover
+        return {"visual_review_id": None,
+                "visual_review_failed": "no render to review"}
+    story_art = rt.store.get(job_id, "Story", Story)
+    about = story_art.payload.logline if story_art else ""
+
+    def body(span):
+        rev = rt.store.next_revision(job_id, "VisualReview")
+        return VisualReviewAgent().execute(
+            rt.context(), span, render=render_art.payload,
+            plan=plan_art.payload, attempt=attempt, about=about,
+            revision=rev)
+
+    try:
+        art = _run_node("visual_review", VisualReviewAgent.id, job_id,
+                        attempt, [render_art.artifact_id,
+                                  plan_art.artifact_id], body)
+    except (ProcessTimeout, WorkCancelled, ProcessCancelled):
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        rt.log.append(f"visual review failed ({type(exc).__name__}: {exc}); "
+                      f"the critic judges without it")
+        return {"visual_review_id": None,
+                "visual_review_failed": str(exc)[:200]}
+    return {"visual_review_id": art.artifact_id, "visual_review_failed": None}
+
+
 def node_critic(state: GraphState) -> dict:
     job_id = state["job_id"]
     rt = runtime_for(job_id)
@@ -976,6 +1019,17 @@ def node_critic(state: GraphState) -> dict:
     if prior:
         previous = prior[-1].payload
 
+    # only the review of THIS render counts
+    visual = None
+    want = state.get("visual_review_id")
+    if want:
+        visual_art = next(
+            (a for a in rt.store.all_revisions(job_id, "VisualReview",
+                                               VisualReview)
+             if a.artifact_id == want), None)
+        if visual_art is not None and visual_art.payload.attempt == attempt:
+            visual = visual_art.payload
+
     holder: dict[str, Any] = {}
 
     def body(span):
@@ -989,7 +1043,8 @@ def node_critic(state: GraphState) -> dict:
             previously_tried=state.get("previously_tried", []),
             pass_threshold=state.get("pass_threshold",
                                      DEFAULT_PASS_THRESHOLD),
-            revision=rev, render_id=render_art.artifact_id)
+            revision=rev, render_id=render_art.artifact_id,
+            visual=visual)
         holder["request"] = request
         return art
 
@@ -1337,6 +1392,7 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_node("caption", node_caption)
     g.add_node("editing_director", node_editing_director)
     g.add_node("render", node_render)
+    g.add_node("visual_review", node_visual_review)
     g.add_node("critic", node_critic)
     g.add_node("finish", node_finish)
     g.add_node("escalate", node_escalate)
@@ -1368,7 +1424,10 @@ def _wire(g: "StateGraph") -> "StateGraph":
     g.add_edge("transition", "caption")
     g.add_edge("caption", "editing_director")
     g.add_edge("editing_director", "render")
-    g.add_edge("render", "critic")
+    # the Quality team: a vision model looks at the cut, then the critic
+    # judges with what it saw - both inside the cycle, after every render
+    g.add_edge("render", "visual_review")
+    g.add_edge("visual_review", "critic")
     g.add_conditional_edges("critic", route_after_critic, {
         "revise": "editing_director",     # <- the cycle
         "escalate": "escalate",

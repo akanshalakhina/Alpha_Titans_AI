@@ -33,6 +33,8 @@ happens immediately and synchronously.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import shutil
 import threading
 import time
@@ -40,7 +42,9 @@ import traceback
 from pathlib import Path
 
 import pydantic
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from . import compat
 from .artifacts import (SCHEMA_VERSION, ClipAnalysisSet, CriticResult,
@@ -179,6 +183,199 @@ def agent_trace(job_id: str):
     _require_agent_job(job_id)
     db, _ = resolve_job_db(job_id)
     return {"job_id": job_id, "trace": TraceRecorder(db).for_job(job_id)}
+
+
+# ------------------------------------------------------- mission control
+#
+# Which agent is working now, and what it is doing. Pure reads of the trace
+# and the artifact store (see agents/mission.py), so they work while the job
+# runs in ANOTHER process - the CLI, or the worker on the VM.
+
+def _mission_snapshot(job_id: str) -> tuple[dict, str]:
+    from . import mission
+    db, _ = resolve_job_db(job_id)
+    rows = TraceRecorder(db).for_job(job_id)
+    # True only when THIS process is running the job. A job run elsewhere
+    # reads as "unknown" (None), so a stale row is judged by its own deadline
+    # instead of being reported as stopped.
+    producing = True if _is_running(job_id) else None
+    snap = mission.build_snapshot(job_id, rows, ArtifactStore(db),
+                                  producing=producing)
+    return snap, mission.signature(rows)
+
+
+@router.get("/mission/teams")
+def mission_teams():
+    """The Chief, the nine teams and what is built or planned. No job."""
+    from . import teams
+    return teams.hierarchy()
+
+
+@router.get("/mission/jobs")
+def mission_jobs(limit: int = 30):
+    """Recent runs that have a trace, newest first, with their status.
+
+    Read from the trace table directly, so a run that is still going - or that
+    is being driven from another process - is listed as soon as its first
+    agent starts, before any artifact exists.
+    """
+    from . import mission
+    from .store import shared_db_path
+    limit = max(1, min(int(limit), 100))
+    try:
+        tracer = TraceRecorder(shared_db_path())
+        out = []
+        for jid in tracer.jobs()[:limit]:
+            rows = tracer.for_job(jid)
+            by_node: dict[str, list[dict]] = {}
+            for r in rows:
+                by_node.setdefault(r["node"], []).append(r)
+            status = mission.job_status(
+                by_node, rows, time.time(),
+                True if _is_running(jid) else None)
+            out.append({"id": jid, "status": status,
+                        "started_at": min(r["started_at"] for r in rows),
+                        "agents": len({r["node"] for r in rows})})
+        return {"jobs": out}
+    except Exception as exc:                          # noqa: BLE001
+        raise HTTPException(500, f"could not list runs: "
+                                 f"{type(exc).__name__}") from None
+
+
+@router.get("/jobs/{job_id}/mission")
+def agent_mission(job_id: str):
+    _require_agent_job(job_id)
+    snap, _sig = _mission_snapshot(job_id)
+    return snap
+
+
+@router.get("/jobs/{job_id}/mission/stream")
+async def agent_mission_stream(job_id: str, request: Request):
+    """Server-sent events: a full snapshot whenever anything changes.
+
+    A snapshot is sent when the trace changes, and at least every ten
+    seconds so the running timers stay fresh. The stream ends with an `end`
+    event once the job is done, failed, stopped or cancelled.
+    """
+    _require_agent_job(job_id)
+
+    async def events():
+        last_sig, last_sent = None, 0.0
+        while True:
+            if await request.is_disconnected():
+                return
+            snap, sig = await run_in_threadpool(_mission_snapshot, job_id)
+            now = time.time()
+            if sig != last_sig or now - last_sent >= 10.0:
+                last_sig, last_sent = sig, now
+                yield ("event: snapshot\ndata: "
+                       + json.dumps(snap, separators=(",", ":")) + "\n\n")
+            else:
+                yield ": keep-alive\n\n"
+            if snap["status"] in ("done", "failed", "stopped", "cancelled"):
+                yield "event: end\ndata: {}\n\n"
+                return
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(
+        events(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ------------------------------------------------------------- data layers
+#
+# The Data Layers team (server/datalayers): source -> staging -> AI ->
+# analytics, from the channel's numbers in the warehouse. Not part of a video
+# run, so it has its own two routes: what the last run found, and run again.
+
+_DATA_LOCK = threading.Lock()
+
+
+def _data_layers_view() -> dict:
+    import sqlite3
+
+    from datalayers import layers as DL
+    from datalayers.run import DB_PATH
+    if not DB_PATH.exists():
+        return {"ran": False, "steps": [], "report": None,
+                "agents": [a for _, a in DL.AGENTS]}
+    db = DL.connect(DB_PATH)
+    try:
+        last = db.execute("SELECT run_id FROM layer_runs ORDER BY started_at "
+                          "DESC LIMIT 1").fetchone()
+        steps = []
+        if last:
+            for r in db.execute("SELECT * FROM layer_runs WHERE run_id=? "
+                                "ORDER BY started_at", (last["run_id"],)):
+                steps.append({"layer": r["layer"], "agent": r["agent"],
+                              "ok": bool(r["ok"]),
+                              "started_at": r["started_at"],
+                              "ended_at": r["ended_at"],
+                              "checks": json.loads(r["checks"] or "[]")})
+        from datalayers import lessons as LS
+        return {"ran": bool(steps), "steps": steps, "report": DL.report(db),
+                "agents": [a for _, a in DL.AGENTS],
+                "source": DL.SOURCE_TABLE, "lessons": LS.listing(db)}
+    except sqlite3.Error as exc:
+        raise HTTPException(500, f"could not read the data layers: "
+                                 f"{type(exc).__name__}") from None
+    finally:
+        db.close()
+
+
+@router.get("/data/layers")
+def data_layers():
+    """The last run of the Data Layers team, and what its analytics say."""
+    return _data_layers_view()
+
+
+@router.post("/data/lessons/{lesson_id}/{decision}")
+def data_lesson_decide(lesson_id: str, decision: str):
+    """A person approves or rejects a lesson. Only an approved lesson
+    reaches the agents that plan the next video; a fragile one cannot be
+    approved."""
+    from datalayers import layers as DL
+    from datalayers import lessons as LS
+    from datalayers.run import DB_PATH
+    if decision not in ("approve", "reject"):
+        raise HTTPException(404, "decision must be approve or reject")
+    db = DL.connect(DB_PATH)
+    try:
+        if not LS.decide(db, lesson_id, decision == "approve"):
+            raise HTTPException(409, "no such lesson, or it is fragile and "
+                                     "cannot be approved")
+    finally:
+        db.close()
+    return _data_layers_view()
+
+
+@router.post("/data/layers/run")
+async def data_layers_run():
+    """Run the four layers now: read the warehouse, rebuild the rest."""
+    def work():
+        import io
+        from contextlib import redirect_stdout
+
+        from datalayers.run import main as run_layers
+        if not _DATA_LOCK.acquire(blocking=False):
+            raise HTTPException(409, "the data layers are already running")
+        try:
+            with redirect_stdout(io.StringIO()):
+                code = run_layers([])
+        finally:
+            _DATA_LOCK.release()
+        return code
+
+    try:
+        code = await run_in_threadpool(work)
+    except HTTPException:
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        raise HTTPException(502, f"the data layers could not run: "
+                                 f"{str(exc)[:200]}") from None
+    view = _data_layers_view()
+    view["exit_code"] = code
+    return view
 
 
 # ---------------------------------------------------------- cancellation

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alpha Titans · Mission Control</title>
+<meta name="description" content="Which agent is working now, and what it is doing.">
+<meta name="theme-color" content="#07080C">
+<link rel="stylesheet" href="/static/styles.css?v=5">
+<link rel="stylesheet" href="/static/studio.css?v=25">
+<link rel="stylesheet" href="/static/mission.css?v=4">
+</head>
+<body class="mc">
+<div class="mc-shell">
+
+  <header class="mc-top">
+    <div class="mc-brand">Alpha Titans <small>Mission Control</small></div>
+    <span id="mcJobState"></span>
+    <div id="mcTotals" class="mc-totals" aria-label="Totals for this run"></div>
+    <div class="mc-pick">
+      <label for="mcJob">Run</label>
+      <select id="mcJob" aria-label="Choose a run"></select>
+      <button id="mcFollow" class="mc-btn" type="button" aria-pressed="true"
+              title="Keep the team room on the team that is working">Follow active</button>
+    </div>
+  </header>
+
+  <section id="mcChief" class="mc-chief" aria-label="Chief"></section>
+
+  <div class="mc-grid">
+    <div>
+      <section id="mcFlow" class="mc-flow" aria-label="The nine teams"></section>
+      <section id="mcRoom" class="mc-room" aria-label="Team room"></section>
+    </div>
+    <aside class="mc-feed" aria-label="Live activity">
+      <div class="mc-feed-h">
+        <h2>Live activity</h2>
+        <button id="mcScope" class="mc-btn" type="button"
+                title="Show every team or only the selected one">All teams</button>
+      </div>
+      <ul id="mcLog" class="mc-log"></ul>
+    </aside>
+  </div>
+
+</div>
+<script type="module" src="/static/mission.js?v=6"></script>
+</body>
+</html>

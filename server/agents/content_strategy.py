@@ -188,7 +188,7 @@ class ContentStrategyAgent(Agent):
         # gate AND a person approved it. In the hash because a new
         # finding must produce a new strategy rather than a cache hit on
         # the one written before anybody had learned anything.
-        learned = _LN.as_guidance(_LN.latest_validated(ctx.store))
+        learned = _LN.guidance(ctx.store)
         if learned:
             span.tool("learning.apply", source="validated LearningReport")
 

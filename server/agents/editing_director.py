@@ -57,7 +57,7 @@ def _learned(ctx) -> str:
     LAST: the report that reaches this job was written by the job before
     it. Nothing is read that did not clear all seven gates.
     """
-    return _LN.as_guidance(_LN.latest_validated(ctx.store))
+    return _LN.guidance(ctx.store)
 from .tools import select_tools as ST
 from .tools.llm_tools import LLMReply
 from .trace import TraceSpan
@@ -113,6 +113,18 @@ Reply with ONLY a JSON object, no prose around it:
     {{"clip_id": "<exact id>", "why": "<why it is not in the cut>"}}
   ]
 }}"""
+
+
+def rejected_windows(constraints: dict) -> list[tuple[str, float, float]]:
+    """`replace_windows` from a revision, as (clip, start, end). Malformed
+    rows are skipped: a constraint must never crash the planner."""
+    out = []
+    for w in constraints.get("replace_windows") or []:
+        try:
+            out.append((str(w["clip_id"]), float(w["start"]), float(w["end"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
 
 
 class EditingDirectorAgent(Agent):
@@ -256,7 +268,8 @@ class EditingDirectorAgent(Agent):
         # making it so is arithmetic over measured windows - the same
         # division of labour as every timestamp in this file.
         segments, length_notes = ST.top_up_to_target(
-            clip_set, segments, clip_set.target_seconds)
+            clip_set, segments, clip_set.target_seconds,
+            avoid=rejected_windows(constraints))
         notes = list(notes) + length_notes
         for line in length_notes:
             ctx.emit(f"plan: {line}")
@@ -865,6 +878,11 @@ class EditingDirectorAgent(Agent):
         # `best_window` returns the same answer every time it is asked. The
         # spent ranges are handed back so the next one steps over them.
         used: dict[str, list[tuple[float, float]]] = {}
+        # Moments the Visual Reviewer turned down on an earlier render are
+        # spent before the first shot is chosen, so neither the shot check
+        # nor the motion search can hand one of them back.
+        for w in rejected_windows(constraints):
+            used.setdefault(w[0], []).append((w[1], w[2]))
 
         for i, s in enumerate(proposal["segments"]):
             clip = clip_set.by_id(s["clip_id"])
@@ -971,6 +989,27 @@ class EditingDirectorAgent(Agent):
                     "why": ("a long opening on flat footage is what the review "
                             "flagged; the window was re-searched at the "
                             "shorter length")})
+
+        # --- weak shots the Visual Reviewer sent back ---------------------
+        rejected = rejected_windows(constraints)
+        if rejected:
+            again = [sg for sg in segments
+                     if any(sg.clip_id == c and sg.start < b and a < sg.end
+                            for c, a, b in rejected)]
+            if again:
+                unmet.append({
+                    "chose": "re-used " + ", ".join(
+                        f"{sg.clip_id} {sg.start:.1f}-{sg.end:.1f}s"
+                        for sg in again),
+                    "why": ("no other moment of that length was left, so a "
+                            "window the Visual Reviewer rejected is still "
+                            "in the cut")})
+            else:
+                applied.append({
+                    "chose": f"avoided {len(rejected)} rejected moment(s)",
+                    "why": ("the Visual Reviewer scored them as not showing "
+                            "the subject; every shot was cut from somewhere "
+                            "else")})
 
         # --- did the opening actually get livelier? ----------------------
         floor = constraints.get("opening_min_mean_ydif")

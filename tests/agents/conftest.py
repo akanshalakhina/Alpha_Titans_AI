@@ -31,6 +31,12 @@ os.environ["AT_MUSIC_DIR"] = str(_TMP / "music")
 # and test_overlays.py cover the new defaults explicitly.
 os.environ["AT_SHOT_CHECK"] = "0"
 os.environ["AT_STOCK_GRAPHICS"] = "1"
+# the Visual Reviewer asks the (injected) model about the rendered video;
+# older tests script exact model replies, so it is off unless a test turns
+# it on (test_visual_review.py does)
+os.environ["AT_VISUAL_REVIEW"] = "0"
+# lessons a person approved on THIS machine must not change a test's prompt
+os.environ["AT_CHANNEL_LESSONS"] = "0"
 os.environ.pop("AT_VISION_API_KEY", None)
 os.environ.pop("AT_LLM_API_KEY", None)
 

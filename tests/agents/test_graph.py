@@ -98,7 +98,11 @@ def test_the_graph_has_the_cycle():
         assert ("vision", "editing_director") not in edges
         assert ("research", "editing_director") not in edges
         assert ("editing_director", "render") in edges
-        assert ("render", "critic") in edges
+        # the Quality team: the Visual Reviewer looks at every render
+        # before the critic judges it
+        assert ("render", "visual_review") in edges
+        assert ("visual_review", "critic") in edges
+        assert ("render", "critic") not in edges
         # packaging comes AFTER the cycle, whichever way it ended, and
         # nothing leads back from it into the cycle
         assert ("finish", "thumbnail") in edges
@@ -416,11 +420,14 @@ def test_every_artifact_is_produced_and_attributed(agent_root, calm_clip,
     assert kinds == {"ClipAnalysis", "VisionAnalysis", "ResearchReport",
                      "ContentStrategy", "Story", "Voiceover", "Music",
                      "Animation", "Transition", "Caption", "EditPlan",
-                     "RenderResult", "CriticResult", "Thumbnail",
+                     "RenderResult", "VisualReview", "CriticResult",
+                     "Thumbnail",
                      "Title", "Publishing", "PerformanceAnalysis",
                      "Learning"}
 
     producers = {r["kind"]: r["produced_by"] for r in rows}
+    # the Visual Reviewer reports on every run, even when it could not look
+    assert producers["VisualReview"] == "visual_review"
     assert producers["ClipAnalysis"] == "clip_analysis"
     assert producers["VisionAnalysis"] == "vision"
     assert producers["ResearchReport"] == "research"

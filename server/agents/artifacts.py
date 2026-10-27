@@ -97,7 +97,7 @@ ArtifactKind = Literal[
     "JobState", "ClipAnalysis", "VisionAnalysis", "ResearchReport",
     "ContentStrategy", "Story", "Voiceover", "Music", "Animation",
     "Transition", "Caption",
-    "EditPlan", "RenderSpec", "RenderResult", "CriticResult",
+    "EditPlan", "RenderSpec", "RenderResult", "VisualReview", "CriticResult",
     "RevisionRequest", "Thumbnail", "Title", "Publishing",
     "PerformanceAnalysis", "Learning",
 ]
@@ -1811,6 +1811,41 @@ class CriticResult(BaseModel):
                 if not t.passed and t.severity == "blocking"]
 
 
+# ---------------------------------------------------------- VisualReview
+
+class ShotReview(BaseModel):
+    """One shot of the RENDERED video, as a vision model saw it."""
+    model_config = ConfigDict(frozen=True)
+
+    index: int = Field(ge=1)
+    clip_id: str
+    start: float = Field(ge=0.0)          # the source window it was cut from
+    end: float = Field(ge=0.0)
+    at: float = Field(ge=0.0)             # where it sits in the finished video
+    score: float = Field(ge=0.0, le=10.0)
+    caption: str = ""
+    caption_ok: bool | None = None        # None => no caption, or not judged
+    problem: str = ""
+
+
+class VisualReview(BaseModel):
+    """The Quality team's look at the finished video, shot by shot.
+
+    `reviewed=False` means nobody looked - no vision model, a refusal, an
+    unreadable answer - and then `shots` is empty. It is never filled with
+    invented scores.
+    """
+    model_config = ConfigDict(frozen=True)
+
+    attempt: int
+    reviewed: bool
+    shots: list[ShotReview] = Field(default_factory=list)
+    weak: list[int] = Field(default_factory=list)       # shot indices
+    weak_below: float = 4.0
+    mean_score: float | None = None
+    summary: str = ""
+
+
 # ------------------------------------------------------- RevisionRequest
 
 class RevisionRequest(BaseModel):
@@ -2646,6 +2681,7 @@ __all__ = [
     "Segment", "EditPlan",
     "SegmentRenderSpec", "RenderSpec",
     "SegmentRenderInfo", "RenderTechnical", "RenderResult",
+    "ShotReview", "VisualReview",
     "TechnicalCheck", "CreativeCheck", "CriticResult", "Verdict", "Severity",
     "RevisionRequest",
     "ThumbnailOperation", "ThumbnailSource", "ThumbnailType",

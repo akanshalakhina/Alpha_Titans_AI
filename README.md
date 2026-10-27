@@ -210,6 +210,56 @@ flowchart TD
 > falls back to a rule-based path and marks its result `degraded`. The video
 > still gets made.
 
+### Teams and Mission Control
+
+**Visual Reviewer** (Quality team, `server/agents/visual_review.py`): after every
+render a vision model scores each shot of the finished video 0-10 for showing
+the subject. Shots below 4 go back to the Editing Director, which re-cuts them
+from another moment and never the rejected one (at most 2 re-cuts). Off with
+`AT_VISUAL_REVIEW=0`.
+
+**Data Layers** (`server/datalayers/`, `python -m datalayers.run` from
+`server/`): reads the channel's daily YouTube numbers from BigQuery
+(`myukti.d_content_analytics.youtube_video_daily`) and builds source -> staging
+(first-7-day numbers) -> AI (hook and topic tags) -> analytics, with a checker
+after each layer. The **Pattern Miner** then proposes lessons from the videos
+that exist; a lesson that does not survive removing each group's best video is
+marked fragile. A person approves a lesson before the Content Strategy and
+Editing Director agents see it. Mission Control's Data Layers card shows all of
+it and can re-run it.
+
+The 19 agents are also organised as a **hierarchy**: one Chief and nine teams.
+Each team has a **lead**, 3–4 **workers** and a **checker**. The structure lives
+in [`server/agents/teams.py`](server/agents/teams.py); how the graph runs is
+unchanged.
+
+| Team | Workers (✱ planned, not built) |
+|---|---|
+| Insight | Collector✱, Classifier✱, Opportunity✱, Patterns✱ |
+| Footage | Clip Analysis, Vision, ShotSelector✱ |
+| Creative | Research, Content Strategy, Story, Hook✱ |
+| Sound | Voiceover, Music, SoundDesign✱ |
+| Edit | Animation, Transition, Caption, Editing Director |
+| Render | Render, Look&Speed✱, Formats&EndCard✱ |
+| Quality | Critic, Visual Reviewer, Features✱, Calibrator✱ |
+| Publish | Thumbnail, Title, Publishing, DriftWatch✱ |
+| Learning | Performance Analysis, Learning, Metrics✱, KnowledgeBase✱ |
+
+**Mission Control** (`/mission`) shows which agent is working now and what it is
+doing: the nine teams, a team room with each worker's state and its current tool
+call, each checker's verdict, and a live activity feed. It reads the trace the
+graph already writes, so it follows a job running in another process (the CLI or
+a VM worker) and never shows a planned agent as working.
+
+* `GET /api/v2/mission/teams` – the structure, built vs planned
+* `GET /api/v2/mission/jobs` – recent runs and their status
+* `GET /api/v2/jobs/{id}/mission` – one snapshot
+* `GET /api/v2/jobs/{id}/mission/stream` – live (server-sent events)
+
+> The checkers are **derived when the page is read**: they report whether a
+> team's result looks sound but do not stop the run. Making them gates, and
+> adding the three human approval stops, are the next steps.
+
 ---
 
 ## 🔍 How a shot is chosen

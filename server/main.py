@@ -667,6 +667,17 @@ def index():
     return FileResponse(f, headers={"Cache-Control": "no-cache"})
 
 
+@app.get("/mission")
+def mission_page():
+    """Mission Control: which agent is working now and what it is doing."""
+    f = WEB / "mission.html"
+    if not f.exists():
+        return HTMLResponse(
+            "<h1>Mission Control</h1><p>frontend/mission.html missing at "
+            f"{WEB}</p>", status_code=500)
+    return FileResponse(f, headers={"Cache-Control": "no-cache"})
+
+
 # The agent layer is optional: if its dependencies are not installed the
 # existing application must still start and behave exactly as before.
 try:

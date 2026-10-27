@@ -324,6 +324,36 @@ def latest_validated(store) -> "Learning | None":
     return best.payload if best else None
 
 
+def channel_guidance() -> str:
+    """Lessons a person approved from the channel's own videos (the Data
+    Layers team's Pattern Miner, `datalayers/lessons.py`), or "".
+
+    Off with AT_CHANNEL_LESSONS=0, which the agent tests set so a lesson
+    approved on this machine cannot change what a test expects."""
+    import os
+    if os.environ.get("AT_CHANNEL_LESSONS", "1") == "0":
+        return ""
+    try:
+        from datalayers import lessons as _lessons
+        from datalayers.layers import connect
+        from datalayers.run import DB_PATH
+        if not DB_PATH.exists():
+            return ""
+        db = connect(DB_PATH)
+        try:
+            return _lessons.guidance(db)
+        finally:
+            db.close()
+    except Exception:                                 # noqa: BLE001
+        return ""                  # a lesson must never stop a production
+
+
+def guidance(store) -> str:
+    """Everything learned that the next video should see: the validated
+    decision finding, then the approved channel lessons."""
+    return as_guidance(latest_validated(store)) + channel_guidance()
+
+
 def as_guidance(report: "Learning | None") -> str:
     """The learned finding as a line for a prompt, or "" for nothing.
 

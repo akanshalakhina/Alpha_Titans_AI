@@ -70,3 +70,6 @@ data/analytics/*.csv
 # Written by scripts/dedupe_uploads.py: which upload is a hardlink to
 # which. Local bookkeeping about this machine's disk, not source.
 data/_dedupe_ledger.json
+
+# the data layers keep their working copy here until a dataset is granted
+data/layers/

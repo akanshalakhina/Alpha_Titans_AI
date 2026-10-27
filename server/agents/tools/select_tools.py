@@ -360,8 +360,9 @@ TOP_UP_MIN = 2.0
 
 
 def top_up_to_target(clip_set: ClipAnalysisSet, segments: list[Segment],
-                     target_seconds: float | None) -> tuple[list[Segment],
-                                                            list[str]]:
+                     target_seconds: float | None,
+                     avoid: list[tuple[str, float, float]] | None = None
+                     ) -> tuple[list[Segment], list[str]]:
     """Add more moments until the cut is as long as the person asked for.
 
     THE BUG THIS FIXES
@@ -395,6 +396,9 @@ def top_up_to_target(clip_set: ClipAnalysisSet, segments: list[Segment],
     taken: dict[str, list[tuple[float, float]]] = {}
     for s in segments:
         taken.setdefault(s.clip_id, []).append((s.start, s.end))
+    # moments a reviewer rejected count as spent too
+    for clip_id, a, b in avoid or []:
+        taken.setdefault(clip_id, []).append((a, b))
 
     # ONLY the clips already in the plan.
     #
