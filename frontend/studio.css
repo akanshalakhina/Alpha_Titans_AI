@@ -985,3 +985,123 @@ html, body { background: var(--bg); color: var(--ink); }
 }
 .wx-ghost:hover { opacity: 1; }
 .wx-ghost[disabled] { opacity: .35; cursor: default; }
+
+/* ═══════════════════════ AGENTS: THE PIPELINE MAP ═══════════════════════
+ * The teams in running order down a numbered spine, their agents inside as
+ * chips that take the selected run's state. Two rails on the right draw the
+ * loops: the Quality team's re-cut back to Edit, and lessons from Learning
+ * back to Creative for the next video. Planned agents are dashed. */
+.ap-section { padding: 0 var(--sx-gut); margin-top: 40px; }
+.ap-head { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px 24px;
+  justify-content: space-between; margin-bottom: 14px; }
+.ap-head h3 { margin: 0; font-family: var(--display); font-size: var(--t-h2);
+  font-weight: 600; }
+.ap-sub { margin: 6px 0 0; color: var(--ink-2); font-size: 13.5px; }
+.ap-sub code { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+.ap-live { color: var(--violet-2); font-size: 13px; text-decoration: none;
+  border: 1px solid var(--violet-line); border-radius: var(--r);
+  padding: 7px 12px; white-space: nowrap; }
+.ap-live:hover { background: var(--violet-wash); }
+.ap-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12px;
+  color: var(--ink-2); margin-bottom: 18px; }
+.ap-legend span { display: inline-flex; align-items: center; gap: 7px; }
+.ap-legend .lg { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-3); }
+.ap-legend .lg.st-ok { background: var(--green); }
+.ap-legend .lg.st-running { background: var(--violet); }
+.ap-legend .lg.st-degraded { background: var(--warn); }
+.ap-legend .lg.st-error { background: var(--bad); }
+.ap-legend .lg.planned { background: none; border: 1px dashed var(--ink-3); }
+.ap-legend .lg.loop { width: 18px; height: 0; border-radius: 0;
+  border-top: 2px dashed var(--violet-2); background: none; }
+
+.ap-map { display: grid; grid-template-columns: 40px minmax(0, 1fr) 34px 34px;
+  column-gap: 14px; row-gap: 14px; }
+.ap-spine { grid-column: 1; position: relative; display: flex;
+  justify-content: center; padding-top: 14px; }
+.ap-spine span { position: relative; z-index: 1; width: 28px; height: 28px;
+  border-radius: 50%; display: grid; place-items: center; font-size: 12px;
+  font-weight: 650; font-family: var(--mono); background: var(--raise);
+  border: 1px solid var(--line-2); color: var(--ink-2); }
+.ap-spine::after { content: ""; position: absolute; top: 42px; bottom: -14px;
+  left: 50%; border-left: 2px solid var(--line-2); }
+.ap-spine.last::after { display: none; }
+.ap-spine.st-ok span { border-color: rgba(55,211,153,.5); color: var(--green); }
+.ap-spine.st-ok::after { border-left-color: rgba(55,211,153,.35); }
+.ap-spine.st-running span { border-color: var(--violet); color: var(--violet-2);
+  background: var(--violet-wash); }
+.ap-spine.st-error span { border-color: var(--bad); color: var(--bad); }
+
+.ap-stage { grid-column: 2; background: var(--card); border: 1px solid var(--line-2);
+  border-radius: var(--r-lg); padding: 14px 16px; min-width: 0; }
+.ap-stage.st-running { border-color: var(--violet-line);
+  box-shadow: 0 0 0 1px var(--violet-line) inset; }
+.ap-stage-h { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px;
+  margin-bottom: 10px; }
+.ap-stage-h strong { font-size: 12px; letter-spacing: .16em; text-transform: uppercase;
+  font-weight: 650; }
+.ap-stage-h span { color: var(--ink-2); font-size: 13px; }
+.ap-stage-h em { margin-left: auto; font-style: normal; font-size: 11.5px;
+  color: var(--ink-3); font-family: var(--mono); }
+.ap-agents { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ap-arrow { color: var(--ink-3); font-size: 13px; }
+.ap-agent { display: inline-flex; align-items: center; gap: 8px; font: inherit;
+  font-size: 13px; color: var(--ink); background: var(--raise);
+  border: 1px solid var(--line-2); border-radius: 99px; padding: 6px 12px; }
+button.ap-agent:not([disabled]) { cursor: pointer; }
+button.ap-agent:not([disabled]):hover { border-color: var(--violet-line);
+  background: var(--violet-wash); }
+.ap-agent:focus-visible { outline: 2px solid var(--violet-2); outline-offset: 2px; }
+.ap-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); flex: none; }
+.ap-agent.st-ok .ap-dot { background: var(--green); }
+.ap-agent.st-degraded .ap-dot { background: var(--warn); }
+.ap-agent.st-error .ap-dot { background: var(--bad); }
+.ap-agent.st-running { border-color: var(--violet); background: var(--violet-wash); }
+.ap-agent.st-running .ap-dot { background: var(--violet);
+  animation: apPulse 1.4s ease-out infinite; }
+@keyframes apPulse { 0% { box-shadow: 0 0 0 0 rgba(124,92,255,.7); }
+  70%, 100% { box-shadow: 0 0 0 7px rgba(124,92,255,0); } }
+@media (prefers-reduced-motion: reduce) { .ap-agent.st-running .ap-dot { animation: none; } }
+.ap-kind { font-size: 10.5px; font-family: var(--mono); color: var(--ink-3); }
+.ap-time { font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.ap-agent.planned { border-style: dashed; background: none; color: var(--ink-2); }
+.ap-agent.planned .ap-dot { background: none; border: 1px dashed var(--ink-3); }
+.ap-note { margin: 10px 0 0; font-size: 12.5px; color: var(--ink-3); }
+.ap-loop-note { color: var(--violet-2); display: none; }
+.ap-feed { margin-top: 12px; padding: 10px 12px; border-radius: var(--r);
+  border: 1px dashed rgba(61,217,235,.45); background: var(--cyan-wash);
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; font-size: 12.5px; }
+.ap-feed-tag { font-family: var(--mono); font-size: 10.5px; color: var(--cyan);
+  text-transform: uppercase; letter-spacing: .1em; }
+.ap-feed span { color: var(--ink-2); }
+.ap-feed-num { margin-left: auto; color: var(--ink) !important; }
+
+/* the loops: a bracket from the lower team back up to the earlier one */
+.ap-rail { position: relative; margin: 30px 0; border: 2px dashed var(--violet-2);
+  border-left: 0; border-radius: 0 12px 12px 0; }
+.ap-rail.r-recut { grid-column: 3; }
+.ap-rail.r-learn { grid-column: 4; border-color: var(--cyan); }
+.ap-rail::before { content: ""; position: absolute; top: -7px; left: -2px;
+  border: 6px solid transparent; border-right: 8px solid var(--violet-2);
+  transform: translateX(-12px); }
+.ap-rail.r-learn::before { border-right-color: var(--cyan); }
+.ap-rail span { position: absolute; top: 50%; right: -9px; transform: translateY(-50%);
+  writing-mode: vertical-rl; font-size: 11px; color: var(--violet-2);
+  background: var(--bg); padding: 6px 0; white-space: nowrap; }
+.ap-rail.r-learn span { color: var(--cyan); }
+
+.ap-team { margin-top: 28px; padding: 18px; border: 1px solid var(--line-2);
+  border-radius: var(--r-lg); background: var(--card); }
+.ap-team-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.ap-tbox { border: 1px solid var(--line-3); border-radius: var(--r); padding: 9px 12px;
+  display: flex; flex-direction: column; gap: 2px; min-width: 120px; }
+.ap-tbox.soft { border-color: var(--line-2); background: var(--raise); }
+.ap-tbox b { font-size: 13px; }
+.ap-tbox span { font-size: 12px; color: var(--ink-2); }
+.ap-roster-h { padding: 0 var(--sx-gut); margin-top: 48px; }
+
+@media (max-width: 760px) {
+  .ap-map { grid-template-columns: 30px minmax(0, 1fr); column-gap: 10px; }
+  .ap-rail { display: none; }
+  .ap-loop-note { display: block; }
+  .ap-stage-h em { margin-left: 0; }
+}

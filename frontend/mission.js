@@ -22,7 +22,7 @@ const MARK = { pass: "✓", warn: "!", fail: "✗", pending: "·" };
 const state = {
   jobId: null, snap: null, selected: null, follow: true, scope: "all",
   es: null, poll: null, receivedAt: 0,
-  data: null, dataBusy: false, dataError: null,
+  data: null, dataBusy: false, dataError: null, agent: null,
 };
 
 function h(tag, attrs, ...kids) {
@@ -168,7 +168,12 @@ function card(t) {
   const [x, y] = xy(t.id);
   const sel = t.id === state.selected;
   const built = t.workers.filter((w) => w.built !== false).length;
-  const pick = () => { state.selected = t.id; state.follow = false; syncFollow(); draw(); };
+  const pick = () => {
+    state.selected = t.id; state.agent = null; state.follow = false; syncFollow(); draw();
+    const d = document.getElementById("mcDrill");
+    if (d) d.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches
+      ? "auto" : "smooth", block: "nearest" });
+  };
   const g = sv("g", {
     class: `mc-card s-${t.state}${sel ? " is-sel" : ""}`, tabindex: "0", role: "button",
     "aria-pressed": sel ? "true" : "false",
@@ -248,7 +253,75 @@ function renderFlow(s) {
       h("span", { class: "k-flow" }, "work moves on"),
       h("span", { class: "k-fb" }, "sent back / lessons"),
       h("span", { class: "k-data" }, "data from the warehouse"),
-      h("span", { class: "k-lock" }, "a person approves")));
+      h("span", { class: "k-lock" }, "a person approves")),
+    renderDrill(s));
+}
+
+// ── the agents inside the chosen team, right under the map ──
+//
+// Click a team: the agents inside it appear in a row, built ones with their
+// state, planned ones dashed.
+
+const DATA_DOES = {
+  "Source Loader": "Copies the channel's daily numbers from BigQuery, untouched.",
+  "Cleaner": "One row per video per day; every video judged on its first seven days.",
+  "Enricher": "A model tags each title's hook and topic.",
+  "Analytics Builder": "One row per video, the groups, and the file Learning reads.",
+  "Feature Analyst": "Measures each published video: length, opening energy, number of shots.",
+  "Opening Reviewer": "Looks at each video's first seconds: finished build shown? hands in the way?",
+  "Pattern Miner": "Finds lessons that still hold without the best video; a person approves each.",
+  "Why Writer": "Says in a few sentences why some videos do better, citing only those lessons.",
+};
+
+function teamWorkers(s, id) {
+  if (id === "data") {
+    const d = state.data || {};
+    return (d.agents || Object.keys(DATA_DOES)).map((a) => {
+      const st = (d.steps || []).find((x) => x.agent === a);
+      return { key: `data:${a}`, label: a, does: DATA_DOES[a] || "", built: true,
+               state: state.dataBusy ? "working" : !st ? "waiting" : st.ok ? "done" : "failed",
+               checks: st ? st.checks : [], duration_s: st ? st.ended_at - st.started_at : 0 };
+    });
+  }
+  const t = s.teams.find((x) => x.id === id);
+  return t ? t.workers : [];
+}
+
+function renderDrill(s) {
+  // Only the agents of the chosen team: who is in it, and whether each has
+  // run. No decisions or logs here - the team room further down has those.
+  const id = state.selected;
+  const team = id === "data" ? dataCard() : s.teams.find((t) => t.id === id);
+  if (!team) return h("div");
+  const workers = teamWorkers(s, id);
+  const built = workers.filter((w) => w.built).length;
+  return h("section", { class: "mc-drill", id: "mcDrill", "aria-label": `${team.label} agents` },
+    h("div", { class: "mc-drill-h" },
+      h("span", { class: "mc-drill-letter" }, LETTER[id] || ""),
+      h("h2", {}, `${team.label} team`),
+      h("span", { class: "mc-drill-count" },
+        `${built} agent${built === 1 ? "" : "s"} built${workers.length > built
+          ? ` · ${workers.length - built} planned` : ""}`)),
+    h("div", { class: "mc-agent-row" }, workers.map((w, i) => [
+      i ? h("span", { class: "mc-agent-sep", "aria-hidden": "true" }, "→") : null,
+      h("button", {
+        class: `mc-agent-chip s-${w.built ? w.state : "planned"}${w.key === state.agent ? " is-sel" : ""}`,
+        type: "button", "aria-pressed": w.key === state.agent ? "true" : "false",
+        onclick: () => { state.agent = w.key === state.agent ? null : w.key; draw(); },
+      }, dot(w.built ? w.state : "planned"), w.label,
+        w.built ? null : h("em", {}, "planned")),
+    ]).flat()),
+    aboutAgent(workers.find((w) => w.key === state.agent)));
+}
+
+// One short line about the chosen agent: what it does, and how it went.
+function aboutAgent(w) {
+  if (!w) return h("p", { class: "mc-about-hint" }, "Click an agent to see what it does.");
+  const how = !w.built ? "Planned: not built yet."
+    : [LABEL[w.state] || w.state, w.duration_s ? dur(w.duration_s) : null,
+       w.fallback ? "used its fallback" : null].filter(Boolean).join(" · ");
+  return h("div", { class: "mc-about" },
+    h("b", {}, w.label), h("span", {}, w.does || ""), h("em", {}, how));
 }
 
 function workerRow(w) {
@@ -299,7 +372,10 @@ function renderDataRoom() {
           "Cleaner": "One row per video per day; every video judged on its first seven days.",
           "Enricher": "Tags each title's hook and topic, and signs who tagged it.",
           "Analytics Builder": "One row per video, the groups, and the file Learning reads.",
+          "Feature Analyst": "Measures each published video: length, opening energy, number of shots.",
+          "Opening Reviewer": "Looks at each video's first seconds: finished build shown? hands in the way?",
           "Pattern Miner": "Finds lessons that still hold without the best video; a person approves each.",
+          "Why Writer": "Says in a few sentences why some videos do better, citing only those lessons.",
         }[a] || ""),
         st ? h("ul", { class: "mc-checks" }, st.checks.map((k) =>
           h("li", { class: "mc-check" },
@@ -338,6 +414,11 @@ function renderDataRoom() {
         h("td", { class: "num" }, `${(v.day7_avg_view_s || 0).toFixed(1)}s`),
         h("td", {}, v.hook_type || ""),
         h("td", { class: "ttl" }, v.title || "")))))) : null,
+    d.why ? h("div", { class: "mc-sub" }, "Why some videos do better") : null,
+    d.why ? h("div", { class: "mc-why" },
+      d.why.text.split(/\n/).map((t) => h("p", {}, t.replace(/\s*\[[0-9a-f]{10}\]/g, ""))),
+      h("p", { class: "mc-note" }, `Written by ${d.why.written_by} from lessons that held up; ` +
+        "each sentence rests on one of the lessons below.")) : null,
     h("div", { class: "mc-sub" }, "Lessons from the channel's videos"),
     (d.lessons || []).length
       ? h("ul", { class: "mc-lessons" }, d.lessons.map((l) =>
@@ -396,51 +477,6 @@ async function runDataLayers() {
   state.dataBusy = false; draw();
 }
 
-function renderRoom(s) {
-  if (state.selected === "data") return renderDataRoom();
-  const t = s.teams.find((x) => x.id === state.selected) || s.teams[0];
-  const c = t.checker;
-  $("#mcRoom").replaceChildren(
-    h("div", { class: "mc-room-h" },
-      h("h2", {}, t.label), badge(t.state), h("p", {}, t.purpose)),
-    h("div", { class: "mc-lead" }, dot(t.lead.state),
-      h("span", { class: "who" }, t.lead.label),
-      h("span", { class: "sum" }, t.lead.summary)),
-    h("div", { class: "mc-sub" }, "Workers"),
-    h("ul", { class: "mc-workers" }, t.workers.map(workerRow)),
-    h("div", { class: "mc-sub" }, c.label, " ", badge(c.state)),
-    c.checks.length
-      ? h("ul", { class: "mc-checks" }, c.checks.map((k) =>
-          h("li", { class: "mc-check" },
-            h("span", { class: `ic s-${k.state}` }, MARK[k.state] || "·"),
-            h("span", { class: "nm" }, k.name),
-            h("span", {}, k.detail))))
-      : h("p", { class: "mc-note" }, c.detail ||
-          (c.state === "planned" ? "No built worker to check yet."
-                                 : "Runs when the team has finished.")),
-    h("p", { class: "mc-note" },
-      "The checker reads the team's results after the fact. It reports; it " +
-      "does not stop the run. Making it a gate is a later step."));
-}
-
-function renderFeed(s) {
-  const log = $("#mcLog");
-  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-  const items = s.feed.filter((e) => state.scope === "all" || e.team === state.selected);
-  if (!items.length) {
-    log.replaceChildren(h("li", { class: "mc-empty" },
-      s.job_id ? "Nothing recorded yet." : "Pick a run to watch its agents."));
-    return;
-  }
-  log.replaceChildren(...items.map((e) =>
-    h("li", { class: `mc-ev k-${e.kind}` },
-      h("time", {}, clock(e.t)),
-      h("div", {},
-        h("span", { class: "who" }, `${e.worker}  `),
-        h("span", { class: "tx" }, e.text)))));
-  if (atBottom) log.scrollTop = log.scrollHeight;
-}
-
 function draw() {
   const s = state.snap;
   if (!s) return;
@@ -451,7 +487,11 @@ function draw() {
       || s.teams.find((t) => t.state === "waiting") || s.teams[0];
     state.selected = active.id;
   }
-  renderTop(s); renderChief(s); renderFlow(s); renderRoom(s); renderFeed(s);
+  renderTop(s); renderChief(s); renderFlow(s);
+  // only the Data Layers keep a room: its refresh button and lesson approvals
+  const room = $("#mcRoom");
+  room.hidden = state.selected !== "data";
+  if (!room.hidden) renderDataRoom();
 }
 
 function syncFollow() {
@@ -518,7 +558,7 @@ async function openJob(id) {
   }
   try { setSnapshot(await fetchSnapshot(id)); }
   catch (e) {
-    $("#mcRoom").replaceChildren(h("p", { class: "mc-empty" },
+    $("#mcFlow").replaceChildren(h("p", { class: "mc-empty" },
       `Could not read run ${id}: ${e.message}`));
     return;
   }
@@ -528,11 +568,6 @@ async function openJob(id) {
 async function init() {
   $("#mcFollow").addEventListener("click", () => {
     state.follow = !state.follow; syncFollow(); draw();
-  });
-  $("#mcScope").addEventListener("click", () => {
-    state.scope = state.scope === "all" ? "team" : "all";
-    $("#mcScope").textContent = state.scope === "all" ? "All teams" : "This team";
-    draw();
   });
   const pick = $("#mcJob");
   pick.addEventListener("change", () => openJob(pick.value || null));

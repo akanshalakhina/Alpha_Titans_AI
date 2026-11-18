@@ -59,7 +59,7 @@ def _groups(rows, dim):
             key = "Shorts" if "short" in (r["title"] or "").lower() else \
                   "regular videos"
         else:
-            key = (r[dim] or "").strip()
+            key = str(r[dim] if r[dim] is not None else "").strip()
         if key:
             out.setdefault(key, []).append(r)
     return out
@@ -73,9 +73,11 @@ def _without_top(vals):
     return sorted(vals)[:-1]
 
 
-def compare(rows, dim: str, metric: str, unit: str, name: str) -> list[dict]:
+def compare(rows, dim: str, metric: str, unit: str, name: str,
+            scope: str = "") -> list[dict]:
     """Every pair of groups on one dimension: which did better, by how
-    much, on how many videos, and whether it survives losing its best."""
+    much, on how many videos, and whether it survives losing its best.
+    `scope` ("Shorts", "regular videos") says which videos were compared."""
     groups = {k: v for k, v in _groups(rows, dim).items()
               if len(v) >= MIN_GROUP}
     keys = sorted(groups)
@@ -94,7 +96,8 @@ def compare(rows, dim: str, metric: str, unit: str, name: str) -> list[dict]:
             n = min(len(vhi), len(vlo))
             lift = mhi / mlo if mlo else None
             conf = label(n) if stable else "fragile"
-            text = (f"{hi} averaged {_fmt(mhi, unit)} {name} against "
+            text = ((f"Among {scope}: " if scope else "")
+                    + f"{hi} averaged {_fmt(mhi, unit)} {name} against "
                     f"{_fmt(mlo, unit)} for {lo}"
                     + (f" ({lift:.1f}x)" if lift else "")
                     + f", over {len(vhi)} and {len(vlo)} videos. "
@@ -102,7 +105,8 @@ def compare(rows, dim: str, metric: str, unit: str, name: str) -> list[dict]:
                        "removed." if stable else
                        "It does NOT hold once each group's best video is "
                        "removed - one video made it."))
-            lid = hashlib.sha1(f"{dim}|{metric}|{hi}|{lo}".encode()
+            key = f"{dim}|{metric}|{hi}|{lo}" + (f"|{scope}" if scope else "")
+            lid = hashlib.sha1(key.encode()
                                ).hexdigest()[:10]
             found.append({"id": lid, "dimension": dim, "metric": metric,
                           "better": hi, "worse": lo, "better_mean": mhi,
@@ -111,6 +115,111 @@ def compare(rows, dim: str, metric: str, unit: str, name: str) -> list[dict]:
                           "stable": stable, "confidence": conf,
                           "text": text})
     return found
+
+
+# What a video is, as groups a comparison can use. Numbers are split at the
+# median of the videos being compared, so "livelier opening" means livelier
+# than the middle video of THIS channel, not than some outside standard.
+FEATURE_DIMS = (
+    ("result_first", {1: "opens on the finished build",
+                      0: "does not open on the finished build"}),
+    ("hands_cover", {1: "hands cover the opening",
+                     0: "the opening is clear of hands"}),
+    ("text_on_screen", {1: "text on screen at the start",
+                        0: "no text at the start"}),
+    ("framing", None),
+    ("opening_energy", ("livelier opening", "calmer opening")),
+    ("shots", ("more shots", "fewer shots")),
+    ("avg_shot_s", ("longer shots", "shorter shots")),
+    ("duration_s", ("longer videos", "shorter videos")),
+)
+WHY_METRICS = (("pct_watched", "of the video watched", "%"),
+               ("day7_views", "first-week views", ""),
+               ("day30_views", "first-month views", ""))
+
+
+def why_rows(db) -> list[dict]:
+    """One row per measured video: its features beside its results.
+    `pct_watched` is the average view against the video's length, the only
+    fair comparison between a 20-second Short and a two-minute video."""
+    from datalayers import features as FT
+    db.executescript(FT.SCHEMA)
+    rows = db.execute(
+        "SELECT a.video_id, a.title, a.day7_views, a.day7_avg_view_s, "
+        "d.published_date, f.duration_s, f.opening_energy, f.shots, "
+        "f.avg_shot_s, l.result_first, l.hands_cover, l.text_on_screen, "
+        "l.framing FROM analytics_video_performance a "
+        "JOIN staging_video_day7 d USING (video_id) "
+        "JOIN video_features f USING (video_id) "
+        "LEFT JOIN ai_video_looks l USING (video_id) WHERE a.mature=1"
+    ).fetchall()
+    out = []
+    for r in rows:
+        r = dict(r)
+        end30 = None
+        try:
+            import datetime as dt
+            end30 = (dt.date.fromisoformat(r["published_date"])
+                     + dt.timedelta(days=29)).isoformat()
+        except (TypeError, ValueError):
+            pass
+        m30 = db.execute(
+            "SELECT SUM(views), MAX(metric_date) FROM staging_video_daily "
+            "WHERE video_id=? AND metric_date BETWEEN ? AND ?",
+            (r["video_id"], r["published_date"], end30)).fetchone()
+        r["day30_views"] = (m30[0] or 0.0) if (end30 and m30[1]
+                                                and m30[1] >= end30) else None
+        r["pct_watched"] = (round(100.0 * r["day7_avg_view_s"]
+                                  / r["duration_s"], 1)
+                            if r["duration_s"] else None)
+        out.append(r)
+    return out
+
+
+def _labelled(rows, dim, labels):
+    """Copy of rows with `dim` turned into the words a lesson uses."""
+    vals = sorted(float(r[dim]) for r in rows if r.get(dim) is not None)
+    out = []
+    for r in rows:
+        v = r.get(dim)
+        if v is None:
+            continue
+        if labels is None:
+            lab = str(v)
+        elif isinstance(labels, dict):
+            lab = labels.get(int(v))
+        else:
+            mid = vals[len(vals) // 2] if vals else 0
+            lab = labels[0] if float(v) >= mid else labels[1]
+        if lab:
+            out.append(dict(r, **{dim: lab}))
+    return out
+
+
+def _is_short(r) -> bool:
+    return "short" in (r.get("title") or "").lower()
+
+
+def mine_features(db) -> tuple[list[dict], int]:
+    """Lessons about what videos ARE: every feature, on every result
+    measure, across all videos and within Shorts and regular videos apart
+    - because length and format move with almost everything else, a
+    difference seen only across the mix may just be the format again."""
+    rows = why_rows(db)
+    found, tried = [], 0
+    scopes = (("", rows),
+              ("Shorts", [r for r in rows if _is_short(r)]),
+              ("regular videos", [r for r in rows if not _is_short(r)]))
+    for scope, subset in scopes:
+        for dim, labels in FEATURE_DIMS:
+            lab = _labelled(subset, dim, labels)
+            for metric, name, unit in WHY_METRICS:
+                usable = [r for r in lab if r.get(metric) is not None]
+                if len({r[dim] for r in usable}) < 2:
+                    continue
+                tried += 1
+                found += compare(usable, dim, metric, unit, name, scope)
+    return found, tried
 
 
 def mine(db) -> list[dict]:
@@ -126,6 +235,8 @@ def mine(db) -> list[dict]:
             if dim == "format" and metric == "day7_avg_view_s":
                 continue            # a Short is shorter; not a fair contest
             found += compare(rows, dim, metric, unit, name)
+    feat, tried = mine_features(db)
+    found += feat
     now = time.time()
     keep = {r["id"]: r for r in db.execute(
         "SELECT id, status, decided_at, decided_by FROM lessons")}
@@ -148,6 +259,13 @@ def mine(db) -> list[dict]:
     return [{"name": "lessons_found", "ok": True,
              "detail": f"{len(found)} comparison(s); {stable} hold without "
                        f"their best video, {len(found) - stable} fragile"},
+            {"name": "video_features_used", "ok": True,
+             "detail": (f"{tried} feature comparison(s) tried on "
+                        f"{len(why_rows(db))} measured video(s); with many "
+                        f"tries a few will look real by chance, which is why "
+                        f"each needs a person and a test on new videos")
+                       if tried else "no measured videos yet, so no "
+                                     "lessons about what the videos are"},
             {"name": "nothing_used_without_approval", "ok": True,
              "detail": "every new lesson starts as proposed"}]
 

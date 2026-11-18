@@ -53,6 +53,14 @@ def table():
     return rows
 
 
+@pytest.fixture(autouse=True)
+def _no_real_videos(tmp_path, monkeypatch):
+    """The feature steps look in a folder of their own, never the real one."""
+    d = tmp_path / "channel_videos"
+    d.mkdir()
+    monkeypatch.setenv("AT_CHANNEL_VIDEOS", str(d))
+
+
 @pytest.fixture
 def db(tmp_path):
     return L.connect(tmp_path / "layers.db")
@@ -70,12 +78,14 @@ def test_all_four_layers_run_in_order_and_pass(db, tmp_path):
                 emit=lines.append)
     assert out["ok"]
     assert [s["layer"] for s in out["steps"]] == [
-        "source", "staging", "ai", "analytics", "lessons"]
+        "source", "staging", "ai", "analytics", "features", "looks",
+        "lessons", "why"]
     assert [s["agent"] for s in out["steps"]] == [a for _, a in L.AGENTS]
     runs = db.execute("SELECT layer, ok FROM layer_runs").fetchall()
     assert [tuple(r) for r in runs] == [("source", 1), ("staging", 1),
                                         ("ai", 1), ("analytics", 1),
-                                        ("lessons", 1)]
+                                        ("features", 1), ("looks", 1),
+                                        ("lessons", 1), ("why", 1)]
 
 
 def test_the_source_layer_keeps_rows_exactly_and_appends(db):

@@ -4,7 +4,7 @@
 
 ### An AI video editor: raw footage in, a YouTube-ready video out.
 
-Upload your clips and say what the video is about. A team of **18 AI agents**
+Upload your clips and say what the video is about. A team of **19 AI agents**
 plans the edit, picks the best shots, writes captions, composes music and
 checks the result. You get a finished video, a thumbnail and a YouTube upload
 sheet.
@@ -21,7 +21,7 @@ sheet.
 2. [What it does](#-what-it-does)
 3. [How it works, from upload to download](#-how-it-works-from-upload-to-download)
 4. [System architecture](#-system-architecture)
-5. [The 18 agents](#-the-18-agents)
+5. [The 19 agents](#-the-19-agents)
 6. [How a shot is chosen](#-how-a-shot-is-chosen)
 7. [How the music is made](#-how-the-music-is-made)
 8. [The cloud studio](#-the-cloud-studio)
@@ -52,7 +52,7 @@ like a small editing team, where each AI agent has one job:
 - an **editing director** chooses which seconds of which clip to use;
 - a **music agent** directs the soundtrack;
 - a **critic** checks the result and can send the edit back for another pass;
-- and so on, for **18 agents** in total.
+- and so on, for **19 agents** in total.
 
 A video engine built on ffmpeg then renders the final cut.
 
@@ -84,7 +84,7 @@ everything for upload, and publishing stays your decision.
 flowchart LR
     A["📤 Upload clips<br/>(starts immediately)"] --> B["⚙️ Choose options<br/>length · orientation<br/>framing · brief"]
     B --> C["▶️ Create my video"]
-    C --> D["🤖 18 agents plan the edit"]
+    C --> D["🤖 19 agents plan the edit"]
     D --> E["🎬 Engine renders<br/>cut · join · captions · music"]
     E --> F{"✅ Critic:<br/>good enough?"}
     F -- "no (max 2 times)" --> D
@@ -118,7 +118,7 @@ flowchart TB
     end
 
     subgraph BRAIN["🧠 Agent layer (LangGraph)"]
-        G["18 agents<br/>in a fixed graph"]
+        G["19 agents<br/>in a fixed graph"]
     end
 
     subgraph ENGINE["🎬 Video engine (ffmpeg)"]
@@ -158,7 +158,7 @@ recorded in `edit_plan.json` with its reason.
 
 ---
 
-## 🤖 The 18 agents
+## 🤖 The 19 agents
 
 ```mermaid
 flowchart TD
@@ -175,13 +175,14 @@ flowchart TD
     TR --> CP["10 · Caption<br/>on-screen text"]
     CP --> ED["11 · Editing Director<br/>which shot, how long<br/>+ shot check"]
     ED --> RE["12 · Render<br/>engine + AI music"]
-    RE --> CR{"13 · Critic<br/>checks the result"}
+    RE --> VR["13 · Visual Reviewer<br/>scores every shot"]
+    VR --> CR{"14 · Critic<br/>checks the result"}
     CR -- "revise" --> ED
-    CR -- "pass" --> TH["14 · Thumbnail"]
-    TH --> TI["15 · Title"]
-    TI --> PU["16 · Publishing<br/>YouTube sheet"]
-    PU --> PA["17 · Performance Analysis"]
-    PA --> LE["18 · Learning"]
+    CR -- "pass" --> TH["15 · Thumbnail"]
+    TH --> TI["16 · Title"]
+    TI --> PU["17 · Publishing<br/>YouTube sheet"]
+    PU --> PA["18 · Performance Analysis"]
+    PA --> LE["19 · Learning"]
     LE --> DONE(["✅ Video ready"])
 ```
 
@@ -199,12 +200,13 @@ flowchart TD
 | 10 | Caption | Writes on-screen captions. | Groq |
 | 11 | Editing Director | Chooses the clip, the seconds and the length of every shot, then runs **shot check**. | Groq + Gemini |
 | 12 | Render | Runs the engine and gets the music composed. | ffmpeg + Lyria |
-| 13 | Critic | Checks length, frames, loudness and the first 3 seconds; sends the edit back if needed. | code |
-| 14 | Thumbnail | Picks and prepares the thumbnail. | Groq |
-| 15 | Title | Writes the title (if you did not give one). | Groq |
-| 16 | Publishing | Checks YouTube's limits and writes `youtube.txt`. Never uploads. | code |
-| 17 | Performance Analysis | Reads how published videos performed. | code |
-| 18 | Learning | Improves future decisions from that performance data. | code |
+| 13 | Visual Reviewer | Scores every shot of the finished video; weak shots go back to be re-cut. | Gemini |
+| 14 | Critic | Checks length, frames, loudness and the first 3 seconds; sends the edit back if needed. | code |
+| 15 | Thumbnail | Picks and prepares the thumbnail. | Groq |
+| 16 | Title | Writes the title (if you did not give one). | Groq |
+| 17 | Publishing | Checks YouTube's limits and writes `youtube.txt`. Never uploads. | code |
+| 18 | Performance Analysis | Reads how published videos performed. | code |
+| 19 | Learning | Improves future decisions from that performance data. | code |
 
 > **No model, no problem.** If a model is down or not configured, each agent
 > falls back to a rule-based path and marks its result `degraded`. The video
@@ -219,14 +221,23 @@ from another moment and never the rejected one (at most 2 re-cuts). Off with
 `AT_VISUAL_REVIEW=0`.
 
 **Data Layers** (`server/datalayers/`, `python -m datalayers.run` from
-`server/`): reads the channel's daily YouTube numbers from BigQuery
-(`myukti.d_content_analytics.youtube_video_daily`) and builds source -> staging
-(first-7-day numbers) -> AI (hook and topic tags) -> analytics, with a checker
-after each layer. The **Pattern Miner** then proposes lessons from the videos
-that exist; a lesson that does not survive removing each group's best video is
-marked fragile. A person approves a lesson before the Content Strategy and
-Editing Director agents see it. Mission Control's Data Layers card shows all of
-it and can re-run it.
+`server/`): eight agents, a checker after each, that turn the channel's numbers
+into lessons.
+
+| Step | Agent | What it does |
+|---|---|---|
+| source | Source Loader | Reads the channel's daily YouTube numbers from BigQuery (`myukti.d_content_analytics.youtube_video_daily`), untouched |
+| staging | Cleaner | One row per video per day; every video judged on its first 7 days |
+| ai | Enricher | Tags each title's hook type and topic (Groq) |
+| analytics | Analytics Builder | One row per video, groups, and the file the Learning agent reads |
+| features | Feature Analyst | Measures each published video: length, opening energy, shots (needs the MP4s in `data/channel_videos/`, downloaded from YouTube Studio) |
+| looks | Opening Reviewer | Gemini looks at each video's first 2 seconds: finished build shown? hands in the way? |
+| lessons | Pattern Miner | Compares groups on % watched and first-week / first-month views, across all videos and within Shorts and regular videos; a lesson that does not survive removing each group's best video is marked fragile |
+| why | Why Writer | Says why some videos do better in a few sentences, each citing a lesson that held up |
+
+A person approves a lesson before the Content Strategy and Editing Director
+agents see it. BigQuery is read with the signed-in `gcloud` account on a
+workstation, or the VM's service account; no key is stored.
 
 The 19 agents are also organised as a **hierarchy**: one Chief and nine teams.
 Each team has a **lead**, 3–4 **workers** and a **checker**. The structure lives
@@ -245,11 +256,14 @@ unchanged.
 | Publish | Thumbnail, Title, Publishing, DriftWatch✱ |
 | Learning | Performance Analysis, Learning, Metrics✱, KnowledgeBase✱ |
 
-**Mission Control** (`/mission`) shows which agent is working now and what it is
-doing: the nine teams, a team room with each worker's state and its current tool
-call, each checker's verdict, and a live activity feed. It reads the trace the
-graph already writes, so it follows a job running in another process (the CLI or
-a VM worker) and never shows a planned agent as working.
+**Mission Control** (`/mission`) draws the teams as a map, lit from the live
+trace: click a team to see its agents (built ones with their state, planned
+ones dashed), click an agent for one line on what it does. The Data Layers card
+opens a room with a Refresh from BigQuery button, the lessons to approve, and
+the "why" summary. It reads the trace the graph already writes, so it follows a
+job running in another process (the CLI or a VM worker) and never shows a
+planned agent as working. The studio's **Agents** screen shows the same
+pipeline team by team, with the re-cut and learning loops.
 
 * `GET /api/v2/mission/teams` – the structure, built vs planned
 * `GET /api/v2/mission/jobs` – recent runs and their status
@@ -320,7 +334,7 @@ sequenceDiagram
     C->>W: start the machine
     W->>C: claim the job (Google ID token)
     W->>S: download clips
-    Note over W: 18 agents + engine<br/>make the video
+    Note over W: 19 agents + engine<br/>make the video
     W-->>C: progress (heartbeats)
     C-->>U: "N% done, about M min left"
     W->>S: upload video, thumbnail, youtube.txt…
@@ -371,7 +385,7 @@ alpha_titans/
 ├── server/
 │   ├── main.py             🖥️ local app: API + studio page
 │   ├── config.py           ⚙️ settings (reads .env)
-│   ├── agents/             🤖 the 18 agents + graph.py
+│   ├── agents/             🤖 the 19 agents + graph.py
 │   │   └── tools/          🔧 LLM client, shot_check, ai_music, render tools…
 │   └── cloud/              ☁️ queue, worker, VM manager, storage, cloud API
 ├── frontend/               🌐 studio pages (index.html, cloud.html)
@@ -430,7 +444,7 @@ Then open **http://127.0.0.1:8000**.
 curl -s http://127.0.0.1:8000/api/v2/health
 ```
 
-You should see `"reasoning_enabled": true` and `"agent_count": 18`.
+You should see `"reasoning_enabled": true` and `"agent_count": 19`.
 
 ---
 
@@ -514,6 +528,7 @@ The step-by-step guide is
 
 | Document | What is inside |
 |---|---|
+| [`docs/Alpha_Titans_Overview.pdf`](docs/Alpha_Titans_Overview.pdf) | 7-page overview for review: pipeline, all agents, learning, costs, what is needed |
 | [`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md) | The shortest complete picture of the project. **Start here.** |
 | [`docs/cloud/02-adr.md`](docs/cloud/02-adr.md) | Why the cloud system is designed the way it is |
 | [`docs/cloud/03-deployment.md`](docs/cloud/03-deployment.md) | How the live system is built and operated |

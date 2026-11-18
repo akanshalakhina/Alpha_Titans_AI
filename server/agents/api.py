@@ -313,9 +313,11 @@ def _data_layers_view() -> dict:
                               "ended_at": r["ended_at"],
                               "checks": json.loads(r["checks"] or "[]")})
         from datalayers import lessons as LS
+        from datalayers import why as WY
         return {"ran": bool(steps), "steps": steps, "report": DL.report(db),
                 "agents": [a for _, a in DL.AGENTS],
-                "source": DL.SOURCE_TABLE, "lessons": LS.listing(db)}
+                "source": DL.SOURCE_TABLE, "lessons": LS.listing(db),
+                "why": WY.latest(db)}
     except sqlite3.Error as exc:
         raise HTTPException(500, f"could not read the data layers: "
                                  f"{type(exc).__name__}") from None

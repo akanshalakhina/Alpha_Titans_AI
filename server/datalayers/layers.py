@@ -393,7 +393,8 @@ def build_analytics(db, batch: str, export_dir: str | Path | None = None
 
 AGENTS = (("source", "Source Loader"), ("staging", "Cleaner"),
           ("ai", "Enricher"), ("analytics", "Analytics Builder"),
-          ("lessons", "Pattern Miner"))
+          ("features", "Feature Analyst"), ("looks", "Opening Reviewer"),
+          ("lessons", "Pattern Miner"), ("why", "Why Writer"))
 
 
 def _mine(db):
@@ -401,9 +402,28 @@ def _mine(db):
     return lessons.mine(db)
 
 
+def _features(db, video_dir):
+    from datalayers import features
+    return features.analyse_features(db, video_dir)
+
+
+def _looks(db, llm, video_dir):
+    from datalayers import features
+    return features.review_openings(db, llm, video_dir)
+
+
+def _why(db, llm):
+    from datalayers import why
+    return why.write(db, llm)
+
+
 def run(db, fetch, *, llm=None, export_dir=None, jobs=None,
-        emit=print) -> dict:
-    """All four layers in order. A failed checker stops the rest.
+        emit=print, video_dir=None) -> dict:
+    """All the layers in order. A failed checker stops the rest.
+
+    `video_dir` holds the channel's published video files (default
+    data/channel_videos); without any, the feature steps say so and the
+    lessons are about titles and formats only.
 
     `fetch()` returns (rows, info): the warehouse query, or a stand-in in
     tests. Returns what ran and every check, for the screen and the log."""
@@ -442,7 +462,11 @@ def run(db, fetch, *, llm=None, export_dir=None, jobs=None,
             ("ai", AGENTS[2][1], lambda: tag_titles(db, llm)),
             ("analytics", AGENTS[3][1],
              lambda: build_analytics(db, batch, export_dir)),
-            ("lessons", AGENTS[4][1], lambda: _mine(db))):
+            ("features", AGENTS[4][1],
+             lambda: _features(db, video_dir)),
+            ("looks", AGENTS[5][1], lambda: _looks(db, llm, video_dir)),
+            ("lessons", AGENTS[6][1], lambda: _mine(db)),
+            ("why", AGENTS[7][1], lambda: _why(db, llm))):
         if not step(layer, agent, fn):
             return {"run_id": run_id, "steps": done, "ok": False}
     return {"run_id": run_id, "steps": done, "ok": True, "batch": batch}

@@ -44,6 +44,7 @@ const ROWS = [
   { nodes: ['music', 'animation', 'transition', 'caption'], chain: true },
   { nodes: ['editing_director'] },
   { nodes: ['render'] },
+  { nodes: ['visual_review'] },
   { nodes: ['critic'] },
   { nodes: ['__pass', '__revise'], branch: true },
   { nodes: ['thumbnail', 'title', 'publishing', 'performance_analysis', 'learning'],
@@ -57,7 +58,8 @@ const EDGES = [
   ['voiceover', 'music'],
   ['music', 'animation'], ['animation', 'transition'], ['transition', 'caption'],
   ['caption', 'editing_director'],
-  ['editing_director', 'render'], ['render', 'critic'],
+  ['editing_director', 'render'], ['render', 'visual_review'],
+  ['visual_review', 'critic'],
   ['critic', '__pass'], ['critic', '__revise'],
   ['__revise', 'editing_director', 'cycle'],
   ['__pass', 'thumbnail'],
@@ -70,6 +72,7 @@ const LABEL = {
   content_strategy: 'Content Strategy', story: 'Story', voiceover: 'Voiceover',
   music: 'Music', animation: 'Animation', transition: 'Transition',
   caption: 'Caption', editing_director: 'Editing Director', render: 'Rendering',
+  visual_review: 'Visual Reviewer',
   critic: 'Critic', thumbnail: 'Thumbnail', title: 'Title',
   publishing: 'Publishing', performance_analysis: 'Performance',
   learning: 'Learning',
@@ -88,6 +91,7 @@ const ROLE = {
   caption: 'The words that appear on screen.',
   editing_director: 'Turns all of it into one edit plan.',
   render: 'Runs the real pipeline: cut, join, score, master.',
+  visual_review: 'Watches every shot of the finished video; weak ones go back to be re-cut.',
   critic: 'Inspects the rendered MP4 itself, not the plan that made it.',
   thumbnail: 'Chooses the frame that represents the video.',
   title: 'Names it.',
@@ -110,6 +114,7 @@ const ICON = {
   editing_director: 'M4 6h7v5H4zM13 6h7v5h-7zM4 13h16v5H4z',
   render: 'M5 4l14 8-14 8z',
   critic: 'M12 4l2.3 5.5L20 11l-5.7 1.5L12 18l-2.3-5.5L4 11l5.7-1.5z',
+  visual_review: 'M2 12s3.8-6 10-6 10 6 10 6-3.8 6-10 6-10-6-10-6z|M9 12l2 2 4-4',
   thumbnail: 'M4 5h16v14H4zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM4 16l5-5 4 4 3-3 4 4',
   title: 'M5 6h14M9 6v12M15 6v12',
   publishing: 'M4 12l16-8-6 16-2.5-6.5z',
@@ -168,7 +173,7 @@ const CRAFT = [
   ['Media production', 'How it looks and sounds',
    ['voiceover', 'music', 'animation', 'transition', 'caption']],
   ['Execution', 'Building, judging and shipping it',
-   ['clip_analysis', 'editing_director', 'render', 'critic',
+   ['clip_analysis', 'editing_director', 'render', 'visual_review', 'critic',
     'thumbnail', 'title', 'publishing', 'performance_analysis', 'learning']],
 ];
 
@@ -1901,6 +1906,164 @@ function packagingSection() {
 
 /* ═══════════════════════════ view: agents ══════════════════════════ */
 
+/* The teams in the order the work moves, each with the agents inside it.
+   Built agents come from the graph; planned ones from /mission/teams and are
+   drawn dashed, never as working. */
+const STAGES = [
+  ['footage', 'Footage', 'What is in the clips',
+   ['clip_analysis', 'vision'], 'Vision and Research run at the same time.'],
+  ['creative', 'Creative', 'What the video says',
+   ['research', 'content_strategy', 'story'], ''],
+  ['sound', 'Sound', 'How it sounds', ['voiceover', 'music'],
+   'Lyria composes the track the Music agent directs.'],
+  ['edit', 'Edit', 'How it is cut',
+   ['animation', 'transition', 'caption', 'editing_director'],
+   'For every shot, Gemini compares 6 moments and the clearest is used.'],
+  ['render', 'Render', 'Making the file', ['render'],
+   'Cuts, joins, captions, music and loudness, with ffmpeg.'],
+  ['quality', 'Quality', 'Is it good enough?', ['visual_review', 'critic'],
+   'A weak shot or a failed check sends the cut back to Edit, at most twice.'],
+  ['publish', 'Publish', 'Ready to ship', ['thumbnail', 'title', 'publishing'],
+   'Nothing is posted to YouTube; the upload stays a person\'s decision.'],
+  ['learning', 'Learning', 'What to do better next time',
+   ['performance_analysis', 'learning'], ''],
+];
+
+async function loadAgentMap() {
+  if (S.mapLoading || (S.teamsMap && S.dataMap !== undefined)) return;
+  S.mapLoading = true;
+  const [teams, data] = await Promise.all([
+    tryGet(`${V2}/mission/teams`), tryGet(`${V2}/data/layers`)]);
+  S.teamsMap = teams || { teams: [] };
+  S.dataMap = data || null;
+  S.mapLoading = false;
+  if (S.view === 'agents') render();
+}
+
+function agentChip(node) {
+  const a = metaFor(node);
+  const st = S.jobId ? stateOf(node) : 'idle';
+  const sp = spanOf(node);
+  const b = el('button', `ap-agent st-${st}`);
+  b.type = 'button';
+  b.title = ROLE[node] || '';
+  b.innerHTML = `<span class="ap-dot" aria-hidden="true"></span>
+    <span class="ap-name">${esc(LABEL[node] || node)}</span>
+    <span class="ap-kind">${esc(a?.uses_llm ? 'AI' : 'code')}</span>
+    ${sp ? `<span class="ap-time">${esc(dur(wallOf(sp)))}</span>` : ''}`;
+  b.setAttribute('aria-label', `${LABEL[node] || node}: ${ROLE[node] || ''} ${
+    S.jobId ? STATE_WORD[st] || st : ''}`);
+  if (S.jobId) b.addEventListener('click', () => openProduction(S.jobId, node));
+  else b.disabled = true;
+  return b;
+}
+
+function pipelineMap() {
+  const wrap = el('section', 'ap-section');
+  const teams = (S.teamsMap?.teams || []);
+  const planned = id => (teams.find(t => t.id === id)?.workers || [])
+    .filter(w => !w.built);
+  const job = S.jobId;
+  const verdict = S.status?.verdict;
+
+  const head = el('div', 'ap-head');
+  head.innerHTML = `
+    <div>
+      <p class="sx-kicker" style="margin:0 0 8px">How a video is made</p>
+      <h3>The pipeline, team by team</h3>
+      <p class="ap-sub">${job
+        ? `Showing run <code>${esc(job)}</code>${verdict ? ` · verdict ${esc(verdict)}` : ''}. Choose an agent to see what it decided.`
+        : 'No run selected. Open one from My videos to light up the map.'}</p>
+    </div>
+    <a class="ap-live" href="/mission${job ? `?job=${encodeURIComponent(job)}` : ''}">Open live Mission Control →</a>`;
+  wrap.append(head);
+
+  const legend = el('div', 'ap-legend');
+  legend.innerHTML = `<span><i class="lg st-ok"></i>done</span>
+    <span><i class="lg st-running"></i>working now</span>
+    <span><i class="lg st-degraded"></i>used its fallback</span>
+    <span><i class="lg st-error"></i>failed</span>
+    <span><i class="lg planned"></i>planned, not built</span>
+    <span><i class="lg loop"></i>sent back / lessons</span>`;
+  wrap.append(legend);
+
+  const map = el('div', 'ap-map');
+  STAGES.forEach(([id, name, purpose, nodes, note], i) => {
+    const row = el('div', 'ap-stage');
+    row.style.gridRow = String(i + 1);
+    const states = nodes.map(n => (job ? stateOf(n) : 'idle'));
+    const stage = states.includes('error') ? 'error'
+      : states.includes('running') ? 'running'
+      : states.every(x => x === 'ok' || x === 'degraded') ? 'ok' : 'idle';
+    const spine = el('div', `ap-spine st-${stage}${i === STAGES.length - 1 ? ' last' : ''}`);
+    spine.style.gridRow = String(i + 1);
+    spine.innerHTML = `<span>${i + 1}</span>`;
+    map.append(spine);
+
+    row.classList.add(`st-${stage}`);
+    row.innerHTML = `<div class="ap-stage-h"><strong>${esc(name)}</strong>
+      <span>${esc(purpose)}</span>
+      <em>${nodes.length} built${planned(id).length ? ` · ${planned(id).length} planned` : ''}</em></div>`;
+    const agents = el('div', 'ap-agents');
+    nodes.forEach((n, k) => {
+      if (k) agents.append(el('span', 'ap-arrow', '→'));
+      agents.append(agentChip(n));
+    });
+    planned(id).forEach(w => {
+      const c = el('span', 'ap-agent planned', `<span class="ap-dot"></span>
+        <span class="ap-name">${esc(w.label)}</span><span class="ap-kind">planned</span>`);
+      c.title = w.does || '';
+      agents.append(c);
+    });
+    row.append(agents);
+    if (note) row.append(el('p', 'ap-note', esc(note)));
+    if (id === 'quality') row.append(el('p', 'ap-note ap-loop-note',
+      '↺ weak shot → back to Edit, re-cut from another moment'));
+    if (id === 'learning') {
+      const d = S.dataMap;
+      const sum = d?.report?.summary;
+      const lessons = (d?.lessons || []);
+      const ok = lessons.filter(l => l.status === 'approved').length;
+      const feed = el('div', 'ap-feed');
+      feed.innerHTML = `<span class="ap-feed-tag">Fed by</span>
+        <strong>Data Layers</strong>
+        <span>BigQuery → Source Loader → Cleaner → Enricher → Analytics Builder → Pattern Miner</span>
+        <span class="ap-feed-num">${sum
+          ? `${sum.videos} channel videos · ${lessons.length} lesson(s), ${ok} approved`
+          : 'not run yet'}</span>`;
+      row.append(feed);
+      row.append(el('p', 'ap-note ap-loop-note',
+        '↺ approved lessons → Creative and Edit plan the next video with them'));
+    }
+    map.append(row);
+  });
+
+  const recut = el('div', 'ap-rail r-recut');
+  recut.style.gridRow = '4 / 7';
+  recut.innerHTML = '<span>re-cut · max 2</span>';
+  const learn = el('div', 'ap-rail r-learn');
+  learn.style.gridRow = '2 / 9';
+  learn.innerHTML = '<span>lessons for the next video</span>';
+  map.append(recut, learn);
+  wrap.append(map);
+
+  const team = el('div', 'ap-team');
+  team.innerHTML = `
+    <p class="sx-kicker" style="margin:0 0 12px">Inside every team</p>
+    <div class="ap-team-row">
+      <div class="ap-tbox"><b>Lead</b><span>splits the task</span></div>
+      <span class="ap-arrow">→</span>
+      <div class="ap-tbox soft"><b>Workers</b><span>one job each, some in parallel</span></div>
+      <span class="ap-arrow">→</span>
+      <div class="ap-tbox"><b>Checker</b><span>tests the result</span></div>
+      <span class="ap-arrow">→</span>
+      <div class="ap-tbox soft"><b>Next team</b><span>only if it passed</span></div>
+    </div>
+    <p class="ap-note">A failed check goes back with its reasons, a limited number of times, then to a person. Every step writes a trace, which is what this map and Mission Control read.</p>`;
+  wrap.append(team);
+  return wrap;
+}
+
 function viewAgents() {
   const f = document.createDocumentFragment();
   const h = S.health;
@@ -1913,14 +2076,19 @@ function viewAgents() {
       <p class="sx-kicker">The roster</p>
       <h2>Your AI production team</h2>
       <p class="sx-hero-lede">${h
-        ? `${h.agent_count} specialists. ${h.reasoning_agents} reason over the
-           footage; ${h.agent_count - h.reasoning_agents} measure it. Each owns
-           exactly one decision and one artifact.`
+        ? `${h.agent_count} agents in 8 teams make every video, a quality team
+           can send it back, and a learning loop carries lessons from the
+           channel's numbers into the next one.`
         : ''}</p>
     </div>`;
   f.append(hero);
 
   if (!h) { f.append(el('div', 'sx-skel')); return f; }
+
+  loadAgentMap();
+  f.append(pipelineMap());
+  f.append(Object.assign(el('div', 'ap-roster-h'), {
+    innerHTML: '<p class="sx-kicker" style="margin:0">Every agent in detail</p>' }));
 
   CRAFT.forEach(([title, note, nodes]) => {
     const g = el('section', 'sx-dir-group');

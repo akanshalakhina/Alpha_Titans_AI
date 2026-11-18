@@ -73,3 +73,7 @@ data/_dedupe_ledger.json
 
 # the data layers keep their working copy here until a dataset is granted
 data/layers/
+
+# the channel's published videos, downloaded from YouTube Studio for the
+# Feature Analyst; large, and never committed
+data/channel_videos/
