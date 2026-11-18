@@ -77,3 +77,11 @@ data/layers/
 # the channel's published videos, downloaded from YouTube Studio for the
 # Feature Analyst; large, and never committed
 data/channel_videos/
+
+# kept on this computer only, never in the repo:
+# notes, plans, reports, the review PDF, local tool settings, downloaded tools
+docs/
+ALPHA_TITANS_CONTEXT.md
+.claude/
+cloudflared.exe
+*.pdf

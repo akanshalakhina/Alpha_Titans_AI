@@ -132,12 +132,11 @@ Run `tests/agents` and `tests/cloud` separately, and keep ffmpeg on `PATH`.
   `yt_videos` and `trending` tables, the Anthropic API key, and the channel's
   MP4s for the "why" agents.
 
-## Documentation
+## Deployment
 
-| Document | Contents |
-|---|---|
-| [docs/Alpha_Titans_Overview.pdf](docs/Alpha_Titans_Overview.pdf) | 7-page overview for review |
-| [docs/AGENT_HANDOFF.md](docs/AGENT_HANDOFF.md) | full technical picture for developers |
-| [docs/cloud/](docs/cloud/README.md) | cloud design, deployment, tests, costs |
+The cloud setup lives in [`deploy/cloud/`](deploy/cloud): systemd units for the
+control and worker machines, and example settings files
+(`control.env.example`, `worker.env.example`). Docker users can run
+`docker compose up --build` (ffmpeg is included in the image).
 
 Built by **Akansha**.

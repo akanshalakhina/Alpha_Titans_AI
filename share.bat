@@ -4,10 +4,15 @@ REM Double-click this file. Keep BOTH windows open while your manager uses the l
 setlocal
 cd /d "%~dp0"
 
-if not exist cloudflared.exe (
-  echo [X] cloudflared.exe was not found in this folder.
-  pause
-  exit /b 1
+set CF=cloudflared.exe
+if not exist %CF% (
+  where cloudflared >nul 2>nul && (set CF=cloudflared) || (
+    echo [X] cloudflared was not found. Install it once with:
+    echo     winget install --id Cloudflare.cloudflared
+    echo or put cloudflared.exe in this folder.
+    pause
+    exit /b 1
+  )
 )
 
 if "%AT_PORT%"=="" set AT_PORT=8000
@@ -25,5 +30,5 @@ echo   .trycloudflare.com  -  copy it and send it to your manager.
 echo   Closing this window turns the link off.
 echo ================================================================
 echo.
-cloudflared.exe tunnel --url http://127.0.0.1:%AT_PORT%
+%CF% tunnel --url http://127.0.0.1:%AT_PORT%
 pause
