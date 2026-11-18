@@ -58,7 +58,7 @@ still made.
 
 | Agent | Does |
 |---|---|
-| Source Loader | reads `myukti.d_content_analytics.youtube_video_daily` from BigQuery, untouched |
+| Source Loader | reads the channel's daily YouTube numbers from BigQuery, untouched |
 | Cleaner | one row per video per day; every video judged on its first 7 days |
 | Enricher | tags each title's hook and topic (Groq) |
 | Analytics Builder | one row per video, groups, and the file the Learning agent reads |
@@ -94,16 +94,6 @@ On macOS or Linux use `source .venv/bin/activate`, `cp` and `./run.sh`.
 Data layers from the command line (needs `gcloud auth login` once):
 `cd server && python -m datalayers.run`
 
-## Settings (`.env`, never committed)
-
-| Setting | For | Without it |
-|---|---|---|
-| `AT_LLM_API_KEY`, `AT_LLM_PROVIDER`, `AT_LLM_BASE_URL`, `AT_LLM_MODEL` | text agents (Groq today; Claude with `AT_LLM_PROVIDER=anthropic`) | agents use their rules |
-| `AT_VISION_API_KEY`, `AT_VISION_MODEL` | Vision, shot check, Visual Reviewer, Opening Reviewer (Gemini) | those steps are skipped |
-| `AT_MUSIC_PROVIDER=lyria`, `AT_MUSIC_PROJECT` | AI-composed music (Google Cloud sign-in, no key) | music composed in code |
-| `AT_SEARCH_PROVIDER`, `AT_SEARCH_API_KEY` | Research agent (Tavily or Brave) | Research is skipped |
-| BigQuery | Source Loader: signed-in `gcloud` account, or the VM's service account | no fresh numbers |
-
 ## Tests
 
 ```bash
@@ -115,22 +105,6 @@ node --test tests/frontend/
 ```
 
 Run `tests/agents` and `tests/cloud` separately, and keep ffmpeg on `PATH`.
-
-## Where it runs
-
-| Place | Status |
-|---|---|
-| Local computer | full studio, Mission Control, data layers |
-| Cloud studio (Google Cloud) | live: a small always-on machine takes uploads; an 8-CPU machine starts only to make a video, then switches off. About $0.13 per video |
-| L4 GPU VM (`myyukti`) | target for daily runs on a timer; waiting for access |
-
-## Status and next steps
-
-- Built: 19 video agents, 8 data agents, live Mission Control, cloud studio.
-- Planned: 14 agents (the Insight team, Hook, Sound Design and others).
-- Needed: VM access, BigQuery access for the VM, read access to the
-  `yt_videos` and `trending` tables, the Anthropic API key, and the channel's
-  MP4s for the "why" agents.
 
 ## Deployment
 
